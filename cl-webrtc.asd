@@ -9,7 +9,7 @@
   :version "0.0.1"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("ironclad" "bordeaux-threads")
+  :depends-on ("ironclad" "bordeaux-threads" "sb-bsd-sockets")
   :serial t
   :components
   ((:module "src"
@@ -18,4 +18,5 @@
     ((:file "packages")
      (:file "util")        ; byte helpers, base64, random
      (:file "sdp")         ; offer parse + answer generation (data-channel m-line)
-     (:file "stun")))))    ; STUN messages: MESSAGE-INTEGRITY + FINGERPRINT (ICE checks)
+     (:file "stun")        ; STUN messages: MESSAGE-INTEGRITY + FINGERPRINT (ICE checks)
+     (:file "ice")))))     ; ICE-lite agent: UDP socket + answer connectivity checks

@@ -10,7 +10,7 @@ Clean-room, tested against **aiortc** (a spec-compliant peer) at each layer, the
 ## Status (WIP)
 - [x] **SDP** — parse the data-channel offer, generate the answer (verified vs aiortc offers).
 - [x] **STUN** — messages + MESSAGE-INTEGRITY (HMAC-SHA1) + FINGERPRINT (CRC32) — **validated by aioice**.
-- [ ] **ICE** — UDP agent, connectivity checks → `iceConnectionState: connected`.
+- [x] **ICE** — ICE-lite UDP agent, connectivity checks → aiortc reaches `iceConnectionState: completed`.
 - [ ] **DTLS 1.2** — over seal's crypto.
 - [ ] **SCTP + DCEP** — the data channel itself (`datachannel.onopen`).
 - [ ] **glass** — framebuffer + input over the channel.
