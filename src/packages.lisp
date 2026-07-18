@@ -14,6 +14,8 @@
            #:sdp-candidates #:sdp-sctp-port #:sdp-mid
            #:generate-webrtc-cert #:webrtc-dtls-setup #:webrtc-dtls-run
            #:dtls-conn-session #:dtls-conn-fingerprint
+           #:webrtc-serve-datachannel #:sctp-assoc #:sctp-assoc-state
+           #:sctp-send-data #:sctp-send-string
            #:webrtc-error))
 
 (in-package #:cl-webrtc)

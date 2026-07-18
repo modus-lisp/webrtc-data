@@ -12,7 +12,7 @@ Clean-room, tested against **aiortc** (a spec-compliant peer) at each layer, the
 - [x] **STUN** — messages + MESSAGE-INTEGRITY (HMAC-SHA1) + FINGERPRINT (CRC32) — **validated by aioice**.
 - [x] **ICE** — ICE-lite UDP agent, connectivity checks → aiortc reaches `iceConnectionState: completed`.
 - [x] **DTLS 1.2** — client handshake (ECDHE-ECDSA/RSA + AES-128-GCM, X25519, mutual auth) over [seal](https://github.com/modus-lisp/seal)'s crypto → aiortc reaches `connectionState: connected`.
-- [ ] **SCTP + DCEP** — the data channel itself (`datachannel.onopen`).
+- [x] **SCTP + DCEP** — SCTP association (responder) + DCEP over DTLS → aiortc fires `datachannel.onopen` and a message round-trips (echo verified).
 - [ ] **glass** — framebuffer + input over the channel.
 
 MIT.
