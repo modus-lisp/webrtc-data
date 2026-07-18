@@ -38,35 +38,6 @@
   (multiple-value-bind (g x) (%egcd (mod a m) m)
     (declare (ignore g)) (mod x m)))
 
-;;; ---- RSA-2048 key generation (e = 65537) -----------------------------------
-
-(defun generate-rsa-key (&optional (bits 2048))
-  "Return (values n e d) for a fresh RSA key with public exponent 65537."
-  (let ((e 65537))
-    (loop
-      (let* ((p (ic:generate-prime (floor bits 2)))
-             (q (ic:generate-prime (- bits (floor bits 2))))
-             (phi (* (1- p) (1- q))))
-        (when (and (/= p q) (= 1 (gcd e phi)))
-          (return (values (* p q) e (mod-inverse e phi))))))))
-
-;;; ---- RSASSA-PKCS1-v1_5 signing (rsa_pkcs1_sha256) --------------------------
-
-(defparameter +sha256-digestinfo+
-  (as-u8vec '(#x30 #x31 #x30 #x0d #x06 #x09 #x60 #x86 #x48 #x01 #x65 #x03
-              #x04 #x02 #x01 #x05 #x00 #x04 #x20)))
-
-(defun pkcs1-sha256-sign (n d message)
-  "Sign MESSAGE (bytes) as EMSA-PKCS1-v1_5 over SHA-256 with private key (n, d)."
-  (let* ((dig (seal:sha256 (as-u8vec message)))
-         (tt (cat-bytes +sha256-digestinfo+ dig))
-         (k (ceiling (integer-length n) 8))
-         (ps (- k (length tt) 3))
-         (em (u8vec k #xff)))
-    (setf (aref em 0) 0 (aref em 1) 1 (aref em (+ 2 ps)) 0)
-    (replace em tt :start1 (+ 3 ps))
-    (i2osp (mod-expt (os2ip em) d n) k)))
-
 ;;; ---- minimal DER encoder ---------------------------------------------------
 
 (defun der-len (n)
@@ -90,30 +61,41 @@
 (defun der-explicit0 (content) (der-tlv #xa0 content))
 
 (defparameter +oid-cn+ (as-u8vec '(#x06 #x03 #x55 #x04 #x03)))
-(defparameter +oid-rsa-encryption+
-  (as-u8vec '(#x06 #x09 #x2a #x86 #x48 #x86 #xf7 #x0d #x01 #x01 #x01)))
-(defparameter +oid-sha256-rsa+
-  (as-u8vec '(#x06 #x09 #x2a #x86 #x48 #x86 #xf7 #x0d #x01 #x01 #x0b)))
+(defparameter +oid-ec-public-key+                       ; id-ecPublicKey 1.2.840.10045.2.1
+  (as-u8vec '(#x06 #x07 #x2a #x86 #x48 #xce #x3d #x02 #x01)))
+(defparameter +oid-prime256v1+                          ; secp256r1 (prime256v1) 1.2.840.10045.3.1.7
+  (as-u8vec '(#x06 #x08 #x2a #x86 #x48 #xce #x3d #x03 #x01 #x07)))
+(defparameter +oid-ecdsa-sha256+                        ; ecdsa-with-SHA256 1.2.840.10045.4.3.2
+  (as-u8vec '(#x06 #x08 #x2a #x86 #x48 #xce #x3d #x04 #x03 #x02)))
 
-(defun build-self-signed-cert (n e d)
-  "Hand-build a self-signed RSA X.509 v3 certificate (DER)."
+(defun ecdsa-sha256-sign (d message)
+  "Sign MESSAGE (bytes) with private scalar D as ecdsa_secp256r1_sha256, returning the
+DER Ecdsa-Sig-Value  SEQUENCE { r INTEGER, s INTEGER }  (the wire form for both the
+certificate self-signature and DTLS CertificateVerify)."
+  (multiple-value-bind (r s) (seal:ecdsa-sign seal:*p256* d (seal:sha256 (as-u8vec message)))
+    (der-seq (der-uint r) (der-uint s))))
+
+(defun build-self-signed-ec-cert (d pub)
+  "Hand-build a self-signed ECDSA P-256 X.509 v3 certificate (DER).  PUB is the affine
+public point (d*G); D the private scalar.  ~330 bytes vs ~800 for RSA-2048."
   (let* ((name (der-seq (der-set (der-seq +oid-cn+ (der-utf8 "cl-webrtc")))))
-         (spki (der-seq (der-seq +oid-rsa-encryption+ (der-null))
-                        (der-bitstring (der-seq (der-uint n) (der-uint e)))))
+         (spki (der-seq (der-seq +oid-ec-public-key+ +oid-prime256v1+)   ; namedCurve as param
+                        (der-bitstring (seal:ec-encode-point seal:*p256* pub))))
          (validity (der-seq (der-utctime "250101000000Z") (der-utctime "350101000000Z")))
-         (sigalg (der-seq +oid-sha256-rsa+ (der-null)))
+         (sigalg (der-seq +oid-ecdsa-sha256+))          ; ecdsa-with-SHA256 has no parameters
          (serial (der-uint (logior 1 (os2ip (random-bytes 8)))))
          (tbs (der-seq (der-explicit0 (der-uint 2))     ; version v3
-                       serial sigalg name validity name spki))
-         (sig (pkcs1-sha256-sign n d tbs)))
-    (der-seq tbs sigalg (der-bitstring sig))))
+                       serial sigalg name validity name spki)))
+    (der-seq tbs sigalg (der-bitstring (ecdsa-sha256-sign d tbs)))))
 
 (defun generate-webrtc-cert ()
-  "Return (values cert-der sign-fn fingerprint) for a fresh DTLS identity."
-  (multiple-value-bind (n e d) (generate-rsa-key 2048)
-    (let ((der (build-self-signed-cert n e d)))
+  "Return (values cert-der sign-fn fingerprint) for a fresh ECDSA P-256 DTLS identity.
+The EC cert keeps our DTLS auth flight to ~one datagram so the handshake survives a lossy
+link; SIGN-FN produces ecdsa_secp256r1_sha256 signatures for CertificateVerify."
+  (multiple-value-bind (d pub) (seal:ec-generate-key seal:*p256*)
+    (let ((der (build-self-signed-ec-cert d pub)))
       (values der
-              (lambda (message) (pkcs1-sha256-sign n d message))
+              (lambda (message) (ecdsa-sha256-sign d message))
               (seal:dtls-fingerprint der)))))
 
 ;;; ---- datagram mailbox (ICE recv thread -> DTLS handshake thread) -----------
@@ -149,6 +131,7 @@ ICE-SERVE so no early DTLS records are dropped."
                                 (let ((p (ice-agent-peer agent)))
                                   (when p (ice-send agent dg (first p) (second p)))))
                      :cert-der der :sign-fn sign-fn
+                     :sig-scheme-code seal:+sig-ecdsa-secp256r1-sha256+
                      :expected-peer-fingerprint remote-fingerprint)))
       (setf (ice-agent-on-packet agent)
             (lambda (pkt host port)
