@@ -31,35 +31,41 @@
 
 (defun run-session (conn)
   "Drive DTLS, then run the data channel; bridge it to glass once it opens."
-  (handler-case
-      (progn
-        (webrtc-dtls-run conn)
-        (let ((glass nil))
-          (webrtc-serve-datachannel
-           conn :duration 3600.0
-           :on-ready
-           (lambda (assoc sid)
-             (setf glass (glass-connect))
-             (format *error-output* "~&[gw] channel open (stream ~a) -> glass ~a:~a~%"
-                     sid *glass-host* *glass-port*)
-             ;; glass -> browser: read RFB, chunk under the no-fragmentation limit
-             (bt:make-thread
-              (lambda ()
-                (let ((buf (make-array 16384 :element-type '(unsigned-byte 8))))
-                  (loop
-                    (multiple-value-bind (b n) (sb-bsd-sockets:socket-receive glass buf nil)
-                      (declare (ignore b))
-                      (when (or (null n) (zerop n)) (return))
-                      (loop for off from 0 below n by 1024
-                            do (sctp-send-binary assoc sid
-                                                 (subseq buf off (min n (+ off 1024)))))))))
-              :name "glass->ch"))
-           :on-message
-           (lambda (assoc sid payload)
-             (declare (ignore assoc sid))
-             (when (and glass (plusp (length payload)))
-               (sb-bsd-sockets:socket-send glass (as-u8vec payload) (length payload)))))))
-    (error (e) (format *error-output* "~&[gw] session error: ~a~%" e))))
+  (let ((glass nil))
+    (unwind-protect
+        (handler-case
+            (progn
+              (webrtc-dtls-run conn)
+              (webrtc-serve-datachannel
+               conn :duration 3600.0
+               :on-ready
+               (lambda (assoc sid)
+                 (setf glass (glass-connect))
+                 (format *error-output* "~&[gw] channel open (stream ~a) -> glass ~a:~a~%"
+                         sid *glass-host* *glass-port*)
+                 ;; glass -> browser: read RFB, chunk under the no-fragmentation limit
+                 (bt:make-thread
+                  (lambda ()
+                    (let ((buf (make-array 16384 :element-type '(unsigned-byte 8))))
+                      (handler-case
+                          (loop
+                            (multiple-value-bind (b n) (sb-bsd-sockets:socket-receive glass buf nil)
+                              (declare (ignore b))
+                              (when (or (null n) (zerop n)) (return))
+                              (loop for off from 0 below n by 1024
+                                    do (sctp-send-binary assoc sid
+                                                         (subseq buf off (min n (+ off 1024)))))))
+                        (error () nil))))
+                  :name "glass->ch"))
+               :on-message
+               (lambda (assoc sid payload)
+                 (declare (ignore assoc sid))
+                 (when (and glass (plusp (length payload)))
+                   (sb-bsd-sockets:socket-send glass (as-u8vec payload) (length payload))))))
+          (error (e) (format *error-output* "~&[gw] session error: ~a~%" e)))
+      ;; cleanup: close the glass connection so glass's per-client thread exits too
+      (when glass (ignore-errors (sb-bsd-sockets:socket-close glass)))
+      (format *error-output* "~&[gw] session closed~%"))))
 
 (defun handle-signal ()
   "POST /signal: body is the browser's offer SDP; return our answer SDP."
