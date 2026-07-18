@@ -105,6 +105,8 @@ the given already-encoded chunks."
   last-received-tsn                          ; cumulative TSN we can ack
   (stream-seq (make-hash-table))             ; per-stream outbound ordered sequence number
   on-message                                 ; (funcall on-message assoc stream-id string)
+  on-ready                                   ; (funcall on-ready assoc stream-id) at DCEP OPEN
+  (send-lock (bt:make-recursive-lock))       ; serialize sends (receive loop + app threads)
   (log nil))                                 ; optional stream for debug logging
 
 (defun sctp-log (assoc fmt &rest args)
@@ -114,10 +116,12 @@ the given already-encoded chunks."
 
 (defun sctp-transmit (assoc &rest chunk-byte-vectors)
   "Wrap CHUNK-BYTE-VECTORS in a packet carrying the peer's verification tag and send it
-over DTLS."
-  (seal:dtls-send-app (sctp-assoc-session assoc)
-                      (apply #'sctp-packet (or (sctp-assoc-peer-tag assoc) 0)
-                             chunk-byte-vectors)))
+over DTLS.  Locked: the DTLS record layer (sequence numbers) is not thread-safe, and the
+glass framebuffer pump sends concurrently with the SCTP receive loop."
+  (bt:with-recursive-lock-held ((sctp-assoc-send-lock assoc))
+    (seal:dtls-send-app (sctp-assoc-session assoc)
+                        (apply #'sctp-packet (or (sctp-assoc-peer-tag assoc) 0)
+                               chunk-byte-vectors))))
 
 ;;; ---- outbound chunks -------------------------------------------------------
 
@@ -128,15 +132,16 @@ over DTLS."
 
 (defun sctp-send-data (assoc stream-id ppid data)
   "Send one unfragmented, ordered DATA chunk on STREAM-ID with the given PPID."
-  (let* ((data (as-u8vec data))
-         (tsn (sctp-assoc-local-tsn assoc))
-         (seq (sctp-next-stream-seq assoc stream-id))
-         (value (cat-bytes (u32be tsn) (u16be stream-id) (u16be seq)
-                           (u32be ppid) data)))
-    (setf (sctp-assoc-local-tsn assoc) (logand (1+ tsn) #xffffffff))
-    (sctp-transmit assoc (sctp-chunk +chunk-data+ +data-flag-be+ value))
-    (sctp-log assoc "~&  >> DATA tsn=~a stream=~a ppid=~a len=~a~%"
-              tsn stream-id ppid (length data))))
+  (bt:with-recursive-lock-held ((sctp-assoc-send-lock assoc))
+    (let* ((data (as-u8vec data))
+           (tsn (sctp-assoc-local-tsn assoc))
+           (seq (sctp-next-stream-seq assoc stream-id))
+           (value (cat-bytes (u32be tsn) (u16be stream-id) (u16be seq)
+                             (u32be ppid) data)))
+      (setf (sctp-assoc-local-tsn assoc) (logand (1+ tsn) #xffffffff))
+      (sctp-transmit assoc (sctp-chunk +chunk-data+ +data-flag-be+ value))
+      (sctp-log assoc "~&  >> DATA tsn=~a stream=~a ppid=~a len=~a~%"
+                tsn stream-id ppid (length data)))))
 
 (defun sctp-send-string (assoc stream-id string)
   "Send STRING as a WebRTC string message (PPID 51) on STREAM-ID."
@@ -144,6 +149,13 @@ over DTLS."
     (if (zerop (length bytes))
         (sctp-send-data assoc stream-id +ppid-string-empty+ #(0))  ; empty needs 1 byte
         (sctp-send-data assoc stream-id +ppid-string+ bytes))))
+
+(defun sctp-send-binary (assoc stream-id bytes)
+  "Send BYTES as a WebRTC binary message (PPID 53) on STREAM-ID."
+  (let ((b (as-u8vec bytes)))
+    (if (zerop (length b))
+        (sctp-send-data assoc stream-id +ppid-binary-empty+ #(0))
+        (sctp-send-data assoc stream-id +ppid-binary+ b))))
 
 (defun sctp-send-sack (assoc)
   (let ((value (cat-bytes (u32be (sctp-assoc-last-received-tsn assoc))
@@ -188,7 +200,10 @@ stateful (one association) so the cookie is an opaque blob the peer just echoes 
         ((= msg-type +dcep-open+)
          (sctp-log assoc "~&  << DCEP OPEN stream=~a -> ACK~%" stream-id)
          ;; reply with a single-byte DATA_CHANNEL_ACK on the same stream
-         (sctp-send-data assoc stream-id +ppid-dcep+ (as-u8vec (list +dcep-ack+))))
+         (sctp-send-data assoc stream-id +ppid-dcep+ (as-u8vec (list +dcep-ack+)))
+         ;; channel is open — let the app (e.g. the glass bridge) start pushing bytes
+         (when (sctp-assoc-on-ready assoc)
+           (funcall (sctp-assoc-on-ready assoc) assoc stream-id)))
         ((= msg-type +dcep-ack+)
          (sctp-log assoc "~&  << DCEP ACK stream=~a~%" stream-id))))))
 
@@ -238,7 +253,7 @@ handling INIT / COOKIE-ECHO / DATA / HEARTBEAT, and sends a SACK if any DATA arr
             ((= ctype +chunk-sack+))       ; we don't retransmit; nothing to do
             ((= ctype +chunk-cookie-ack+))
             ((= ctype +chunk-abort+)
-             (sctp-log assoc "~&  << ABORT~%") (setf (sctp-assoc-state assoc) :closed))
+             (sctp-log assoc "~&  << ABORT~%") (setf (sctp-assoc-state assoc) :aborted))
             ((= ctype +chunk-shutdown+)
              (sctp-log assoc "~&  << SHUTDOWN~%"))
             (t (sctp-log assoc "~&  << unhandled chunk type ~a~%" ctype))))
@@ -248,22 +263,24 @@ handling INIT / COOKIE-ECHO / DATA / HEARTBEAT, and sends a SACK if any DATA arr
 
 ;;; ---- driver: run the association over a DTLS-CONN --------------------------
 
-(defun webrtc-serve-datachannel (conn &key on-message (duration 30.0) log)
-  "Run the SCTP association + DCEP over the (already handshaked) DTLS-CONN for DURATION
-seconds, pumping inbound datagrams from the mailbox.  ON-MESSAGE, if given, is called as
-(funcall on-message ASSOC STREAM-ID STRING) for each inbound WebRTC string/binary message
-— e.g. to echo it back with (sctp-send-string assoc stream-id string).  Returns the
-SCTP-ASSOC.  Designed so higher layers (glass framebuffer + input) can push bytes with
-SCTP-SEND-DATA / SCTP-SEND-STRING and pull them via ON-MESSAGE."
+(defun webrtc-serve-datachannel (conn &key on-message on-ready (duration 30.0) log)
+  "Run the SCTP association + DCEP over the (already handshaked) DTLS-CONN for up to DURATION
+seconds (or until the peer ABORTs), pumping inbound datagrams from the mailbox.  ON-MESSAGE,
+if given, is called as (funcall on-message ASSOC STREAM-ID PAYLOAD) for each inbound message
+— a string for PPID 51, raw bytes for PPID 53.  ON-READY, if given, is called as
+(funcall on-ready ASSOC STREAM-ID) once the channel opens (DCEP OPEN) — the moment a bridge
+should start pushing bytes (e.g. glass, whose RFB server speaks first).  Returns the
+SCTP-ASSOC.  Higher layers push with SCTP-SEND-DATA / SCTP-SEND-STRING and pull via ON-MESSAGE."
   (let* ((session (dtls-conn-session conn))
          (mb (dtls-conn-mailbox conn))
-         (assoc (make-sctp-assoc :session session :on-message on-message :log log))
+         (assoc (make-sctp-assoc :session session :on-message on-message :on-ready on-ready :log log))
          (deadline (+ (get-internal-real-time)
                       (round (* duration internal-time-units-per-second)))))
-    (loop while (< (get-internal-real-time) deadline) do
-      (let ((dg (mailbox-pop mb 1.0)))
-        (when dg
-          (dolist (sctp (seal:dtls-handle-datagram session dg))
-            (handler-case (sctp-input assoc sctp)
-              (error (e) (sctp-log assoc "~&  !! sctp-input error: ~a~%" e)))))))
+    (loop while (and (< (get-internal-real-time) deadline)
+                     (not (eq (sctp-assoc-state assoc) :aborted)))
+          do (let ((dg (mailbox-pop mb 1.0)))
+               (when dg
+                 (dolist (sctp (seal:dtls-handle-datagram session dg))
+                   (handler-case (sctp-input assoc sctp)
+                     (error (e) (sctp-log assoc "~&  !! sctp-input error: ~a~%" e)))))))
     assoc))

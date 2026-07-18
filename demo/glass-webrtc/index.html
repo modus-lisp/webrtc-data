@@ -1,0 +1,48 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <title>glass over WebRTC</title>
+  <style>html,body{margin:0;height:100%;background:#111;overflow:hidden}#screen{width:100vw;height:100vh}</style>
+</head>
+<body>
+  <div id="screen"></div>
+  <script type="module">
+    import RFB from '/novnc/core/rfb.js';
+    const log = (...a) => console.log('[glass-webrtc]', ...a);
+
+    // No STUN: on a LAN the host candidates suffice, and our ICE-lite answerer only
+    // responds to checks (no trickle), so we gather fully before signaling.
+    const pc = new RTCPeerConnection({ iceServers: [] });
+    pc.oniceconnectionstatechange = () => log('ice', pc.iceConnectionState);
+    pc.onconnectionstatechange = () => log('conn', pc.connectionState);
+
+    // We open the channel; noVNC 1.7 rides the RTCDataChannel directly.
+    const ch = pc.createDataChannel('rfb', { ordered: true });
+    ch.binaryType = 'arraybuffer';
+    ch.onopen = () => log('datachannel open');
+    const rfb = new RFB(document.getElementById('screen'), ch, {});
+    rfb.scaleViewport = true;
+    rfb.focusOnClick = true;
+    rfb.addEventListener('connect', () => { log('RFB connected'); rfb.focus(); });
+    rfb.addEventListener('disconnect', e => log('RFB disconnect', e.detail));
+
+    (async () => {
+      await pc.setLocalDescription(await pc.createOffer());
+      // non-trickle: wait until ICE gathering is done so the offer carries candidates
+      await new Promise(res => {
+        if (pc.iceGatheringState === 'complete') return res();
+        pc.addEventListener('icegatheringstatechange', () => {
+          if (pc.iceGatheringState === 'complete') res();
+        });
+      });
+      log('posting offer');
+      const r = await fetch('/signal', { method: 'POST', body: pc.localDescription.sdp });
+      const answer = await r.text();
+      await pc.setRemoteDescription({ type: 'answer', sdp: answer });
+      log('answer applied');
+    })();
+  </script>
+</body>
+</html>

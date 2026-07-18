@@ -13,6 +13,6 @@ Clean-room, tested against **aiortc** (a spec-compliant peer) at each layer, the
 - [x] **ICE** — ICE-lite UDP agent, connectivity checks → aiortc reaches `iceConnectionState: completed`.
 - [x] **DTLS 1.2** — client handshake (ECDHE-ECDSA/RSA + AES-128-GCM, X25519, mutual auth) over [seal](https://github.com/modus-lisp/seal)'s crypto → aiortc reaches `connectionState: connected`.
 - [x] **SCTP + DCEP** — SCTP association (responder) + DCEP over DTLS → aiortc fires `datachannel.onopen` and a message round-trips (echo verified).
-- [ ] **glass** — framebuffer + input over the channel.
+- [x] **glass** — framebuffer + input over the channel (remote desktop in a browser). See `demo/glass-webrtc/`.
 
 MIT.
