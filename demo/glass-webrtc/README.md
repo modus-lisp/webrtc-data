@@ -34,3 +34,12 @@ Env overrides: `GW_PORT` (8765), `GLASS_HOST` (127.0.0.1), `GLASS_PORT` (5900), 
   is chunked to ≤1024 B because our SCTP doesn't fragment; browser→glass is small RFB messages.
 - Verified end-to-end against headless Chromium: framebuffer renders and typed keystrokes reach
   the shell.
+
+## Monitoring
+- **Browser HUD** (top-right): live rendered FPS (hooks noVNC's `FramebufferUpdate` completion),
+  inbound KB/s + msg/s, and the data-channel `bufferedAmount` (backpressure). `buf 0 KB` means the
+  transport is keeping up.
+- **Server-side**: the gateway logs an SCTP health line every 2s (out/in KB/s, retransmit count +
+  %, drops, cwnd, rwnd, flight, send-queue depth, rto). Any code can snapshot it via `sctp-stats`.
+- **Loss test**: set `cl-webrtc::*sctp-drop-rate*` (e.g. 0.15) to drop that fraction of outbound
+  packets — the desktop still renders correctly, proving retransmission recovers.
