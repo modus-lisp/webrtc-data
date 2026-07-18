@@ -30,6 +30,8 @@
     (sb-bsd-sockets:socket-connect s (sb-bsd-sockets:make-inet-address *glass-host*) *glass-port*)
     s))
 
+(defvar *last-assoc* nil)   ; most recent SCTP association, for the /stats endpoint
+
 (defun run-session (conn)
   "Drive DTLS, then run the data channel; bridge it to glass once it opens."
   (let ((glass nil))
@@ -41,7 +43,7 @@
                conn :duration 3600.0
                :on-ready
                (lambda (assoc sid)
-                 (setf glass (glass-connect))
+                 (setf glass (glass-connect) *last-assoc* assoc)
                  (format *error-output* "~&[gw] channel open (stream ~a) -> glass ~a:~a~%"
                          sid *glass-host* *glass-port*)
                  ;; glass -> browser: read RFB, chunk under the no-fragmentation limit
@@ -87,7 +89,8 @@
                                     (/ (d :bytes-out) 1024d0 dt) (/ (d :bytes-in) 1024d0 dt)
                                     (d :rtx) (d :drops) (getf now :cwnd)
                                     (or (getf now :srtt-ms) -1) (getf now :flight) (getf now :send-q)
-                                    (getf now :rto)))
+                                    (getf now :rto))
+                            (finish-output *error-output*))   ; flush: survive an ungraceful kill
                           (setf prev now t0 (get-internal-real-time))))))
                   :name "gw-stats"))
                :on-message
@@ -104,7 +107,9 @@
   "POST /signal: body is the browser's offer SDP; return our answer SDP."
   (setf (hunchentoot:content-type*) "application/sdp")
   (let* ((offer (parse-sdp (hunchentoot:raw-post-data :force-text t)))
-         (agent (make-ice))
+         ;; ICE_LOCAL_IP pins the advertised host candidate (multi-homed / netns / container
+         ;; deploys, where auto-detect can't reach 8.8.8.8); nil = auto-detect.
+         (agent (make-ice :local-ip (uiop:getenv "ICE_LOCAL_IP")))
          (conn (webrtc-dtls-setup agent :remote-fingerprint (sdp-fingerprint offer)))
          (answer (ice-answer agent offer :fingerprint (dtls-conn-fingerprint conn))))
     (ice-serve agent)
@@ -122,10 +127,22 @@
       (setf (symbol-value (find-symbol "*SCTP-DROP-RATE*" :cl-webrtc)) (float r 1d0))))
   (format nil "drop-rate=~a~%" (symbol-value (find-symbol "*SCTP-DROP-RATE*" :cl-webrtc))))
 
+(defun handle-stats ()
+  "GET /stats — the current session's SCTP transport stats as JSON."
+  (setf (hunchentoot:content-type*) "application/json")
+  (if *last-assoc*
+      (format nil "{~{~a~^,~}}"
+              (loop for (k v) on (sctp-stats *last-assoc*) by #'cddr
+                    collect (format nil "\"~(~a~)\":~a"
+                                    k (cond ((null v) -1) ((symbolp v) (format nil "\"~(~a~)\"" v))
+                                            ((floatp v) (format nil "~,2f" v)) (t v)))))
+      "{}"))
+
 (setf hunchentoot:*dispatch-table*
       (list (hunchentoot:create-folder-dispatcher-and-handler "/novnc/" *novnc*)
             (hunchentoot:create-regex-dispatcher "^/signal$" #'handle-signal)
             (hunchentoot:create-regex-dispatcher "^/drop$" #'handle-drop)
+            (hunchentoot:create-regex-dispatcher "^/stats$" #'handle-stats)
             (hunchentoot:create-regex-dispatcher "^/$" #'handle-index)))
 
 (defvar *acceptor*
