@@ -1,5 +1,7 @@
 pristine|delay 1ms loss 0
 good-wifi|delay 15ms 5ms loss 0.3%
+mobile-3g|delay 100ms 20ms loss 1% rate 2mbit
 bad-wifi|delay 80ms 20ms distribution normal loss 5%
+throttled|delay 40ms 10ms loss 0.5% rate 500kbit
 satellite|delay 300ms 40ms loss 1%
 awful|delay 150ms 60ms distribution normal loss 15% reorder 10%
