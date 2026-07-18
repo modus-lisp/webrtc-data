@@ -20,8 +20,8 @@
      (:file "sdp")         ; offer parse + answer generation (data-channel m-line)
      (:file "stun")        ; STUN messages: MESSAGE-INTEGRITY + FINGERPRINT (ICE checks)
      (:file "turn")        ; TURN client (RFC 5766/8656): relay candidate + ChannelData
-     (:file "ice")         ; ICE-lite agent: UDP socket + answer connectivity checks
-     (:file "dtls")        ; DTLS 1.2 client (via seal) + RSA cert generation
+     (:file "ice")         ; full ICE agent: UDP socket, host/srflx/relay candidates + own checks
+     (:file "dtls")        ; DTLS 1.2 client (via seal) + ECDSA P-256 cert generation
      (:file "sctp")))))    ; SCTP association + DCEP (data channels over DTLS)
 
 ;;; Optional integration: register :webrtc as a cl-transport INBOUND backend, so any modus-lisp
