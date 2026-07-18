@@ -12,6 +12,12 @@
   (:export #:parse-sdp #:make-answer-sdp #:sdp-session
            #:sdp-ice-ufrag #:sdp-ice-pwd #:sdp-fingerprint #:sdp-setup
            #:sdp-candidates #:sdp-sctp-port #:sdp-mid
+           #:make-ice #:ice-answer #:ice-serve #:ice-start-checks #:ice-close
+           #:ice-gather-srflx #:ice-gather-relay #:ice-agent-relay-ip #:ice-agent-relay-port
+           #:ice-agent-srflx-ip #:ice-agent-srflx-port #:ice-agent-turn #:ice-agent-peer
+           #:ice-agent-local-ip #:ice-agent-port #:turn-start-refresh
+           #:turn-allocate #:turn-alloc-relay-ip #:turn-alloc-relay-port #:make-turn-alloc
+           #:turn-install-peer #:turn-create-permission #:turn-channel-bind #:turn-refresh
            #:generate-webrtc-cert #:webrtc-dtls-setup #:webrtc-dtls-run
            #:dtls-conn-session #:dtls-conn-fingerprint
            #:webrtc-serve-datachannel #:sctp-assoc #:sctp-assoc-state

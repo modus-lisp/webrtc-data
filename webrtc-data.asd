@@ -19,6 +19,7 @@
      (:file "util")        ; byte helpers, base64, random
      (:file "sdp")         ; offer parse + answer generation (data-channel m-line)
      (:file "stun")        ; STUN messages: MESSAGE-INTEGRITY + FINGERPRINT (ICE checks)
+     (:file "turn")        ; TURN client (RFC 5766/8656): relay candidate + ChannelData
      (:file "ice")         ; ICE-lite agent: UDP socket + answer connectivity checks
      (:file "dtls")        ; DTLS 1.2 client (via seal) + RSA cert generation
      (:file "sctp")))))    ; SCTP association + DCEP (data channels over DTLS)

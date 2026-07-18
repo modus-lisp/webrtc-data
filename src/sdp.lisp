@@ -49,18 +49,24 @@
              (push (parse-candidate v) (sdp-candidates s)))))))))
 
 (defun make-answer-sdp (&key ice-ufrag ice-pwd fingerprint ip port srflx-ip srflx-port
+                             relay-ip relay-port
                              (sctp-port 5000) (mid "0") (setup "active") (foundation "1")
                              (priority 2130706431) (session-id "3993324220") (lite t))
   "Build the answer SDP.  FINGERPRINT is our DTLS cert's SHA-256 as colon-hex; IP/PORT is our
    host ICE candidate; SRFLX-IP/PORT, when supplied, adds a server-reflexive candidate so a peer
-   behind a different NAT can reach us; SETUP \"active\" means we are the DTLS client; LITE
-   advertises ICE-lite (the peer does all connectivity checks + nomination — we only answer)."
+   behind a different NAT can reach us; RELAY-IP/PORT adds a `typ relay` (TURN) candidate — a
+   stable server-side address that works even through a symmetric NAT; SETUP \"active\" means we
+   are the DTLS client; LITE advertises ICE-lite (the peer does the checks + nomination)."
   (let ((candidates
           (concatenate 'string
             (format nil "a=candidate:~a 1 udp ~d ~a ~d typ host~%" foundation priority ip port)
             (if srflx-ip
                 (format nil "a=candidate:2 1 udp ~d ~a ~d typ srflx raddr ~a rport ~d~%"
                         1694498815 srflx-ip srflx-port ip port)   ; srflx type-pref 100
+                "")
+            (if relay-ip
+                (format nil "a=candidate:3 1 udp ~d ~a ~d typ relay raddr ~a rport ~d~%"
+                        41885439 relay-ip relay-port (or srflx-ip ip) (or srflx-port port))
                 "")
             (format nil "a=end-of-candidates~%"))))
     (format nil "v=0~%o=- ~a ~a IN IP4 0.0.0.0~%s=-~%t=0 0~%~@[a=ice-lite~%~*~]a=group:BUNDLE ~a~%~
