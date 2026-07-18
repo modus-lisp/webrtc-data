@@ -111,10 +111,12 @@
          ;; deploys, where auto-detect can't reach 8.8.8.8); nil = auto-detect.
          (agent (make-ice :local-ip (uiop:getenv "ICE_LOCAL_IP")))
          (conn (webrtc-dtls-setup agent :remote-fingerprint (sdp-fingerprint offer)))
-         ;; GATHER_SRFLX=1 → also advertise our public (STUN-discovered) address for NAT traversal
-         ;; (adds a STUN round-trip; leave off for LAN where the host candidate suffices).
+         ;; GATHER_SRFLX=1 → advertise our public (STUN) address for NAT traversal; setting
+         ;; TURN_SERVER/TURN_USER/TURN_PASS additionally Allocates a TURN relay candidate, which
+         ;; covers symmetric NAT. Both add a round-trip; leave off for LAN.
          (answer (ice-answer agent offer :fingerprint (dtls-conn-fingerprint conn)
-                             :gather-srflx (and (uiop:getenv "GATHER_SRFLX") t))))
+                             :gather-srflx (and (uiop:getenv "GATHER_SRFLX") t)
+                             :gather-relay (and (uiop:getenv "TURN_SERVER") t))))
     (ice-serve agent)
     ;; full-agent checks (punch our NAT mapping open toward the peer) when NAT traversal is on
     (when (uiop:getenv "GATHER_SRFLX") (ice-start-checks agent))
