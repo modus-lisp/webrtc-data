@@ -11,10 +11,12 @@ async def main(url, out, secs):
                 _,ts,fps,kbps,mps,buf=t.split(); series.append([round(time.monotonic()-t0[0],2),float(fps),float(kbps),float(buf)])
         pg.on("console", onc)
         ts=time.monotonic(); await pg.goto(url)
+        dtls_at=[None]
         for _ in range(80):                              # up to 40s to bring RFB up over a bad link
             txt=await pg.locator("#hud").text_content()
+            if txt and "connected" in txt and dtls_at[0] is None: dtls_at[0]=round(time.monotonic()-ts,1)
             if txt and "glass-term" in txt: connected_at=round(time.monotonic()-ts,1); break
-            await pg.wait_for_timeout(500)
+            await pg.wait_for_timeout(300)
         if connected_at is None:
             print("@@RESULT connect=NONE"); await b.close(); json.dump({"series":[],"connect_s":None,"stats":{}},open(out,"w")); return
         await pg.mouse.click(300,200); await pg.wait_for_timeout(400)
@@ -27,5 +29,5 @@ async def main(url, out, secs):
     fps=sorted(r[1] for r in series); med=fps[len(fps)//2] if fps else 0
     kbps=max((r[2] for r in series),default=0)
     json.dump({"series":series,"connect_s":connected_at,"stats":stats},open(out,"w"))
-    print(f"@@RESULT connect={connected_at}s fps={med} srtt={stats.get('srtt-ms',-1)} rtx={stats.get('rtx',0)} drops={stats.get('drops',0)} cwnd={stats.get('cwnd',0)} peakKBs={round(kbps,1)}")
+    print(f"@@RESULT dtls={dtls_at[0]}s rfb={connected_at}s fps={med} srtt={stats.get('srtt-ms',-1)} rtx={stats.get('rtx',0)} drops={stats.get('drops',0)} cwnd={stats.get('cwnd',0)} peakKBs={round(kbps,1)}")
 asyncio.run(main(sys.argv[1], sys.argv[2], float(sys.argv[3])))

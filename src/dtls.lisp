@@ -157,9 +157,11 @@ ICE-SERVE so no early DTLS records are dropped."
       (make-dtls-conn :agent agent :session session :mailbox mb
                       :cert-der der :sign-fn sign-fn :fingerprint fp))))
 
-(defun webrtc-dtls-run (conn &key (timeout 1.0) (peer-wait 15.0))
-  "Wait for ICE to settle on a peer, then drive the DTLS client handshake.
-Returns the seal DTLS-SESSION on success (SEAL:DTLS-DONE true)."
+(defun webrtc-dtls-run (conn &key (timeout 0.4) (peer-wait 20.0))
+  "Wait for ICE to settle on a peer, then drive the DTLS client handshake.  TIMEOUT is the
+INITIAL handshake retransmit timer — seal backs it off exponentially, so a low value makes a
+lossy link recover fast without storming a high-RTT one.  Returns the seal DTLS-SESSION on
+success (SEAL:DTLS-DONE true)."
   (let ((agent (dtls-conn-agent conn)))
     (loop with deadline = (+ (get-internal-real-time)
                              (round (* peer-wait internal-time-units-per-second)))
