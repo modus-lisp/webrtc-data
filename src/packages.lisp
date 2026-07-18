@@ -12,6 +12,8 @@
   (:export #:parse-sdp #:make-answer-sdp #:sdp-session
            #:sdp-ice-ufrag #:sdp-ice-pwd #:sdp-fingerprint #:sdp-setup
            #:sdp-candidates #:sdp-sctp-port #:sdp-mid
+           #:generate-webrtc-cert #:webrtc-dtls-setup #:webrtc-dtls-run
+           #:dtls-conn-session #:dtls-conn-fingerprint
            #:webrtc-error))
 
 (in-package #:cl-webrtc)
