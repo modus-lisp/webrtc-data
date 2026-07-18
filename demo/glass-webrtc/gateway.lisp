@@ -16,9 +16,9 @@
 
 (defparameter *dir* (uiop:pathname-directory-pathname
                      (or *load-pathname* *default-pathname-defaults*)))
-;; noVNC checkout: $NOVNC_DIR, else ../novnc/ next to this demo.
+;; noVNC: $NOVNC_DIR, else the vendored copy next to this demo (novnc/, includes our TRLE decoder).
 (defparameter *novnc* (truename (or (uiop:getenv "NOVNC_DIR")
-                                    (merge-pathnames "../novnc/" *dir*))))
+                                    (merge-pathnames "novnc/" *dir*))))
 (defparameter *index* (uiop:read-file-string (merge-pathnames "index.html" *dir*)))
 (defparameter *port*       (or (ignore-errors (parse-integer (uiop:getenv "GW_PORT"))) 8765))
 (defparameter *epoch* (get-internal-real-time))   ; series time origin (ms since load)
