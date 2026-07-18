@@ -74,6 +74,7 @@
 (defconstant +sctp-rto-max+  60.0d0)
 (defconstant +sctp-fast-rtx-threshold+ 3)    ; missing reports before fast retransmit
 (defconstant +sctp-dup-report-max+ 32)       ; cap duplicate TSNs reported per SACK
+(defconstant +sctp-max-rto-strikes+ 8)       ; consecutive RTO fires w/o progress -> peer gone
 
 (defparameter *sctp-drop-rate* 0.0
   "TEST AID: probability in [0.0,1.0] that SCTP-TRANSMIT silently drops an outbound
@@ -148,9 +149,15 @@ the given already-encoded chunks."
   (peer-rwnd 0)                              ; peer's advertised receive window (from INIT/SACK)
   peer-cum-ack                               ; highest TSN the peer has cumulatively acked
   (rto +sctp-rto-init+)                      ; current retransmission timeout (s)
+  (rto-strikes 0)                            ; consecutive RTO fires with no forward progress
   ;; --- receive side (peer -> us) ---
   (rcv-buffer (make-hash-table))             ; tsn -> (list stream-id ppid user), out-of-order
   (dup-tsns nil)                             ; duplicate TSNs to report in the next SACK
+  ;; --- stats (cumulative counters, for performance monitoring) ---
+  (n-bytes-out 0) (n-bytes-in 0)             ; DATA payload bytes sent / received
+  (n-data-out 0) (n-data-in 0)               ; DATA chunks sent (incl. retransmits) / received
+  (n-rtx 0) (n-fast-rtx 0) (n-rto 0)         ; chunks retransmitted, fast-retransmits, RTO events
+  (n-sack-in 0) (n-drop 0)                   ; SACKs processed, packets dropped by *sctp-drop-rate*
   ;; --- glue ---
   on-message                                 ; (funcall on-message assoc stream-id payload)
   on-ready                                   ; (funcall on-ready assoc stream-id) at DCEP OPEN
@@ -174,8 +181,9 @@ glass framebuffer pump sends concurrently with the SCTP receive loop.  Honours
   (bt:with-recursive-lock-held ((sctp-assoc-send-lock assoc))
     (let ((pkt (apply #'sctp-packet (or (sctp-assoc-peer-tag assoc) 0)
                       chunk-byte-vectors)))
-      (unless (and (plusp *sctp-drop-rate*) (< (random 1.0) *sctp-drop-rate*))
-        (seal:dtls-send-app (sctp-assoc-session assoc) pkt)))))
+      (if (and (plusp *sctp-drop-rate*) (< (random 1.0) *sctp-drop-rate*))
+          (incf (sctp-assoc-n-drop assoc))
+          (seal:dtls-send-app (sctp-assoc-session assoc) pkt)))))
 
 ;;; ---- outbound: send queue, flow control, retransmission --------------------
 
@@ -231,6 +239,8 @@ nothing is in flight (zero-window / cold-start probe) so the stream can't wedge.
              (setf (txc-sent txc) (sctp-now))
              (setf (gethash (txc-tsn txc) (sctp-assoc-outstanding assoc)) txc)
              (incf (sctp-assoc-flight assoc) size)
+             (incf (sctp-assoc-n-data-out assoc))
+             (incf (sctp-assoc-n-bytes-out assoc) size)
              (sctp-transmit assoc (txc-bytes txc)))))
 
 (defun sctp-send-data (assoc stream-id ppid data)
@@ -282,11 +292,18 @@ retransmit every outstanding chunk (oldest first)."
               (max (floor (sctp-assoc-flight assoc) 2) (* 4 +sctp-mtu+)))
         (setf (sctp-assoc-cwnd assoc) +sctp-mtu+)
         (setf (sctp-assoc-rto assoc) (min +sctp-rto-max+ (* 2 (sctp-assoc-rto assoc))))
+        (when (>= (incf (sctp-assoc-rto-strikes assoc)) +sctp-max-rto-strikes+)
+          (sctp-log assoc "~&  !! peer unreachable (~a RTO strikes) -> abort~%"
+                    (sctp-assoc-rto-strikes assoc))
+          (setf (sctp-assoc-state assoc) :aborted)
+          (return-from sctp-tick))
         (let ((chunks (sort (loop for txc being the hash-values of (sctp-assoc-outstanding assoc)
                                   collect txc)
                             (lambda (a b) (tsn< (txc-tsn a) (txc-tsn b))))))
           (sctp-log assoc "~&  !! RTO fire: retransmit ~a chunk(s) rto=~,2f cwnd=~a~%"
                     (length chunks) (sctp-assoc-rto assoc) (sctp-assoc-cwnd assoc))
+          (incf (sctp-assoc-n-rto assoc))
+          (incf (sctp-assoc-n-rtx assoc) (length chunks))
           (dolist (txc chunks)
             (setf (txc-sent txc) (sctp-now) (txc-missing txc) 0)
             (sctp-transmit assoc (txc-bytes txc))))))))
@@ -297,6 +314,7 @@ update the peer's advertised window, grow the congestion window, fast-retransmit
 chunk reported missing >=3 times, then flush whatever the window now allows."
   (when (< (length value) 12) (return-from sctp-handle-sack))
   (bt:with-recursive-lock-held ((sctp-assoc-send-lock assoc))
+    (incf (sctp-assoc-n-sack-in assoc))
     (let* ((cum      (rd-u32be value 0))
            (new-rwnd (rd-u32be value 4))
            (ngap     (rd-u16be value 8))
@@ -343,6 +361,8 @@ chunk reported missing >=3 times, then flush whatever the window now allows."
                     (max (floor (sctp-assoc-flight assoc) 2) (* 4 +sctp-mtu+)))
               (setf (sctp-assoc-cwnd assoc) (sctp-assoc-ssthresh assoc))
               (sctp-log assoc "~&  !! fast-retransmit ~a chunk(s)~%" (length fast))
+              (incf (sctp-assoc-n-fast-rtx assoc) (length fast))
+              (incf (sctp-assoc-n-rtx assoc) (length fast))
               (dolist (txc (sort fast (lambda (a b) (tsn< (txc-tsn a) (txc-tsn b)))))
                 (setf (txc-sent txc) (sctp-now) (txc-missing txc) 0)
                 (sctp-transmit assoc (txc-bytes txc)))))))
@@ -350,7 +370,8 @@ chunk reported missing >=3 times, then flush whatever the window now allows."
       (setf (sctp-assoc-peer-rwnd assoc) new-rwnd)
       (when (and (sctp-assoc-peer-cum-ack assoc)
                  (tsn< (sctp-assoc-peer-cum-ack assoc) cum))
-        (setf (sctp-assoc-rto assoc) +sctp-rto-init+))  ; forward progress: reset RTO
+        (setf (sctp-assoc-rto assoc) +sctp-rto-init+     ; forward progress: reset RTO
+              (sctp-assoc-rto-strikes assoc) 0))         ; ... and the unreachable counter
       (setf (sctp-assoc-peer-cum-ack assoc) cum)
       (when (plusp acked)
         (if (<= (sctp-assoc-cwnd assoc) (sctp-assoc-ssthresh assoc))
@@ -453,6 +474,8 @@ now-contiguous buffered TSNs drain); a future TSN is buffered; a past TSN is a d
          (ppid (rd-u32be value 8))
          (user (subseq value 12))
          (cum (sctp-assoc-last-received-tsn assoc)))
+    (incf (sctp-assoc-n-data-in assoc))
+    (incf (sctp-assoc-n-bytes-in assoc) (length user))
     (cond
       ;; duplicate / already delivered — ack again, report as a duplicate, don't redeliver
       ((tsn<= tsn cum)
@@ -509,6 +532,23 @@ handling INIT / COOKIE-ECHO / DATA / SACK / HEARTBEAT, and sends a SACK if DATA 
         ;; advance past chunk + padding
         (incf pos (+ clen (mod (- (mod clen 4)) 4)))))
     (when data-seen (sctp-send-sack assoc))))
+
+;;; ---- performance monitoring ------------------------------------------------
+
+(defun sctp-stats (assoc)
+  "A snapshot plist of transport counters + live window state.  Cumulative counters (:bytes-*,
+:data-*, :rtx, :drops, ...) let a caller compute rates by differencing over time; the window
+fields (:cwnd, :peer-rwnd, :flight, :outstanding, :send-q, :rto) are instantaneous health."
+  (list :state       (sctp-assoc-state assoc)
+        :bytes-out   (sctp-assoc-n-bytes-out assoc) :bytes-in (sctp-assoc-n-bytes-in assoc)
+        :data-out    (sctp-assoc-n-data-out assoc)  :data-in  (sctp-assoc-n-data-in assoc)
+        :rtx         (sctp-assoc-n-rtx assoc)       :fast-rtx (sctp-assoc-n-fast-rtx assoc)
+        :rto-events  (sctp-assoc-n-rto assoc)       :sacks-in (sctp-assoc-n-sack-in assoc)
+        :drops       (sctp-assoc-n-drop assoc)
+        :cwnd        (sctp-assoc-cwnd assoc)        :peer-rwnd (sctp-assoc-peer-rwnd assoc)
+        :flight      (sctp-assoc-flight assoc)      :rto      (sctp-assoc-rto assoc)
+        :outstanding (hash-table-count (sctp-assoc-outstanding assoc))
+        :send-q      (sctp-assoc-send-q-len assoc)))
 
 ;;; ---- driver: run the association over a DTLS-CONN --------------------------
 

@@ -4,10 +4,17 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
   <title>glass over WebRTC</title>
-  <style>html,body{margin:0;height:100%;background:#111;overflow:hidden}#screen{width:100vw;height:100vh}</style>
+  <style>
+    html,body{margin:0;height:100%;background:#111;overflow:hidden}#screen{width:100vw;height:100vh}
+    #hud{position:fixed;top:6px;right:6px;z-index:10;font:11px/1.45 ui-monospace,Menlo,monospace;
+         color:#7CFC9B;background:rgba(0,0,0,.62);padding:6px 9px;border-radius:6px;
+         white-space:pre;pointer-events:none;text-shadow:0 0 2px #000}
+    #hud b{color:#fff;font-weight:600}
+  </style>
 </head>
 <body>
   <div id="screen"></div>
+  <div id="hud">connecting…</div>
   <script type="module">
     import RFB from '/novnc/core/rfb.js';
     const log = (...a) => console.log('[glass-webrtc]', ...a);
@@ -27,6 +34,28 @@
     rfb.focusOnClick = true;
     rfb.addEventListener('connect', () => { log('RFB connected'); rfb.focus(); });
     rfb.addEventListener('disconnect', e => log('RFB disconnect', e.detail));
+
+    // --- performance HUD: real rendered FPS + throughput + backpressure ---------
+    let frames = 0, bytesIn = 0, msgsIn = 0;
+    // count a frame each time noVNC finishes consuming a FramebufferUpdate
+    const origFBU = rfb._framebufferUpdate.bind(rfb);
+    rfb._framebufferUpdate = function () { const done = origFBU(); if (done) frames++; return done; };
+    // count inbound bytes/messages without stealing noVNC's own onmessage handler
+    ch.addEventListener('message', e => {
+      bytesIn += (e.data.byteLength ?? e.data.length ?? 0); msgsIn++;
+    });
+    const hud = document.getElementById('hud');
+    let last = performance.now();
+    setInterval(() => {
+      const now = performance.now(), dt = (now - last) / 1000; last = now;
+      const fps = frames / dt, kbs = bytesIn / 1024 / dt, mps = msgsIn / dt;
+      frames = bytesIn = msgsIn = 0;
+      const buf = ch.bufferedAmount || 0;
+      hud.innerHTML =
+        `<b>${fps.toFixed(0)}</b> fps   <b>${kbs.toFixed(0)}</b> KB/s\n` +
+        `${mps.toFixed(0)} msg/s   buf ${(buf/1024).toFixed(0)} KB\n` +
+        `${pc.connectionState} · ${rfb._fbName || 'rfb'}`;
+    }, 1000);
 
     (async () => {
       await pc.setLocalDescription(await pc.createOffer());

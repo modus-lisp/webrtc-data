@@ -56,7 +56,28 @@
                                     do (sctp-send-binary assoc sid
                                                          (subseq buf off (min n (+ off 1024)))))))
                         (error () nil))))
-                  :name "glass->ch"))
+                  :name "glass->ch")
+                 ;; transport-health monitor: log SCTP rates every 2s until the peer aborts
+                 (bt:make-thread
+                  (lambda ()
+                    (let ((prev (sctp-stats assoc)) (t0 (get-internal-real-time)))
+                      (loop until (eq (getf (sctp-stats assoc) :state) :aborted) do
+                        (sleep 2.0)
+                        (let* ((now (sctp-stats assoc))
+                               (dt (max 1d-3 (/ (float (- (get-internal-real-time) t0) 1d0)
+                                                internal-time-units-per-second))))
+                          (flet ((d (k) (- (getf now k) (getf prev k))))
+                            (format *error-output*
+                                    "~&[stats] out ~,1f KB/s  in ~,1f KB/s  rtx ~a (~,1f%)  drops ~a  ~
+                                     cwnd ~a  rwnd ~a  flight ~a  outq ~a  rto ~,2f~%"
+                                    (/ (d :bytes-out) 1024d0 dt) (/ (d :bytes-in) 1024d0 dt)
+                                    (d :rtx)
+                                    (if (plusp (d :data-out)) (* 100d0 (/ (d :rtx) (d :data-out))) 0d0)
+                                    (d :drops)
+                                    (getf now :cwnd) (getf now :peer-rwnd) (getf now :flight)
+                                    (getf now :send-q) (getf now :rto)))
+                          (setf prev now t0 (get-internal-real-time))))))
+                  :name "gw-stats"))
                :on-message
                (lambda (assoc sid payload)
                  (declare (ignore assoc sid))
