@@ -23,3 +23,21 @@
      (:file "ice")         ; ICE-lite agent: UDP socket + answer connectivity checks
      (:file "dtls")        ; DTLS 1.2 client (via seal) + RSA cert generation
      (:file "sctp")))))    ; SCTP association + DCEP (data channels over DTLS)
+
+;;; Optional integration: register :webrtc as a cl-transport INBOUND backend, so any modus-lisp
+;;; code can accept WebRTC data-channel connections through cl-transport's uniform EXPOSE — just
+;;; like :tcp (built in) and :frp (via cl-frpc).  cl-transport + hunchentoot stay OUT of core
+;;; webrtc-data's deps; they're only pulled in when you load this system.
+(defsystem "webrtc-data/transport"
+  :description "cl-transport :webrtc inbound backend: accept WebRTC data channels via EXPOSE."
+  :version "0.1.0"
+  :author "ynniv"
+  :license "MIT"
+  :depends-on ("webrtc-data" "cl-transport" "hunchentoot" "bordeaux-threads")
+  :serial t
+  :components
+  ((:module "src"
+    :serial t
+    :components
+    ((:file "transport-package")
+     (:file "transport")))))   ; Gray channel stream + %webrtc-expose + register :webrtc
