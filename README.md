@@ -72,8 +72,8 @@ peer-death detection.
 
 - **Loss resilience** — with `*sctp-drop-rate*` set to 0.15 (15 % of outbound packets dropped),
   the glass desktop still renders **completely**; retransmission recovers. The prior "blast and
-  hope" version wedged to a blank screen under the same loss. `demo/netsim/` conditions the link
-  (netem loss/delay/reorder/rate) to reproduce this on demand.
+  hope" version wedged to a blank screen under the same loss. `demo/glass-webrtc/netsim/`
+  conditions the link (netem loss/delay/reorder/rate) to reproduce this on demand.
 - **Handshake under loss** — the DTLS flight layer coalesces and backs off exponentially, so an
   *awful* link (15 % loss + reorder) that never completed a handshake before now connects.
 - **Performance** — `sctp-stats` exposes counters + live window state; the demo shows a live HUD
