@@ -48,17 +48,25 @@
             ((setf v (%aval line "a=candidate:"))
              (push (parse-candidate v) (sdp-candidates s)))))))))
 
-(defun make-answer-sdp (&key ice-ufrag ice-pwd fingerprint ip port
+(defun make-answer-sdp (&key ice-ufrag ice-pwd fingerprint ip port srflx-ip srflx-port
                              (sctp-port 5000) (mid "0") (setup "active") (foundation "1")
                              (priority 2130706431) (session-id "3993324220") (lite t))
   "Build the answer SDP.  FINGERPRINT is our DTLS cert's SHA-256 as colon-hex; IP/PORT is our
-   host ICE candidate; SETUP \"active\" means we are the DTLS client; LITE advertises ICE-lite
-   (the peer then does all connectivity checks + nomination — we only answer)."
-  (format nil "v=0~%o=- ~a ~a IN IP4 0.0.0.0~%s=-~%t=0 0~%~@[a=ice-lite~%~*~]a=group:BUNDLE ~a~%~
-               a=msid-semantic:WMS *~%~
-               m=application ~d UDP/DTLS/SCTP webrtc-datachannel~%~
-               c=IN IP4 ~a~%a=mid:~a~%a=sctp-port:~d~%a=max-message-size:65536~%~
-               a=candidate:~a 1 udp ~d ~a ~d typ host~%a=end-of-candidates~%~
-               a=ice-ufrag:~a~%a=ice-pwd:~a~%a=fingerprint:sha-256 ~a~%a=setup:~a~%"
-          session-id session-id lite mid port ip mid sctp-port
-          foundation priority ip port ice-ufrag ice-pwd fingerprint setup))
+   host ICE candidate; SRFLX-IP/PORT, when supplied, adds a server-reflexive candidate so a peer
+   behind a different NAT can reach us; SETUP \"active\" means we are the DTLS client; LITE
+   advertises ICE-lite (the peer does all connectivity checks + nomination — we only answer)."
+  (let ((candidates
+          (concatenate 'string
+            (format nil "a=candidate:~a 1 udp ~d ~a ~d typ host~%" foundation priority ip port)
+            (if srflx-ip
+                (format nil "a=candidate:2 1 udp ~d ~a ~d typ srflx raddr ~a rport ~d~%"
+                        1694498815 srflx-ip srflx-port ip port)   ; srflx type-pref 100
+                "")
+            (format nil "a=end-of-candidates~%"))))
+    (format nil "v=0~%o=- ~a ~a IN IP4 0.0.0.0~%s=-~%t=0 0~%~@[a=ice-lite~%~*~]a=group:BUNDLE ~a~%~
+                 a=msid-semantic:WMS *~%~
+                 m=application ~d UDP/DTLS/SCTP webrtc-datachannel~%~
+                 c=IN IP4 ~a~%a=mid:~a~%a=sctp-port:~d~%a=max-message-size:65536~%~a~
+                 a=ice-ufrag:~a~%a=ice-pwd:~a~%a=fingerprint:sha-256 ~a~%a=setup:~a~%"
+            session-id session-id lite mid port ip mid sctp-port
+            candidates ice-ufrag ice-pwd fingerprint setup)))

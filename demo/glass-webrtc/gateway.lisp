@@ -111,7 +111,10 @@
          ;; deploys, where auto-detect can't reach 8.8.8.8); nil = auto-detect.
          (agent (make-ice :local-ip (uiop:getenv "ICE_LOCAL_IP")))
          (conn (webrtc-dtls-setup agent :remote-fingerprint (sdp-fingerprint offer)))
-         (answer (ice-answer agent offer :fingerprint (dtls-conn-fingerprint conn))))
+         ;; GATHER_SRFLX=1 → also advertise our public (STUN-discovered) address for NAT traversal
+         ;; (adds a STUN round-trip; leave off for LAN where the host candidate suffices).
+         (answer (ice-answer agent offer :fingerprint (dtls-conn-fingerprint conn)
+                             :gather-srflx (and (uiop:getenv "GATHER_SRFLX") t))))
     (ice-serve agent)
     (bt:make-thread (lambda () (run-session conn)) :name "webrtc-session")
     answer))

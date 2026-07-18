@@ -80,6 +80,16 @@
         (xaddr (logxor (rd-u32be (as-u8vec ip-octets) 0) +stun-magic+)))
     (cat-bytes (as-u8vec (list 0 1)) (u16be xport) (u32be xaddr))))   ; reserved, family=IPv4
 
+(defun parse-xor-mapped-address (value)
+  "Decode an XOR-MAPPED-ADDRESS value -> (values dotted-ip-string port), IPv4 only, else NIL.
+Used to read our server-reflexive (public) address out of a STUN server's Binding response."
+  (when (and (>= (length value) 8) (= (aref value 1) 1))       ; family = IPv4
+    (let ((port (logxor (rd-u16be value 2) (ash +stun-magic+ -16)))
+          (addr (logxor (rd-u32be value 4) +stun-magic+)))
+      (values (format nil "~d.~d.~d.~d" (ldb (byte 8 24) addr) (ldb (byte 8 16) addr)
+                      (ldb (byte 8 8) addr) (ldb (byte 8 0) addr))
+              port))))
+
 (defun stun-attr (attrs type) (cdr (assoc type attrs)))
 
 (defun stun-username-key (val) (bytes->ascii val))   ; ICE USERNAME = "rfrag:lfrag"

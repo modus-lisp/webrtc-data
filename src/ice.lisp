@@ -14,7 +14,22 @@
   (map 'string (lambda (b) (char +ice-chars+ (mod b 62))) (random-bytes n)))
 
 (defstruct ice-agent socket port local-ip local-ufrag local-pwd remote-ufrag remote-pwd
+  srflx-ip srflx-port                          ; server-reflexive (public) address, if gathered
   (on-packet nil) (peer nil) (stop nil) thread)
+
+(defparameter *stun-servers*
+  '(("stun.l.google.com" . 19302) ("stun.cloudflare.com" . 3478))
+  "Public STUN servers tried in order to discover our server-reflexive address.")
+
+(defun resolve-host (host)
+  "Dotted-quad IP string for HOST (a dotted string passes through); NIL on failure."
+  (handler-case
+      (if (every (lambda (c) (or (digit-char-p c) (char= c #\.))) host)
+          host
+          (format nil "~{~d~^.~}"
+                  (coerce (sb-bsd-sockets:host-ent-address
+                           (sb-bsd-sockets:get-host-by-name host)) 'list)))
+    (error () nil)))
 
 (defun local-ipv4 ()
   "Primary non-loopback IPv4 as a dotted string (connect a UDP socket outward, read its addr)."
@@ -37,19 +52,55 @@
       (make-ice-agent :socket sock :port port :local-ip (or local-ip (local-ipv4))
                       :local-ufrag (ice-string 4) :local-pwd (ice-string 22)))))
 
-(defun ice-answer (agent remote-sdp &key fingerprint (setup "active"))
-  "Record the remote credentials from REMOTE-SDP and return our answer SDP."
+(defun ice-answer (agent remote-sdp &key fingerprint (setup "active") gather-srflx)
+  "Record the remote credentials from REMOTE-SDP and return our answer SDP.  With GATHER-SRFLX,
+first discover our server-reflexive (public) address via STUN and include it as a candidate, so a
+peer behind a different NAT can reach us — must run before ICE-SERVE (it uses the ICE socket)."
   (setf (ice-agent-remote-ufrag agent) (sdp-ice-ufrag remote-sdp)
         (ice-agent-remote-pwd agent) (sdp-ice-pwd remote-sdp))
+  (when gather-srflx (ice-gather-srflx agent))
   (make-answer-sdp :ice-ufrag (ice-agent-local-ufrag agent) :ice-pwd (ice-agent-local-pwd agent)
                    :fingerprint (or fingerprint (colon-hex (u8vec 32)))   ; valid-format placeholder until DTLS
-
                    :ip (ice-agent-local-ip agent) :port (ice-agent-port agent)
+                   :srflx-ip (ice-agent-srflx-ip agent) :srflx-port (ice-agent-srflx-port agent)
                    :setup setup :mid (sdp-mid remote-sdp) :lite t))
 
 (defun ice-send (agent bytes host port)
   (sb-bsd-sockets:socket-send (ice-agent-socket agent) (as-u8vec bytes) (length bytes)
                               :address (list host port)))
+
+(defun ice-gather-srflx (agent &key (timeout 1.5))
+  "Discover our server-reflexive (public) transport address: send a STUN Binding request from
+the ICE socket to a public STUN server and read XOR-MAPPED-ADDRESS from the response, setting
+SRFLX-IP/PORT on AGENT.  Because the request goes out from the very socket ICE will use, the
+NAT mapping it creates is the one the peer will reach us through (host-candidate hole punch for
+cone NATs).  Best-effort — returns T on success, NIL if no server answers.  MUST run before
+ICE-SERVE so the response isn't consumed by the receive loop."
+  (let ((sock (ice-agent-socket agent)))
+    (dolist (server *stun-servers* nil)
+      (let ((ip (resolve-host (car server))))
+        (when ip
+          (handler-case
+              (let ((tid (stun-transaction-id)))
+                ;; ICE-SEND takes the peer host as a 4-octet vector (as socket-receive returns it),
+                ;; so convert the resolved dotted string.
+                (ice-send agent (encode-stun +binding-request+ tid nil :fingerprint t)
+                          (sb-bsd-sockets:make-inet-address ip) (cdr server))
+                (when (sb-sys:wait-until-fd-usable
+                       (sb-bsd-sockets:socket-file-descriptor sock) :input timeout)
+                  (let ((buf (make-array 512 :element-type '(unsigned-byte 8))))
+                    (multiple-value-bind (b len) (sb-bsd-sockets:socket-receive sock buf nil)
+                      (declare (ignore b))
+                      (when (and len (>= len 20))
+                        (multiple-value-bind (type rtid attrs) (decode-stun (subseq buf 0 len))
+                          (when (and (eql type +binding-success+) (equalp rtid tid))
+                            (multiple-value-bind (mip mport)
+                                (parse-xor-mapped-address (stun-attr attrs +attr-xor-mapped-address+))
+                              (when mip
+                                (setf (ice-agent-srflx-ip agent) mip
+                                      (ice-agent-srflx-port agent) mport)
+                                (return t))))))))))
+            (error () nil)))))))
 
 (defun ice-handle-stun (agent pkt from-host from-port)
   (multiple-value-bind (type tid) (decode-stun pkt)
