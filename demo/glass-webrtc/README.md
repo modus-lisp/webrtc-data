@@ -2,14 +2,14 @@
 
 Serve a [glass](https://github.com/modus-lisp/glass) desktop/terminal to a plain browser
 (iPhone Safari included) over the from-scratch WebRTC data-channel stack — no plugins, no
-Tor, P2P. cl-webrtc is a transparent RFB pipe: **noVNC** (in the browser) is the RFB client,
+Tor, P2P. webrtc-data is a transparent RFB pipe: **noVNC** (in the browser) is the RFB client,
 **glass** is the RFB server, and the bytes ride our ICE → DTLS → SCTP → data channel.
 
 ```
 browser (noVNC on an RTCDataChannel)
    │   SDP offer/answer over HTTP (hunchentoot)
    ▼
-cl-webrtc gateway  ──TCP──▶  glass RFB server (:5900)
+webrtc-data gateway  ──TCP──▶  glass RFB server (:5900)
    (ICE-lite · DTLS 1.2 · SCTP/DCEP)
 ```
 
@@ -41,5 +41,5 @@ Env overrides: `GW_PORT` (8765), `GLASS_HOST` (127.0.0.1), `GLASS_PORT` (5900), 
   transport is keeping up.
 - **Server-side**: the gateway logs an SCTP health line every 2s (out/in KB/s, retransmit count +
   %, drops, cwnd, rwnd, flight, send-queue depth, rto). Any code can snapshot it via `sctp-stats`.
-- **Loss test**: set `cl-webrtc::*sctp-drop-rate*` (e.g. 0.15) to drop that fraction of outbound
+- **Loss test**: set `webrtc-data::*sctp-drop-rate*` (e.g. 0.15) to drop that fraction of outbound
   packets — the desktop still renders correctly, proving retransmission recovers.

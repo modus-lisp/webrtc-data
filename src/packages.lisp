@@ -1,4 +1,4 @@
-;;;; cl-webrtc — a from-scratch WebRTC data-channel peer in pure Common Lisp.
+;;;; webrtc-data — a from-scratch WebRTC data-channel peer in pure Common Lisp.
 ;;;;
 ;;;; The goal: a browser (or aiortc) opens an RTCDataChannel to us with no plugins — so we
 ;;;; implement the answerer side of the stack it expects: SDP, ICE (STUN connectivity), DTLS
@@ -6,7 +6,7 @@
 ;;;; and input for `glass` ride the data channel.  Crypto via ironclad + seal; UDP via
 ;;;; sb-bsd-sockets.  Tested against aiortc (a spec-compliant peer), then a real browser.
 
-(defpackage #:cl-webrtc
+(defpackage #:webrtc-data
   (:use #:cl)
   (:local-nicknames (#:ic #:ironclad) (#:bt #:bordeaux-threads))
   (:export #:parse-sdp #:make-answer-sdp #:sdp-session
@@ -18,9 +18,9 @@
            #:sctp-send-data #:sctp-send-string #:sctp-send-binary #:sctp-stats
            #:webrtc-error))
 
-(in-package #:cl-webrtc)
+(in-package #:webrtc-data)
 
 (define-condition webrtc-error (error)
   ((msg :initarg :msg :reader webrtc-error-msg))
-  (:report (lambda (c s) (format s "cl-webrtc: ~a" (webrtc-error-msg c)))))
+  (:report (lambda (c s) (format s "webrtc-data: ~a" (webrtc-error-msg c)))))
 (defun werr (fmt &rest args) (error 'webrtc-error :msg (apply #'format nil fmt args)))

@@ -6,7 +6,7 @@
 ;;;; by the peer's ICE password, over the message with its length pre-adjusted to include the
 ;;;; attribute) and a FINGERPRINT (CRC-32 xor 0x5354554e).
 
-(in-package #:cl-webrtc)
+(in-package #:webrtc-data)
 
 (defconstant +stun-magic+ #x2112A442)
 (defparameter +binding-request+ #x0001)

@@ -15,7 +15,7 @@
 ;;;; arriving on the ICE socket are pumped into a mailbox, and seal's handshake
 ;;;; reads that mailbox and writes back through ICE-SEND.
 
-(in-package #:cl-webrtc)
+(in-package #:webrtc-data)
 
 ;;; ---- integer <-> octet-string + modular arithmetic -------------------------
 
@@ -78,7 +78,7 @@ certificate self-signature and DTLS CertificateVerify)."
 (defun build-self-signed-ec-cert (d pub)
   "Hand-build a self-signed ECDSA P-256 X.509 v3 certificate (DER).  PUB is the affine
 public point (d*G); D the private scalar.  ~330 bytes vs ~800 for RSA-2048."
-  (let* ((name (der-seq (der-set (der-seq +oid-cn+ (der-utf8 "cl-webrtc")))))
+  (let* ((name (der-seq (der-set (der-seq +oid-cn+ (der-utf8 "webrtc-data")))))
          (spki (der-seq (der-seq +oid-ec-public-key+ +oid-prime256v1+)   ; namedCurve as param
                         (der-bitstring (seal:ec-encode-point seal:*p256* pub))))
          (validity (der-seq (der-utctime "250101000000Z") (der-utctime "350101000000Z")))

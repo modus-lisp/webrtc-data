@@ -1,6 +1,6 @@
 ;;;; src/util.lisp — byte helpers shared across the stack.
 
-(in-package #:cl-webrtc)
+(in-package #:webrtc-data)
 
 (deftype u8 () '(unsigned-byte 8))
 (deftype u8vec () '(simple-array (unsigned-byte 8) (*)))

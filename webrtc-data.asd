@@ -1,10 +1,10 @@
-;;;; cl-webrtc.asd
+;;;; webrtc-data.asd
 ;;;;
 ;;;; A from-scratch WebRTC data-channel peer in pure Common Lisp: SDP + ICE/STUN + DTLS 1.2 +
 ;;;; SCTP/DCEP, so a browser (or aiortc) can open an RTCDataChannel with no plugins.  Data
 ;;;; channels only — no SRTP, no video codec; built to carry glass's framebuffer + input.
 
-(defsystem "cl-webrtc"
+(defsystem "webrtc-data"
   :description "A from-scratch WebRTC data-channel peer in pure Common Lisp (SDP/ICE/DTLS/SCTP)."
   :version "0.1.0"
   :author "ynniv"

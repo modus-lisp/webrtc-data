@@ -26,7 +26,7 @@
 ;;;; mailbox and running (seal:dtls-handle-datagram session datagram) -> list of SCTP
 ;;;; packets.
 
-(in-package #:cl-webrtc)
+(in-package #:webrtc-data)
 
 ;;; ---- constants -------------------------------------------------------------
 

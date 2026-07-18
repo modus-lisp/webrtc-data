@@ -1,7 +1,7 @@
 ;;;; gateway.lisp — serve glass over WebRTC to a browser (noVNC on the data channel).
 ;;;;
 ;;;; hunchentoot serves the noVNC page + one POST /signal for the SDP exchange.  For each
-;;;; browser we set up the cl-webrtc answerer (ICE-lite -> DTLS -> SCTP), and when the data
+;;;; browser we set up the webrtc-data answerer (ICE-lite -> DTLS -> SCTP), and when the data
 ;;;; channel opens we open a TCP connection to glass's RFB server and pump bytes both ways:
 ;;;;   glass -> channel  (chunked, since our SCTP doesn't fragment)
 ;;;;   channel -> glass  (noVNC's RFB client messages)
@@ -9,10 +9,10 @@
 
 (require :asdf)
 (handler-bind ((warning #'muffle-warning))
-  (asdf:load-system "cl-webrtc")
+  (asdf:load-system "webrtc-data")
   (ql:quickload '(:hunchentoot) :silent t))
 
-(in-package #:cl-webrtc)
+(in-package #:webrtc-data)
 
 (defparameter *dir* (uiop:pathname-directory-pathname
                      (or *load-pathname* *default-pathname-defaults*)))
@@ -124,8 +124,8 @@
   (setf (hunchentoot:content-type*) "text/plain")
   (let ((r (ignore-errors (read-from-string (hunchentoot:get-parameter "rate")))))
     (when (realp r)
-      (setf (symbol-value (find-symbol "*SCTP-DROP-RATE*" :cl-webrtc)) (float r 1d0))))
-  (format nil "drop-rate=~a~%" (symbol-value (find-symbol "*SCTP-DROP-RATE*" :cl-webrtc))))
+      (setf (symbol-value (find-symbol "*SCTP-DROP-RATE*" :webrtc-data)) (float r 1d0))))
+  (format nil "drop-rate=~a~%" (symbol-value (find-symbol "*SCTP-DROP-RATE*" :webrtc-data))))
 
 (defun handle-stats ()
   "GET /stats — the current session's SCTP transport stats as JSON."

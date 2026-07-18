@@ -1,4 +1,4 @@
-# cl-webrtc
+# webrtc-data
 
 A **from-scratch WebRTC data-channel peer in pure Common Lisp** — so a browser (or aiortc) can
 open an `RTCDataChannel` straight to your Lisp with no plugins, no Tor, no signaling service
@@ -7,7 +7,7 @@ beyond one HTTP POST. Data channels only (no SRTP, no video codec).
 It exists to carry [glass](https://github.com/modus-lisp/glass) — a pure-CL VNC/RFB server — to
 a bare browser (iPhone Safari included) as a **remote desktop**, P2P. The transport is written
 from scratch; the browser reuses [noVNC](https://github.com/novnc/noVNC) and the server reuses
-glass, so cl-webrtc is a transparent RFB pipe over its own ICE/DTLS/SCTP.
+glass, so webrtc-data is a transparent RFB pipe over its own ICE/DTLS/SCTP.
 
 Clean-room, and **verified against a spec-compliant peer at every layer** — aiortc/aioice for
 the protocol, pynacl for the crypto, then a real headless browser end to end.
@@ -54,7 +54,7 @@ delivery with an out-of-order buffer and gap-ack SACKs, and peer-death detection
 
 ```lisp
 ;; deps: ironclad, bordeaux-threads, sb-bsd-sockets, and seal (all in the modus-lisp dist)
-(ql:quickload "cl-webrtc")
+(ql:quickload "webrtc-data")
 ```
 
 Run the remote-desktop demo (`demo/glass-webrtc/`):

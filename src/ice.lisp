@@ -7,7 +7,7 @@
 ;;;; That's enough for the peer's checks to succeed and ICE to reach `connected`.  Non-STUN
 ;;;; packets on the same socket (DTLS, later) are handed to ON-PACKET.
 
-(in-package #:cl-webrtc)
+(in-package #:webrtc-data)
 
 (defparameter +ice-chars+ "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
 (defun ice-string (n)
@@ -80,7 +80,7 @@
                              (when (ice-agent-on-packet agent)
                                (funcall (ice-agent-on-packet agent) pkt host port))))))
                  (error () (unless (ice-agent-stop agent) (sleep 0.005)))))))
-         :name "cl-webrtc-ice"))
+         :name "webrtc-data-ice"))
   agent)
 
 (defun ice-close (agent)

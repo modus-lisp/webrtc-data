@@ -5,7 +5,7 @@
 ;;;; signaling is just one offer/answer exchange.  Media is always a single m=application
 ;;;; (webrtc-datachannel) — no audio/video lines.
 
-(in-package #:cl-webrtc)
+(in-package #:webrtc-data)
 
 (defstruct ice-candidate foundation component transport priority ip port type)
 
