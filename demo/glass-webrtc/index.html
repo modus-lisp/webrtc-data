@@ -55,6 +55,8 @@
         `<b>${fps.toFixed(0)}</b> fps   <b>${kbs.toFixed(0)}</b> KB/s\n` +
         `${mps.toFixed(0)} msg/s   buf ${(buf/1024).toFixed(0)} KB\n` +
         `${pc.connectionState} · ${rfb._fbName || 'rfb'}`;
+      // machine-readable series line (parsed by the perf harness)
+      console.log(`PERF ${(now/1000).toFixed(1)} ${fps.toFixed(1)} ${kbs.toFixed(1)} ${mps.toFixed(1)} ${(buf/1024).toFixed(1)}`);
     }, 1000);
 
     (async () => {

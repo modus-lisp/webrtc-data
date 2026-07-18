@@ -129,7 +129,8 @@ the given already-encoded chunks."
   bytes                                      ; the fully-encoded DATA chunk (ready to wrap)
   size                                       ; user-data payload length (flight/window unit)
   (sent 0)                                   ; internal-real-time it was last transmitted
-  (missing 0))                               ; SACK missing-indications (for fast retransmit)
+  (missing 0)                                ; SACK missing-indications (for fast retransmit)
+  (retx nil))                                ; ever retransmitted? (Karn: don't sample its RTT)
 
 (defstruct sctp-assoc
   session                                    ; seal DTLS session (transport)
@@ -150,6 +151,7 @@ the given already-encoded chunks."
   peer-cum-ack                               ; highest TSN the peer has cumulatively acked
   (rto +sctp-rto-init+)                      ; current retransmission timeout (s)
   (rto-strikes 0)                            ; consecutive RTO fires with no forward progress
+  (srtt nil) (rttvar nil)                    ; smoothed RTT + variance (s), Jacobson/RFC 6298
   ;; --- receive side (peer -> us) ---
   (rcv-buffer (make-hash-table))             ; tsn -> (list stream-id ppid user), out-of-order
   (dup-tsns nil)                             ; duplicate TSNs to report in the next SACK
@@ -305,8 +307,22 @@ retransmit every outstanding chunk (oldest first)."
           (incf (sctp-assoc-n-rto assoc))
           (incf (sctp-assoc-n-rtx assoc) (length chunks))
           (dolist (txc chunks)
-            (setf (txc-sent txc) (sctp-now) (txc-missing txc) 0)
+            (setf (txc-sent txc) (sctp-now) (txc-missing txc) 0 (txc-retx txc) t)
             (sctp-transmit assoc (txc-bytes txc))))))))
+
+(defun sctp-update-rtt (assoc r)
+  "Feed one RTT sample R (seconds) into the SRTT/RTTVAR estimator and recompute the RTO
+(RFC 6298 / RFC 4960 §6.3.1): the first sample seeds SRTT=R, RTTVAR=R/2; later samples are
+exponentially smoothed (α=1/8, β=1/4) and RTO = SRTT + 4·RTTVAR, clamped to [rto-min, rto-max]."
+  (if (null (sctp-assoc-srtt assoc))
+      (setf (sctp-assoc-srtt assoc) r
+            (sctp-assoc-rttvar assoc) (/ r 2))
+      (let ((srtt (sctp-assoc-srtt assoc)) (rttvar (sctp-assoc-rttvar assoc)))
+        (setf (sctp-assoc-rttvar assoc) (+ (* 0.75d0 rttvar) (* 0.25d0 (abs (- srtt r))))
+              (sctp-assoc-srtt assoc)   (+ (* 0.875d0 srtt) (* 0.125d0 r)))))
+  (setf (sctp-assoc-rto assoc)
+        (min +sctp-rto-max+ (max +sctp-rto-min+
+                                 (+ (sctp-assoc-srtt assoc) (* 4 (sctp-assoc-rttvar assoc)))))))
 
 (defun sctp-handle-sack (assoc value)
   "Process an inbound SACK: drop cumulatively- and gap-acked chunks from OUTSTANDING,
@@ -321,14 +337,19 @@ chunk reported missing >=3 times, then flush whatever the window now allows."
            (out      (sctp-assoc-outstanding assoc))
            (acked    0)
            (highest-gap nil))
-      ;; 1. cumulative ack: drop everything at or below CUM.
-      (let ((drop '()))
+      ;; 1. cumulative ack: drop everything at or below CUM; sample RTT off one chunk that
+      ;;    was never retransmitted (Karn's algorithm) to drive the RTO estimator.
+      (let ((drop '()) (rtt nil))
         (maphash (lambda (tsn txc)
-                   (when (tsn<= tsn cum) (push tsn drop) (incf acked (txc-size txc))))
+                   (when (tsn<= tsn cum)
+                     (push tsn drop) (incf acked (txc-size txc))
+                     (when (and (null rtt) (not (txc-retx txc)))
+                       (setf rtt (sctp-secs-since (txc-sent txc))))))
                  out)
         (dolist (tsn drop)
           (decf (sctp-assoc-flight assoc) (txc-size (gethash tsn out)))
-          (remhash tsn out)))
+          (remhash tsn out))
+        (when rtt (sctp-update-rtt assoc rtt)))
       ;; 2. gap-ack blocks: [cum+start, cum+end] were received out of order.
       (let ((gap-acked (make-hash-table)))
         (dotimes (i ngap)
@@ -364,14 +385,14 @@ chunk reported missing >=3 times, then flush whatever the window now allows."
               (incf (sctp-assoc-n-fast-rtx assoc) (length fast))
               (incf (sctp-assoc-n-rtx assoc) (length fast))
               (dolist (txc (sort fast (lambda (a b) (tsn< (txc-tsn a) (txc-tsn b)))))
-                (setf (txc-sent txc) (sctp-now) (txc-missing txc) 0)
+                (setf (txc-sent txc) (sctp-now) (txc-missing txc) 0 (txc-retx txc) t)
                 (sctp-transmit assoc (txc-bytes txc)))))))
       ;; 4. window + congestion-control bookkeeping.
       (setf (sctp-assoc-peer-rwnd assoc) new-rwnd)
       (when (and (sctp-assoc-peer-cum-ack assoc)
                  (tsn< (sctp-assoc-peer-cum-ack assoc) cum))
-        (setf (sctp-assoc-rto assoc) +sctp-rto-init+     ; forward progress: reset RTO
-              (sctp-assoc-rto-strikes assoc) 0))         ; ... and the unreachable counter
+        (setf (sctp-assoc-rto-strikes assoc) 0))   ; forward progress: clear unreachable counter
+                                                    ; (RTO itself is now driven by SCTP-UPDATE-RTT)
       (setf (sctp-assoc-peer-cum-ack assoc) cum)
       (when (plusp acked)
         (if (<= (sctp-assoc-cwnd assoc) (sctp-assoc-ssthresh assoc))
@@ -547,6 +568,7 @@ fields (:cwnd, :peer-rwnd, :flight, :outstanding, :send-q, :rto) are instantaneo
         :drops       (sctp-assoc-n-drop assoc)
         :cwnd        (sctp-assoc-cwnd assoc)        :peer-rwnd (sctp-assoc-peer-rwnd assoc)
         :flight      (sctp-assoc-flight assoc)      :rto      (sctp-assoc-rto assoc)
+        :srtt-ms     (let ((s (sctp-assoc-srtt assoc))) (and s (* 1000d0 s)))  ; smoothed RTT
         :outstanding (hash-table-count (sctp-assoc-outstanding assoc))
         :send-q      (sctp-assoc-send-q-len assoc)))
 

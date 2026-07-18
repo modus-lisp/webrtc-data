@@ -21,6 +21,7 @@
                                     (merge-pathnames "../novnc/" *dir*))))
 (defparameter *index* (uiop:read-file-string (merge-pathnames "index.html" *dir*)))
 (defparameter *port*       (or (ignore-errors (parse-integer (uiop:getenv "GW_PORT"))) 8765))
+(defparameter *epoch* (get-internal-real-time))   ; series time origin (ms since load)
 (defparameter *glass-host* (or (uiop:getenv "GLASS_HOST") "127.0.0.1"))
 (defparameter *glass-port* (or (ignore-errors (parse-integer (uiop:getenv "GLASS_PORT"))) 5900))
 
@@ -62,20 +63,31 @@
                   (lambda ()
                     (let ((prev (sctp-stats assoc)) (t0 (get-internal-real-time)))
                       (loop until (eq (getf (sctp-stats assoc) :state) :aborted) do
-                        (sleep 2.0)
+                        (sleep 1.0)
                         (let* ((now (sctp-stats assoc))
                                (dt (max 1d-3 (/ (float (- (get-internal-real-time) t0) 1d0)
                                                 internal-time-units-per-second))))
                           (flet ((d (k) (- (getf now k) (getf prev k))))
                             (format *error-output*
                                     "~&[stats] out ~,1f KB/s  in ~,1f KB/s  rtx ~a (~,1f%)  drops ~a  ~
-                                     cwnd ~a  rwnd ~a  flight ~a  outq ~a  rto ~,2f~%"
+                                     cwnd ~a  rwnd ~a  flight ~a  outq ~a  srtt ~a  rto ~,2f~%"
                                     (/ (d :bytes-out) 1024d0 dt) (/ (d :bytes-in) 1024d0 dt)
                                     (d :rtx)
                                     (if (plusp (d :data-out)) (* 100d0 (/ (d :rtx) (d :data-out))) 0d0)
                                     (d :drops)
                                     (getf now :cwnd) (getf now :peer-rwnd) (getf now :flight)
-                                    (getf now :send-q) (getf now :rto)))
+                                    (getf now :send-q)
+                                    (let ((s (getf now :srtt-ms))) (if s (format nil "~,1fms" s) "-"))
+                                    (getf now :rto))
+                            ;; machine-readable series line (parsed by the perf harness)
+                            (format *error-output*
+                                    "~&PERFSVR ~,1f ~,2f ~,2f ~a ~a ~a ~,1f ~a ~a ~,2f~%"
+                                    (/ (float (- (get-internal-real-time) *epoch*) 1d0)
+                                       internal-time-units-per-second)
+                                    (/ (d :bytes-out) 1024d0 dt) (/ (d :bytes-in) 1024d0 dt)
+                                    (d :rtx) (d :drops) (getf now :cwnd)
+                                    (or (getf now :srtt-ms) -1) (getf now :flight) (getf now :send-q)
+                                    (getf now :rto)))
                           (setf prev now t0 (get-internal-real-time))))))
                   :name "gw-stats"))
                :on-message
@@ -102,9 +114,18 @@
 (defun handle-index ()
   (setf (hunchentoot:content-type*) "text/html") *index*)
 
+(defun handle-drop ()
+  "GET /drop?rate=R — set *SCTP-DROP-RATE* (a dev knob for simulating outbound loss)."
+  (setf (hunchentoot:content-type*) "text/plain")
+  (let ((r (ignore-errors (read-from-string (hunchentoot:get-parameter "rate")))))
+    (when (realp r)
+      (setf (symbol-value (find-symbol "*SCTP-DROP-RATE*" :cl-webrtc)) (float r 1d0))))
+  (format nil "drop-rate=~a~%" (symbol-value (find-symbol "*SCTP-DROP-RATE*" :cl-webrtc))))
+
 (setf hunchentoot:*dispatch-table*
       (list (hunchentoot:create-folder-dispatcher-and-handler "/novnc/" *novnc*)
             (hunchentoot:create-regex-dispatcher "^/signal$" #'handle-signal)
+            (hunchentoot:create-regex-dispatcher "^/drop$" #'handle-drop)
             (hunchentoot:create-regex-dispatcher "^/$" #'handle-index)))
 
 (defvar *acceptor*
