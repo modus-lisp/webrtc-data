@@ -6,7 +6,7 @@
 
 (defsystem "cl-webrtc"
   :description "A from-scratch WebRTC data-channel peer in pure Common Lisp (SDP/ICE/DTLS/SCTP)."
-  :version "0.0.1"
+  :version "0.1.0"
   :author "ynniv"
   :license "MIT"
   :depends-on ("ironclad" "bordeaux-threads" "sb-bsd-sockets" "seal")
