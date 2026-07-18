@@ -116,6 +116,8 @@
          (answer (ice-answer agent offer :fingerprint (dtls-conn-fingerprint conn)
                              :gather-srflx (and (uiop:getenv "GATHER_SRFLX") t))))
     (ice-serve agent)
+    ;; full-agent checks (punch our NAT mapping open toward the peer) when NAT traversal is on
+    (when (uiop:getenv "GATHER_SRFLX") (ice-start-checks agent))
     (bt:make-thread (lambda () (run-session conn)) :name "webrtc-session")
     answer))
 

@@ -19,9 +19,10 @@
     import RFB from '/novnc/core/rfb.js';
     const log = (...a) => console.log('[glass-webrtc]', ...a);
 
-    // No STUN: on a LAN the host candidates suffice, and our ICE-lite answerer only
-    // responds to checks (no trickle), so we gather fully before signaling.
-    const pc = new RTCPeerConnection({ iceServers: [] });
+    // A STUN server so the browser also gathers a server-reflexive (public) candidate for
+    // NAT traversal; host candidates still cover the LAN case. Non-trickle: we gather fully
+    // (host + srflx) before signaling, since our answer is one-shot.
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
     pc.oniceconnectionstatechange = () => log('ice', pc.iceConnectionState);
     pc.onconnectionstatechange = () => log('conn', pc.connectionState);
 

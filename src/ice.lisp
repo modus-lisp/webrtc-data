@@ -15,11 +15,16 @@
 
 (defstruct ice-agent socket port local-ip local-ufrag local-pwd remote-ufrag remote-pwd
   srflx-ip srflx-port                          ; server-reflexive (public) address, if gathered
-  (on-packet nil) (peer nil) (stop nil) thread)
+  (remote-candidates '())                      ; the peer's candidates (from its offer), for our checks
+  (on-packet nil) (peer nil) (stop nil) (check-thread nil) thread)
 
 (defparameter *stun-servers*
-  '(("stun.l.google.com" . 19302) ("stun.cloudflare.com" . 3478))
-  "Public STUN servers tried in order to discover our server-reflexive address.")
+  (let ((env (uiop:getenv "STUN_SERVER")))     ; "host:port" — overrides for a local/test STUN
+    (if (and env (position #\: env))
+        (list (cons (subseq env 0 (position #\: env))
+                    (parse-integer (subseq env (1+ (position #\: env))))))
+        '(("stun.l.google.com" . 19302) ("stun.cloudflare.com" . 3478))))
+  "STUN servers tried in order to discover our server-reflexive address ($STUN_SERVER overrides).")
 
 (defun resolve-host (host)
   "Dotted-quad IP string for HOST (a dotted string passes through); NIL on failure."
@@ -57,7 +62,8 @@
 first discover our server-reflexive (public) address via STUN and include it as a candidate, so a
 peer behind a different NAT can reach us — must run before ICE-SERVE (it uses the ICE socket)."
   (setf (ice-agent-remote-ufrag agent) (sdp-ice-ufrag remote-sdp)
-        (ice-agent-remote-pwd agent) (sdp-ice-pwd remote-sdp))
+        (ice-agent-remote-pwd agent) (sdp-ice-pwd remote-sdp)
+        (ice-agent-remote-candidates agent) (sdp-candidates remote-sdp))
   (when gather-srflx (ice-gather-srflx agent))
   (make-answer-sdp :ice-ufrag (ice-agent-local-ufrag agent) :ice-pwd (ice-agent-local-pwd agent)
                    :fingerprint (or fingerprint (colon-hex (u8vec 32)))   ; valid-format placeholder until DTLS
@@ -104,14 +110,49 @@ ICE-SERVE so the response isn't consumed by the receive loop."
 
 (defun ice-handle-stun (agent pkt from-host from-port)
   (multiple-value-bind (type tid) (decode-stun pkt)
-    (when (eql type +binding-request+)
-      ;; remember where the peer reaches us from (for DTLS later)
-      (setf (ice-agent-peer agent) (list from-host from-port))
-      (ice-send agent
-                (encode-stun +binding-success+ tid
-                             (list (cons +attr-xor-mapped-address+ (xor-mapped-address from-host from-port)))
-                             :integrity-key (ice-agent-local-pwd agent) :fingerprint t)
-                from-host from-port))))
+    (cond
+      ((eql type +binding-request+)
+       ;; a connectivity check from the peer: respond, and remember where it reached us from
+       (setf (ice-agent-peer agent) (list from-host from-port))
+       (ice-send agent
+                 (encode-stun +binding-success+ tid
+                              (list (cons +attr-xor-mapped-address+ (xor-mapped-address from-host from-port)))
+                              :integrity-key (ice-agent-local-pwd agent) :fingerprint t)
+                 from-host from-port))
+      ((eql type +binding-success+)
+       ;; a response to one of OUR checks: this pair works, so the peer is reachable here
+       (unless (ice-agent-peer agent)
+         (setf (ice-agent-peer agent) (list from-host from-port)))))))
+
+(defun ice-start-checks (agent &key (interval 0.2) (duration 15.0) (priority 1845494015))
+  "Full-agent behaviour layered on the ICE-lite responder: periodically send STUN connectivity
+checks to each of the peer's candidates.  We don't nominate (the peer, controlling, does that) —
+the point is that sending these punches OUR NAT mapping open toward the peer, so a restricted-cone
+NAT lets the peer's own checks reach us.  Runs on its own thread until a peer address is
+established or DURATION elapses.  Call after ICE-SERVE."
+  (setf (ice-agent-check-thread agent)
+        (bt:make-thread
+         (lambda ()
+           (let ((deadline (+ (get-internal-real-time)
+                              (round (* duration internal-time-units-per-second))))
+                 (tiebreaker (random-bytes 8))
+                 (username (ascii (format nil "~a:~a" (ice-agent-remote-ufrag agent)
+                                          (ice-agent-local-ufrag agent)))))
+             (loop until (or (ice-agent-peer agent) (ice-agent-stop agent)
+                             (>= (get-internal-real-time) deadline))
+                   do (dolist (c (ice-agent-remote-candidates agent))
+                        (ignore-errors
+                          (ice-send agent
+                                    (encode-stun +binding-request+ (stun-transaction-id)
+                                                 (list (cons +attr-username+ username)
+                                                       (cons +attr-ice-controlled+ tiebreaker)
+                                                       (cons +attr-priority+ (u32be priority)))
+                                                 :integrity-key (ice-agent-remote-pwd agent) :fingerprint t)
+                                    (sb-bsd-sockets:make-inet-address (ice-candidate-ip c))
+                                    (ice-candidate-port c))))
+                      (sleep interval))))
+         :name "ice-checks"))
+  agent)
 
 (defun ice-serve (agent)
   "Start the receive loop on its own thread.  Returns AGENT."
