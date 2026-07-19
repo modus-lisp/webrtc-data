@@ -1,0 +1,107 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <title>glass over WebRTC · Nostr-signaled</title>
+  <style>
+    html,body{margin:0;height:100%;background:#111;overflow:hidden}#screen{width:100vw;height:100vh}
+    #hud{position:fixed;top:6px;right:6px;z-index:10;font:11px/1.45 ui-monospace,Menlo,monospace;
+         color:#7CFC9B;background:rgba(0,0,0,.62);padding:6px 9px;border-radius:6px;
+         white-space:pre;pointer-events:none;text-shadow:0 0 2px #000}
+    #hud b{color:#fff;font-weight:600}
+  </style>
+</head>
+<body>
+  <div id="screen"></div>
+  <div id="hud">connecting…</div>
+  <script type="module">
+    // noVNC rides the RTCDataChannel directly; nostr-tools does the gift-wrapped signaling.
+    import RFB from './novnc/core/rfb.js';
+    import { generateSecretKey, getPublicKey } from 'https://esm.sh/nostr-tools@2.15.0/pure';
+    import { SimplePool } from 'https://esm.sh/nostr-tools@2.15.0/pool';
+    import { wrapEvent, unwrapEvent } from 'https://esm.sh/nostr-tools@2.15.0/nip59';
+    import { decode } from 'https://esm.sh/nostr-tools@2.15.0/nip19';
+
+    const log = (...a) => console.log('[glass-nostr]', ...a);
+    const hud = document.getElementById('hud');
+    const setStatus = s => { hud.textContent = s; log(s); };
+
+    // --- config: the box's identity (npub or hex) + relays, from the URL --------
+    const params = new URLSearchParams(location.search);
+    const boxArg = params.get('box') ||
+      '75427ab8309aad26beea8142edf427674e4544604ae4dc5045108ad21fc8a0db';   // dev box pubkey
+    const boxPub = boxArg.startsWith('npub') ? decode(boxArg).data : boxArg;
+    const relays = (params.get('relays') ||
+      'wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net').split(',');
+
+    // --- ephemeral phone identity (a throwaway key per visit) -------------------
+    const sk = generateSecretKey();
+    const pk = getPublicKey(sk);
+    const pool = new SimplePool();
+
+    // --- WebRTC + noVNC (identical to the HTTP page) ----------------------------
+    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    pc.oniceconnectionstatechange = () => log('ice', pc.iceConnectionState);
+    pc.onconnectionstatechange = () => log('conn', pc.connectionState);
+    const ch = pc.createDataChannel('rfb', { ordered: true });
+    ch.binaryType = 'arraybuffer';
+    const rfb = new RFB(document.getElementById('screen'), ch, {});
+    rfb.scaleViewport = true;
+    rfb.focusOnClick = true;
+    rfb.addEventListener('connect', () => { log('RFB connected'); rfb.focus(); });
+    rfb.addEventListener('disconnect', e => log('RFB disconnect', e.detail));
+
+    // --- performance HUD (real FPS + throughput + backpressure) -----------------
+    let frames = 0, bytesIn = 0, msgsIn = 0, connected = false;
+    const origFBU = rfb._framebufferUpdate.bind(rfb);
+    rfb._framebufferUpdate = function () { const done = origFBU(); if (done) frames++; return done; };
+    ch.addEventListener('message', e => { bytesIn += (e.data.byteLength ?? e.data.length ?? 0); msgsIn++; });
+    ch.addEventListener('open', () => { connected = true; });
+    let last = performance.now();
+    setInterval(() => {
+      if (!connected) return;
+      const now = performance.now(), dt = (now - last) / 1000; last = now;
+      const fps = frames / dt, kbs = bytesIn / 1024 / dt, mps = msgsIn / dt;
+      frames = bytesIn = msgsIn = 0;
+      const buf = ch.bufferedAmount || 0;
+      hud.innerHTML =
+        `<b>${fps.toFixed(0)}</b> fps   <b>${kbs.toFixed(0)}</b> KB/s\n` +
+        `${mps.toFixed(0)} msg/s   buf ${(buf/1024).toFixed(0)} KB\n` +
+        `${pc.connectionState} · nostr · ${rfb._fbName || 'rfb'}`;
+      console.log(`PERF ${(now/1000).toFixed(1)} ${fps.toFixed(1)} ${kbs.toFixed(1)} ${mps.toFixed(1)} ${(buf/1024).toFixed(1)}`);
+    }, 1000);
+
+    // --- gift-wrapped Nostr signaling -------------------------------------------
+    let answered = false;
+    // subscribe for the gift-wrapped ANSWER first, so we can't miss it
+    pool.subscribeMany(relays, [{ kinds: [1059], '#p': [pk] }], {
+      onevent: (ev) => {
+        try {
+          const rumor = unwrapEvent(ev, sk);                    // 1059 -> seal -> rumor
+          if (!answered && rumor?.content?.includes('m=application')) {
+            answered = true;
+            pc.setRemoteDescription({ type: 'answer', sdp: rumor.content });
+            setStatus('answer received — establishing WebRTC…');
+          }
+        } catch (_) { /* not addressed to us / not a wrap we can open */ }
+      },
+    });
+
+    (async () => {
+      setStatus('gathering ICE candidates…');
+      await pc.setLocalDescription(await pc.createOffer());
+      // non-trickle: our answer is one-shot, so gather fully before we send the offer
+      await new Promise(res => {
+        if (pc.iceGatheringState === 'complete') return res();
+        pc.addEventListener('icegatheringstatechange',
+          () => { if (pc.iceGatheringState === 'complete') res(); });
+      });
+      setStatus('gift-wrapping offer to the box…');
+      const wrap = wrapEvent({ kind: 14, content: pc.localDescription.sdp, tags: [] }, sk, boxPub);
+      await Promise.any(pool.publish(relays, wrap));            // to every relay
+      setStatus('offer sent over Nostr — waiting for the box…');
+    })();
+  </script>
+</body>
+</html>
