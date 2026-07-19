@@ -100,21 +100,26 @@ link; SIGN-FN produces ecdsa_secp256r1_sha256 signatures for CertificateVerify."
 
 ;;; ---- datagram mailbox (ICE recv thread -> DTLS handshake thread) -----------
 
-(defstruct mailbox (lock (bt:make-lock)) (items '()))
+(defstruct mailbox (lock (bt:make-lock)) (cvar (bt:make-condition-variable)) (items '()))
 
 (defun mailbox-push (mb item)
   (bt:with-lock-held ((mailbox-lock mb))
-    (setf (mailbox-items mb) (nconc (mailbox-items mb) (list item)))))
+    (setf (mailbox-items mb) (nconc (mailbox-items mb) (list item)))
+    (bt:condition-notify (mailbox-cvar mb))))
 
 (defun mailbox-pop (mb timeout)
-  "Pop the next datagram, waiting up to TIMEOUT seconds; NIL on timeout."
+  "Pop the next datagram, waiting up to TIMEOUT seconds; NIL on timeout.  Event-driven: a
+MAILBOX-PUSH wakes the waiter immediately, so an inbound datagram is processed with no polling
+latency (this is the per-hop delay in the RFB round trip, so it directly affects frame rate)."
   (let ((deadline (+ (get-internal-real-time)
                      (round (* timeout internal-time-units-per-second)))))
-    (loop
-      (bt:with-lock-held ((mailbox-lock mb))
-        (when (mailbox-items mb) (return-from mailbox-pop (pop (mailbox-items mb)))))
-      (when (>= (get-internal-real-time) deadline) (return nil))
-      (sleep 0.002))))
+    (bt:with-lock-held ((mailbox-lock mb))
+      (loop
+        (when (mailbox-items mb) (return-from mailbox-pop (pop (mailbox-items mb))))
+        (let ((remaining (/ (float (- deadline (get-internal-real-time)) 1d0)
+                            internal-time-units-per-second)))
+          (when (<= remaining 0d0) (return-from mailbox-pop nil))
+          (bt:condition-wait (mailbox-cvar mb) (mailbox-lock mb) :timeout remaining))))))
 
 ;;; ---- glue: DTLS over an ICE agent ------------------------------------------
 
