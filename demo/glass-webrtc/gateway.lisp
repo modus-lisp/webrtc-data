@@ -8,6 +8,11 @@
 ;;;; The gateway is transparent to RFB: noVNC is the client, glass is the server.
 
 (require :asdf)
+;; Bigger GC nursery: the SCTP/DTLS send path conses ~7 KB/packet, so at a few thousand
+;; packets/s the default nursery collects often enough to skim ~6% off throughput.  Trade some
+;; resident memory for fewer collections during a full-frame blast.  (Measured ~6%; the rest of
+;; the throughput ceiling is CPU-bound in AES-GCM, not GC.)
+#+sbcl (setf (sb-ext:bytes-consed-between-gcs) (* 256 1024 1024))
 (handler-bind ((warning #'muffle-warning))
   (asdf:load-system "webrtc-data")
   (ql:quickload '(:hunchentoot) :silent t))
