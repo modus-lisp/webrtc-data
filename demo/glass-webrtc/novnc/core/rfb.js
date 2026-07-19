@@ -2249,7 +2249,10 @@ export default class RFB extends EventTargetMixin {
             }
             encs.push(encodings.encodingTight);
             encs.push(encodings.encodingTightPNG);
-            encs.push(encodings.encodingTRLE);
+            // TRLE disabled for the WebRTC demo: its raw tiles are ~1MB/frame full-screen vs
+            // ZRLE's compressed tens-of-KB (bandwidth loss over a data channel), and the local
+            // TRLE decoder desyncs on partial edge tiles. Let glass fall back to ZRLE.
+            // encs.push(encodings.encodingTRLE);
             encs.push(encodings.encodingZRLE);
             encs.push(encodings.encodingJPEG);
             encs.push(encodings.encodingHextile);

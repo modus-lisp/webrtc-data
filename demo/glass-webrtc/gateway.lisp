@@ -3,7 +3,7 @@
 ;;;; hunchentoot serves the noVNC page + one POST /signal for the SDP exchange.  For each
 ;;;; browser we set up the webrtc-data answerer (ICE-lite -> DTLS -> SCTP), and when the data
 ;;;; channel opens we open a TCP connection to glass's RFB server and pump bytes both ways:
-;;;;   glass -> channel  (chunked, since our SCTP doesn't fragment)
+;;;;   glass -> channel  (one message per read; SCTP fragments + the peer reassembles)
 ;;;;   channel -> glass  (noVNC's RFB client messages)
 ;;;; The gateway is transparent to RFB: noVNC is the client, glass is the server.
 
@@ -28,6 +28,10 @@
 (defun glass-connect ()
   (let ((s (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
     (sb-bsd-sockets:socket-connect s (sb-bsd-sockets:make-inet-address *glass-host*) *glass-port*)
+    ;; no Nagle: we forward tiny RFB messages (FramebufferUpdateRequests, key/pointer events)
+    ;; toward glass — Nagle would batch them and add ~40ms of interactive latency per round trip.
+    ;; glass sets TCP_NODELAY on its accept socket; we set it on our end of the same connection.
+    (setf (sb-bsd-sockets:sockopt-tcp-nodelay s) t)
     s))
 
 (defvar *last-assoc* nil)   ; most recent SCTP association, for the /stats endpoint
@@ -46,7 +50,9 @@
                  (setf glass (glass-connect) *last-assoc* assoc)
                  (format *error-output* "~&[gw] channel open (stream ~a) -> glass ~a:~a~%"
                          sid *glass-host* *glass-port*)
-                 ;; glass -> browser: read RFB, chunk under the no-fragmentation limit
+                 ;; glass -> browser: read RFB, send each read as ONE message — SCTP now
+                 ;; fragments it internally and the peer reassembles, so noVNC sees one
+                 ;; onmessage per read instead of one per 1KB (far fewer data-channel events)
                  (bt:make-thread
                   (lambda ()
                     (let ((buf (make-array 16384 :element-type '(unsigned-byte 8))))
@@ -55,9 +61,7 @@
                             (multiple-value-bind (b n) (sb-bsd-sockets:socket-receive glass buf nil)
                               (declare (ignore b))
                               (when (or (null n) (zerop n)) (return))
-                              (loop for off from 0 below n by 1024
-                                    do (sctp-send-binary assoc sid
-                                                         (subseq buf off (min n (+ off 1024)))))))
+                              (sctp-send-binary assoc sid (subseq buf 0 n))))
                         (error () nil))))
                   :name "glass->ch")
                  ;; transport-health monitor: log SCTP rates every 2s until the peer aborts

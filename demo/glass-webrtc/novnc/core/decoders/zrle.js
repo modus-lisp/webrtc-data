@@ -83,10 +83,14 @@ export default class ZRLEDecoder {
     _readPixels(pixels) {
         let data = this._pixelBuffer;
         const buffer = this._inflator.inflate(3*pixels);
+        // glass ignores our SetPixelFormat and always sends its native CPIXEL byte order
+        // B,G,R (red-shift=16), whereas noVNC's SetPixelFormat asked for R,G,B. Map to the
+        // canvas's R,G,B here so colours are correct (a no-op for grayscale/green content,
+        // which is why terminal-only testing never caught it).
         for (let i = 0, j = 0; i < pixels*4; i += 4, j += 3) {
-            data[i]     = buffer[j];
-            data[i + 1] = buffer[j + 1];
-            data[i + 2] = buffer[j + 2];
+            data[i]     = buffer[j + 2];  // R  <- glass byte 2
+            data[i + 1] = buffer[j + 1];  // G  <- glass byte 1
+            data[i + 2] = buffer[j];      // B  <- glass byte 0
             data[i + 3] = 255;  // Add the Alpha
         }
         return data;
