@@ -8,18 +8,21 @@
 ;;;;   * the 4-way association handshake as the RESPONDER (server): aiortc is the ICE
 ;;;;     controlling agent, so it is the SCTP *client* and sends INIT; we reply INIT-ACK
 ;;;;     (with a State Cookie), receive COOKIE-ECHO, reply COOKIE-ACK -> ESTABLISHED,
-;;;;   * DATA chunks (unfragmented, ordered) on one reliable stream, with a genuine
-;;;;     RFC 4960 transmit path: a send queue, retransmission (RTO + fast retransmit),
-;;;;     slow-start/congestion-avoidance congestion control, and flow control that
-;;;;     honours the peer's advertised receive window (a_rwnd) learned from SACKs,
+;;;;   * DATA chunks (ordered) on one reliable stream, with a genuine RFC 4960 transmit
+;;;;     path: a send queue, retransmission (RTO + fast retransmit), slow-start/
+;;;;     congestion-avoidance congestion control, and flow control that honours the peer's
+;;;;     advertised receive window (a_rwnd) learned from SACKs,
+;;;;   * message fragmentation + reassembly (RFC 4960 §6.9): a large user message is split
+;;;;     across consecutive-TSN DATA chunks with B/E flags and one stream sequence number,
+;;;;     and inbound fragments are reassembled in TSN order before delivery — so a caller
+;;;;     may send a message of any size and the peer sees it whole,
 ;;;;   * an in-order receive path that buffers out-of-order TSNs and reports gaps +
 ;;;;     duplicates back in our SACKs (TSN serial arithmetic, 32-bit wrap safe),
 ;;;;   * HEARTBEAT ack, and DCEP DATA_CHANNEL_OPEN -> DATA_CHANNEL_ACK.
 ;;;;
-;;;; Deliberately NOT implemented (fine for a single reliable data channel carrying
-;;;; RFB messages that the gateway already chunks to <=1024B): fragmentation/reassembly
-;;;; (I-DATA / DATA fragments), FORWARD-TSN / partial reliability (PR-SCTP), RE-CONFIG,
-;;;; and multihoming.  We advertise no chunk extensions, so aiortc uses plain DATA=0.
+;;;; Deliberately NOT implemented (unneeded for one reliable ordered data channel):
+;;;; FORWARD-TSN / partial reliability (PR-SCTP), RE-CONFIG, and multihoming.  We advertise
+;;;; no chunk extensions, so aiortc uses plain DATA=0 (classic fragmentation, not I-DATA).
 ;;;;
 ;;;; Transport glue (from dtls.lisp / seal): send an SCTP packet with
 ;;;; (seal:dtls-send-app session packet-bytes); receive by popping a datagram from the
@@ -67,6 +70,12 @@
 ;;; ---- reliability / congestion-control tunables -----------------------------
 
 (defconstant +sctp-mtu+ 1200)                ; nominal path MTU (bytes) for cc math
+(defconstant +sctp-max-frag+ 1152
+  "Max user-data bytes per DATA chunk.  A larger user message is fragmented across
+consecutive-TSN chunks (RFC 4960 §6.9) and reassembled by the peer.  Sized to fill the path
+MTU: 1152 + 12 (DATA hdr) + 4 (chunk hdr) + 12 (SCTP common) = 1180 <= +SCTP-MTU+ (1200), and
++ DTLS/GCM expansion (~37) still fits a 1500-byte Ethernet datagram — so fewer packets (and
+fewer per-packet CRC/GCM/syscall) per byte than the old 1024.")
 (defconstant +sctp-cwnd-init+ 4380)          ; min(4*MTU, max(2*MTU, 4380))
 (defconstant +sctp-send-q-max+ 512)          ; backpressure bound on the ready queue
 (defconstant +sctp-rto-init+ 1.0d0)          ; initial retransmit timeout (s)
@@ -153,8 +162,11 @@ the given already-encoded chunks."
   (rto-strikes 0)                            ; consecutive RTO fires with no forward progress
   (srtt nil) (rttvar nil)                    ; smoothed RTT + variance (s), Jacobson/RFC 6298
   ;; --- receive side (peer -> us) ---
-  (rcv-buffer (make-hash-table))             ; tsn -> (list stream-id ppid user), out-of-order
+  (rcv-buffer (make-hash-table))             ; tsn -> (list stream-id ppid user flags), out-of-order
   (dup-tsns nil)                             ; duplicate TSNs to report in the next SACK
+  ;; reassembly of an inbound fragmented message (RFC 4960 §6.9); fragments arrive as
+  ;; strictly-sequential TSNs delivered in order, so one accumulator per assoc suffices
+  (reasm-frags nil) (reasm-sid nil) (reasm-ppid nil)
   ;; --- stats (cumulative counters, for performance monitoring) ---
   (n-bytes-out 0) (n-bytes-in 0)             ; DATA payload bytes sent / received
   (n-data-out 0) (n-data-in 0)               ; DATA chunks sent (incl. retransmits) / received
@@ -211,17 +223,32 @@ glass framebuffer pump sends concurrently with the SCTP receive loop.  Honours
       (unless (sctp-assoc-send-q assoc) (setf (sctp-assoc-send-q-tail assoc) nil)))
     txc))
 
-(defun sctp-build-data-txc (assoc stream-id ppid data)
-  "Assign the next TSN and build a DATA chunk for DATA on STREAM-ID.  Caller holds the
-send-lock so TSNs and stream sequence numbers stay monotonic."
+(defun sctp-build-data-txcs (assoc stream-id ppid data)
+  "Assign consecutive TSNs and build the DATA chunk(s) for one user message on STREAM-ID,
+fragmenting per +SCTP-MAX-FRAG+ (RFC 4960 §6.9): every fragment carries the same stream
+sequence number, and the B/E flags mark the first/last (a message that fits in one chunk
+gets both = unfragmented).  Returns the txc's in TSN order.  Caller holds the send-lock so
+TSNs and the per-message sequence number stay monotonic and the fragments stay sequential."
   (let* ((data (as-u8vec data))
-         (tsn (sctp-assoc-local-tsn assoc))
-         (seq (sctp-next-stream-seq assoc stream-id))
-         (value (cat-bytes (u32be tsn) (u16be stream-id) (u16be seq)
-                           (u32be ppid) data)))
-    (setf (sctp-assoc-local-tsn assoc) (u32 (1+ tsn)))
-    (make-txc :tsn tsn :size (length data)
-              :bytes (sctp-chunk +chunk-data+ +data-flag-be+ value))))
+         (n (length data))
+         (seq (sctp-next-stream-seq assoc stream-id))   ; one SSN for the whole message
+         (off 0)
+         (txcs '()))
+    (loop
+      (let* ((end (min n (+ off +sctp-max-frag+)))
+             (flags (logior (if (zerop off) +data-flag-first+ 0)
+                            (if (>= end n)  +data-flag-last+  0)))
+             (frag (subseq data off end))
+             (tsn (sctp-assoc-local-tsn assoc))
+             (value (cat-bytes (u32be tsn) (u16be stream-id) (u16be seq)
+                               (u32be ppid) frag)))
+        (setf (sctp-assoc-local-tsn assoc) (u32 (1+ tsn)))
+        (push (make-txc :tsn tsn :size (length frag)
+                        :bytes (sctp-chunk +chunk-data+ flags value))
+              txcs)
+        (setf off end)
+        (when (>= off n) (return))))
+    (nreverse txcs)))
 
 (defun sctp-window (assoc)
   "Bytes we may have outstanding right now: min(cwnd, peer-rwnd)."
@@ -255,7 +282,10 @@ producer (e.g. the glass pump) down to what the peer can absorb."
       (bt:with-recursive-lock-held ((sctp-assoc-send-lock assoc))
         (when (< (sctp-assoc-send-q-len assoc) +sctp-send-q-max+)
           (setf room t)
-          (sctp-enqueue assoc (sctp-build-data-txc assoc stream-id ppid data))
+          ;; all fragments of the message are enqueued together (consecutive TSNs, no other
+          ;; chunk interleaved) so the peer can reassemble them by TSN order
+          (dolist (txc (sctp-build-data-txcs assoc stream-id ppid data))
+            (sctp-enqueue assoc txc))
           (sctp-flush assoc)))
       (when room (return))
       (sleep 0.002))))                        ; queue full: wait for a SACK to drain it
@@ -486,10 +516,35 @@ stateful (one association) so the cookie is an opaque blob the peer just echoes 
      (when (sctp-assoc-on-message assoc)
        (funcall (sctp-assoc-on-message assoc) assoc stream-id user)))))
 
-(defun sctp-handle-data (assoc value)
-  "VALUE is the DATA chunk value: TSN(4) stream_id(2) stream_seq(2) PPID(4) user_data.
-Delivers in order: a TSN one past the cumulative is delivered immediately (then any
-now-contiguous buffered TSNs drain); a future TSN is buffered; a past TSN is a duplicate."
+(defun sctp-reassemble (assoc stream-id ppid user flags)
+  "Collect DATA fragments delivered in TSN order (RFC 4960 §6.9) and hand a completed user
+message to SCTP-DELIVER.  B marks the first fragment, E the last; an unfragmented chunk has
+both.  A message's fragments are strictly-sequential TSNs and reach here in order, so a
+single per-assoc accumulator is enough."
+  (let ((begin (plusp (logand flags +data-flag-first+)))
+        (end   (plusp (logand flags +data-flag-last+))))
+    (cond
+      ((and begin end)                          ; unfragmented — the overwhelmingly common path
+       (sctp-deliver assoc stream-id ppid user))
+      (begin                                    ; first fragment: start a new message
+       (setf (sctp-assoc-reasm-frags assoc) (list user)
+             (sctp-assoc-reasm-sid assoc)   stream-id
+             (sctp-assoc-reasm-ppid assoc)  ppid))
+      ((sctp-assoc-reasm-frags assoc)           ; a continuation (middle or last)
+       (push user (sctp-assoc-reasm-frags assoc))
+       (when end
+         (let ((msg (apply #'cat-bytes (nreverse (sctp-assoc-reasm-frags assoc)))))
+           (setf (sctp-assoc-reasm-frags assoc) nil)
+           (sctp-deliver assoc (sctp-assoc-reasm-sid assoc)
+                         (sctp-assoc-reasm-ppid assoc) msg))))
+      (t                                        ; middle/last with no start — shouldn't happen
+       (sctp-log assoc "~&  << DATA orphan fragment (flags=~a) dropped~%" flags)))))
+
+(defun sctp-handle-data (assoc flags value)
+  "VALUE is the DATA chunk value: TSN(4) stream_id(2) stream_seq(2) PPID(4) user_data; FLAGS
+is the chunk's flag byte (B/E fragment bits).  Delivers in order: a TSN one past the
+cumulative is reassembled/delivered immediately (then any now-contiguous buffered TSNs
+drain); a future TSN is buffered; a past TSN is a duplicate."
   (let* ((tsn (rd-u32be value 0))
          (stream-id (rd-u16be value 4))
          (ppid (rd-u32be value 8))
@@ -503,22 +558,22 @@ now-contiguous buffered TSNs drain); a future TSN is buffered; a past TSN is a d
        (when (< (length (sctp-assoc-dup-tsns assoc)) +sctp-dup-report-max+)
          (push tsn (sctp-assoc-dup-tsns assoc)))
        (sctp-log assoc "~&  << DATA dup tsn=~a (cum=~a)~%" tsn cum))
-      ;; the next expected TSN: deliver, advance, then drain contiguous buffered TSNs
+      ;; the next expected TSN: reassemble/deliver, advance, then drain contiguous buffered TSNs
       ((= tsn (u32 (1+ cum)))
-       (sctp-deliver assoc stream-id ppid user)
+       (sctp-reassemble assoc stream-id ppid user flags)
        (setf cum tsn)
        (loop for next = (u32 (1+ cum))
              for buffered = (gethash next (sctp-assoc-rcv-buffer assoc))
              while buffered
-             do (destructuring-bind (bsid bppid buser) buffered
-                  (sctp-deliver assoc bsid bppid buser))
+             do (destructuring-bind (bsid bppid buser bflags) buffered
+                  (sctp-reassemble assoc bsid bppid buser bflags))
                 (remhash next (sctp-assoc-rcv-buffer assoc))
                 (setf cum next))
        (setf (sctp-assoc-last-received-tsn assoc) cum))
-      ;; a future TSN (gap): buffer it for later in-order delivery
+      ;; a future TSN (gap): buffer it (with its flags) for later in-order delivery
       (t
        (unless (gethash tsn (sctp-assoc-rcv-buffer assoc))
-         (setf (gethash tsn (sctp-assoc-rcv-buffer assoc)) (list stream-id ppid user)))
+         (setf (gethash tsn (sctp-assoc-rcv-buffer assoc)) (list stream-id ppid user flags)))
        (sctp-log assoc "~&  << DATA gap tsn=~a (cum=~a) buffered~%" tsn cum)))))
 
 (defun sctp-input (assoc packet)
@@ -539,7 +594,7 @@ handling INIT / COOKIE-ECHO / DATA / SACK / HEARTBEAT, and sends a SACK if DATA 
              (setf (sctp-assoc-state assoc) :established)
              (sctp-transmit assoc (sctp-chunk +chunk-cookie-ack+ 0 #())))
             ((= ctype +chunk-data+)        (setf data-seen t)
-                                           (sctp-handle-data assoc value))
+                                           (sctp-handle-data assoc (aref packet (1+ pos)) value))
             ((= ctype +chunk-sack+)        (sctp-handle-sack assoc value))
             ((= ctype +chunk-heartbeat+)
              ;; echo the params back as a HEARTBEAT-ACK
