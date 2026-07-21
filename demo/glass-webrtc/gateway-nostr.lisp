@@ -29,6 +29,29 @@
   (or (uiop:getenv "NOSTR_SEC")
       "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b"))
 
+;; ---- pubkey auth: only these clients may open the desktop --------------------
+;; NOSTR_ALLOW is a comma-separated list of authorized client pubkeys (npub or 64-hex).
+;; The sender is the VERIFIED seal signer from unwrap-giftwrap (a forged rumor pubkey is
+;; already rejected there), so an allowlist hit is a real cryptographic identity.  Unset
+;; => refuse everyone (fail closed): with no allowlist there is no one to authorize.
+(defun %normalize-pubkey (s)
+  "npub1... -> 64-hex; hex -> lowercased hex; blank -> NIL."
+  (let ((s (string-trim '(#\Space #\Tab #\Newline #\Return) s)))
+    (cond ((zerop (length s)) nil)
+          ((and (>= (length s) 4) (string-equal (subseq s 0 4) "npub"))
+           (ignore-errors (string-downcase (cl-nostr.util:bytes->hex (cl-nostr.bech32:npub-decode s)))))
+          (t (string-downcase s)))))
+
+(defparameter *allow*
+  (let ((e (uiop:getenv "NOSTR_ALLOW")))
+    (when e
+      (remove nil (mapcar #'%normalize-pubkey
+                          (remove "" (uiop:split-string e :separator ",") :test #'string=))))))
+
+(defun authorized-p (pubkey)
+  "T iff PUBKEY (hex) is on the allowlist.  No allowlist => NIL (deny all)."
+  (and pubkey *allow* (member (string-downcase pubkey) *allow* :test #'string=) t))
+
 (defun glass-connect ()
   (let ((s (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
     (sb-bsd-sockets:socket-connect s (sb-bsd-sockets:make-inet-address *glass-host*) *glass-port*)
@@ -94,6 +117,10 @@
   (format t "@@ box npub:   ~a~%" (or box-npub "(npub encode failed; use hex)"))
   (format t "@@ box pubkey: ~a~%" box-pub)
   (format t "@@ relays:     ~a~%" *relays*)
+  (if *allow*
+      (format t "@@ allowlist:  ~{~a~^, ~}~%" (mapcar (lambda (h) (subseq h 0 12)) *allow*))
+      (format t "@@ allowlist:  (empty) — NOSTR_ALLOW unset; REFUSING ALL offers.~%~
+                 @@              set NOSTR_ALLOW=<npub or hex>[,...] to authorize clients.~%"))
   (finish-output)
   (cl-nostr.pool:pool-subscribe
    pool
@@ -104,14 +131,19 @@
      (handler-case
          (multiple-value-bind (offer-sdp phone-pub) (cl-nostr.nip59:unwrap-giftwrap kp wrap)
            (when (and (stringp offer-sdp) (search "m=application" offer-sdp))   ; a data-channel offer
-             (format t "~&@@ offer from ~a... (~a bytes) -> answering~%"
-                     (subseq phone-pub 0 8) (length offer-sdp))
-             (finish-output)
-             (let* ((answer (process-offer offer-sdp))
-                    (reply  (cl-nostr.nip59:build-giftwrap kp phone-pub answer)))
-               (cl-nostr.pool:pool-publish pool reply)
-               (format t "@@ answer gift-wrapped -> ~a...~%" (subseq phone-pub 0 8))
-               (finish-output))))
+             (cond
+               ((not (authorized-p phone-pub))
+                (format t "~&@@ DENIED ~a... — not on the allowlist~%" (subseq phone-pub 0 8))
+                (finish-output))
+               (t
+                (format t "~&@@ offer from ~a... (~a bytes) -> answering~%"
+                        (subseq phone-pub 0 8) (length offer-sdp))
+                (finish-output)
+                (let* ((answer (process-offer offer-sdp))
+                       (reply  (cl-nostr.nip59:build-giftwrap kp phone-pub answer)))
+                  (cl-nostr.pool:pool-publish pool reply)
+                  (format t "@@ answer gift-wrapped -> ~a...~%" (subseq phone-pub 0 8))
+                  (finish-output))))))
        (error (e) (format t "~&@@ signal error: ~a~%" e) (finish-output)))))
   (format t "@@ subscribed; waiting for gift-wrapped offers~%")
   (finish-output)
