@@ -1,0 +1,6 @@
+#!/usr/bin/env sh
+# nsite-url — shareable glass-over-WebRTC URL for a backend (box) identity.
+#   ./nsite-url <box-npub | 64-hex | name@domain>
+# The box npub goes in the #hash fragment (the nsite gateway never sees it).
+# Override the hosting nsite with NSITE_NPUB=npub1<site>.
+exec sbcl --script "$(dirname "$0")/nsite-url.lisp" "$@"

@@ -15,6 +15,7 @@
 (handler-bind ((warning #'muffle-warning))
   (asdf:load-system "webrtc-data")
   (asdf:load-system "cl-nostr"))
+(load (merge-pathnames "login-token.lisp" (or *load-pathname* *default-pathname-defaults*)))
 
 (in-package #:webrtc-data)
 
@@ -35,9 +36,11 @@
 ;; already rejected there), so an allowlist hit is a real cryptographic identity.  Unset
 ;; => refuse everyone (fail closed): with no allowlist there is no one to authorize.
 (defun %normalize-pubkey (s)
-  "npub1... -> 64-hex; hex -> lowercased hex; blank -> NIL."
+  "npub1... / 64-hex / name@domain (NIP-05) -> 64-hex; blank -> NIL."
   (let ((s (string-trim '(#\Space #\Tab #\Newline #\Return) s)))
     (cond ((zerop (length s)) nil)
+          ((cl-nostr.nip05:nip05-address-p s)                       ; an email-style identifier
+           (ignore-errors (string-downcase (cl-nostr.nip05:resolve-pubkey s))))
           ((and (>= (length s) 4) (string-equal (subseq s 0 4) "npub"))
            (ignore-errors (string-downcase (cl-nostr.util:bytes->hex (cl-nostr.bech32:npub-decode s)))))
           (t (string-downcase s)))))
@@ -51,6 +54,34 @@
 (defun authorized-p (pubkey)
   "T iff PUBKEY (hex) is on the allowlist.  No allowlist => NIL (deny all)."
   (and pubkey *allow* (member (string-downcase pubkey) *allow* :test #'string=) t))
+
+;; ---- one-time codes (magic-link login, keyed by *box-secret*) ----------------
+;; A code arrives inside the offer envelope (see PARSE-OFFER); it was delivered to a
+;; user via a gift-wrapped DM (login-link), so holding a valid one is proof enough —
+;; no browser signer needed.  We enforce single-use with a spent-nonce set.
+(defvar *spent* (make-hash-table :test 'equal) "nonce -> exp, for spent one-time codes")
+(defvar *spent-lock* (sb-thread:make-mutex :name "spent-codes"))
+
+(defun code-authorized-p (code)
+  "T iff CODE is a valid, unexpired, unspent one-time login code — and marks it spent."
+  (and (stringp code) (plusp (length code))
+       (multiple-value-bind (ok nonce exp) (glass-login:verify-token *box-secret* code)
+         (and ok nonce
+              (sb-thread:with-mutex (*spent-lock*)
+                (let ((now (- (get-universal-time) 2208988800)))
+                  (maphash (lambda (k v) (when (< v now) (remhash k *spent*))) *spent*))  ; prune
+                (unless (gethash nonce *spent*)
+                  (setf (gethash nonce *spent*) exp)
+                  t))))))
+
+(defun parse-offer (payload)
+  "An offer PAYLOAD is either a {\"sdp\",\"code\"} JSON envelope or a bare SDP string.
+Return (values SDP CODE)."
+  (or (ignore-errors
+        (let ((j (com.inuoe.jzon:parse payload)))
+          (when (and (hash-table-p j) (gethash "sdp" j))
+            (values (gethash "sdp" j) (gethash "code" j)))))
+      (values payload nil)))
 
 (defun glass-connect ()
   (let ((s (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
@@ -116,11 +147,16 @@
   (format t "~&@@ nostr gateway  (glass ~a:~a)~%" *glass-host* *glass-port*)
   (format t "@@ box npub:   ~a~%" (or box-npub "(npub encode failed; use hex)"))
   (format t "@@ box pubkey: ~a~%" box-pub)
+  (when box-npub
+    (format t "@@ share URL:  https://~a.nsite.lol/#~a~%"
+            (or (uiop:getenv "NSITE_NPUB")
+                "npub1ajvjnhgcmdxkng22lzsh22qvl63es78gk6p9mwksepju974teguq4l4evc")
+            box-npub))
   (format t "@@ relays:     ~a~%" *relays*)
   (if *allow*
       (format t "@@ allowlist:  ~{~a~^, ~}~%" (mapcar (lambda (h) (subseq h 0 12)) *allow*))
-      (format t "@@ allowlist:  (empty) — NOSTR_ALLOW unset; REFUSING ALL offers.~%~
-                 @@              set NOSTR_ALLOW=<npub or hex>[,...] to authorize clients.~%"))
+      (format t "@@ allowlist:  (empty) — no NOSTR_ALLOW; only one-time codes admit clients.~%"))
+  (format t "@@ login-link: sbcl --script login-link.lisp <npub|email> [ttl]  (DMs a code)~%")
   (finish-output)
   (cl-nostr.pool:pool-subscribe
    pool
@@ -129,21 +165,26 @@
    (lambda (wrap relay)
      (declare (ignore relay))
      (handler-case
-         (multiple-value-bind (offer-sdp phone-pub) (cl-nostr.nip59:unwrap-giftwrap kp wrap)
-           (when (and (stringp offer-sdp) (search "m=application" offer-sdp))   ; a data-channel offer
-             (cond
-               ((not (authorized-p phone-pub))
-                (format t "~&@@ DENIED ~a... — not on the allowlist~%" (subseq phone-pub 0 8))
-                (finish-output))
-               (t
-                (format t "~&@@ offer from ~a... (~a bytes) -> answering~%"
-                        (subseq phone-pub 0 8) (length offer-sdp))
-                (finish-output)
-                (let* ((answer (process-offer offer-sdp))
-                       (reply  (cl-nostr.nip59:build-giftwrap kp phone-pub answer)))
-                  (cl-nostr.pool:pool-publish pool reply)
-                  (format t "@@ answer gift-wrapped -> ~a...~%" (subseq phone-pub 0 8))
-                  (finish-output))))))
+         (multiple-value-bind (payload phone-pub) (cl-nostr.nip59:unwrap-giftwrap kp wrap)
+           (multiple-value-bind (offer-sdp code) (parse-offer payload)
+             (when (and (stringp offer-sdp) (search "m=application" offer-sdp))   ; a data-channel offer
+               ;; a valid one-time code OR an allowlisted signer authorizes the connection
+               (let ((via (cond ((code-authorized-p code) "code")
+                                ((authorized-p phone-pub) "allowlist")
+                                (t nil))))
+                 (cond
+                   ((null via)
+                    (format t "~&@@ DENIED ~a... — no valid code, not on the allowlist~%"
+                            (subseq phone-pub 0 8))
+                    (finish-output))
+                   (t
+                    (format t "~&@@ offer from ~a... (via ~a) -> answering~%" (subseq phone-pub 0 8) via)
+                    (finish-output)
+                    (let* ((answer (process-offer offer-sdp))
+                           (reply  (cl-nostr.nip59:build-giftwrap kp phone-pub answer)))
+                      (cl-nostr.pool:pool-publish pool reply)
+                      (format t "@@ answer gift-wrapped -> ~a...~%" (subseq phone-pub 0 8))
+                      (finish-output))))))))
        (error (e) (format t "~&@@ signal error: ~a~%" e) (finish-output)))))
   (format t "@@ subscribed; waiting for gift-wrapped offers~%")
   (finish-output)

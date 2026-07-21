@@ -17,9 +17,10 @@
   <div id="hud">connecting…</div>
   <script type="module">
     import RFB from './novnc/core/rfb.js';
-    import { generateSecretKey, finalizeEvent, getEventHash } from 'https://esm.sh/nostr-tools@2.15.0/pure';
+    import { generateSecretKey, getPublicKey, finalizeEvent, getEventHash } from 'https://esm.sh/nostr-tools@2.15.0/pure';
     import { SimplePool } from 'https://esm.sh/nostr-tools@2.15.0/pool';
     import { getConversationKey, encrypt as nip44Encrypt } from 'https://esm.sh/nostr-tools@2.15.0/nip44';
+    import { wrapEvent, unwrapEvent } from 'https://esm.sh/nostr-tools@2.15.0/nip59';
     import { decode } from 'https://esm.sh/nostr-tools@2.15.0/nip19';
     const log = (...a) => console.log('[glass-nostr]', ...a);
 
@@ -252,54 +253,76 @@
       console.log(`PERF ${(now/1000).toFixed(1)} ${fps.toFixed(1)} ${kbs.toFixed(1)} ${mps.toFixed(1)} ${(buf/1024).toFixed(1)}`);
     }, 1000);
 
-    // --- NIP-07 identity + NIP-59 gift-wrapped signaling ------------------------
-    // The signer (a NIP-07 extension / Nostr browser) holds the secret; we never see it.
-    // We sign the SEAL through window.nostr (nip44.encrypt + signEvent) and wrap it under a
-    // throwaway ephemeral key we generate here.  The box answers gift-wrapped back to us; we
-    // authenticate the box by requiring the answer's seal to be signed by its pubkey.
+    // --- signaling: gift-wrapped Nostr, authorized by a one-time code OR a NIP-07 signer -------
+    // The URL decides how you get in:
+    //   * #…&code=<token> (from `login-link`, delivered to you in a gift-wrapped DM) -> connect
+    //     with a throwaway EPHEMERAL key; no browser signer needed — holding the code is proof.
+    //   * otherwise -> a NIP-07 signer (window.nostr) signs as your real identity, and the box
+    //     admits you if you're on its allowlist.
+    // The box npub + code live in the #hash fragment, which the nsite gateway never receives.
     const setStatus = s => { hud.textContent = s; log(s); };
     const params = new URLSearchParams(location.search);
-    const boxArg = params.get('box') ||
-      '75427ab8309aad26beea8142edf427674e4544604ae4dc5045108ad21fc8a0db';   // dev box pubkey
+    const hraw = location.hash.replace(/^#/, '');
+    const hp = new URLSearchParams(hraw.includes('=') ? hraw : ('box=' + hraw));   // bare npub or box=/code=
+    const boxArg = hp.get('box') || params.get('box') ||
+      '75427ab8309aad26beea8142edf427674e4544604ae4dc5045108ad21fc8a0db';   // dev fallback
+    const code = hp.get('code') || params.get('code') || '';
     const boxPub = boxArg.startsWith('npub') ? decode(boxArg).data : boxArg;
     const relays = (params.get('relays') ||
       'wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net').split(',');
-    const nowSec  = () => Math.floor(Date.now() / 1000);
-    const pastTs  = () => nowSec() - Math.floor(Math.random() * 172800);    // backdate seal/wrap ~2d
+    const nowSec = () => Math.floor(Date.now() / 1000);
+    const pastTs = () => nowSec() - Math.floor(Math.random() * 172800);     // backdate seal/wrap ~2d
 
-    async function giftWrap(signer, myPub, message) {
-      const rumor = { pubkey: myPub, created_at: nowSec(), kind: 14,
-                      tags: [['p', boxPub]], content: message };
-      rumor.id = getEventHash(rumor);                                       // rumor: id, no sig
+    // NIP-07 gift wrap: sign the seal through the signer (secret never exposed), wrap under a
+    // throwaway key.  The code path instead uses nostr-tools wrapEvent with an ephemeral key we own.
+    async function giftWrap07(signer, myPub, message) {
+      const rumor = { pubkey: myPub, created_at: nowSec(), kind: 14, tags: [['p', boxPub]], content: message };
+      rumor.id = getEventHash(rumor);
       const sealContent = await signer.nip44.encrypt(boxPub, JSON.stringify(rumor));
       const seal = await signer.signEvent({ kind: 13, created_at: pastTs(), tags: [], content: sealContent });
-      const esk = generateSecretKey();                                      // ephemeral wrap key
+      const esk = generateSecretKey();
       const wrapContent = nip44Encrypt(JSON.stringify(seal), getConversationKey(esk, boxPub));
       return finalizeEvent({ kind: 1059, created_at: pastTs(), tags: [['p', boxPub]], content: wrapContent }, esk);
     }
-    async function giftUnwrap(signer, wrap) {
+    async function giftUnwrap07(signer, wrap) {
       const seal = JSON.parse(await signer.nip44.decrypt(wrap.pubkey, wrap.content));
-      if (seal.pubkey !== boxPub) throw new Error('answer not sealed by the box');   // authenticate box
+      if (seal.pubkey !== boxPub) return null;                            // authenticate the box
       const rumor = JSON.parse(await signer.nip44.decrypt(seal.pubkey, seal.content));
       return rumor.content;
     }
 
-    (async () => {
-      const signer = window.nostr;
-      if (!signer || !signer.nip44) {
-        setStatus('No NIP-07 signer with nip44 — install a Nostr signer (Alby / nos2x) or use a Nostr browser');
-        return;
+    // Choose an identity from the URL: a code -> ephemeral key (no signer); else -> NIP-07.
+    async function makeIdentity() {
+      if (code) {
+        const sk = generateSecretKey();
+        return {
+          pub: getPublicKey(sk), mode: 'code',
+          wrapOffer: (payload) => wrapEvent({ kind: 14, content: payload, tags: [['p', boxPub]] }, sk, boxPub),
+          unwrap: (ev) => { try { const r = unwrapEvent(ev, sk); return (r && r.pubkey === boxPub) ? r.content : null; }
+                            catch { return null; } },
+        };
       }
-      const myPub = await signer.getPublicKey();
+      const signer = window.nostr;
+      if (!signer || !signer.nip44)
+        throw new Error('No login code in the link, and no NIP-07 signer found — open the one-time link from your DM, or use a Nostr signer.');
+      const pub = await signer.getPublicKey();
+      return { pub, mode: 'nip07',
+               wrapOffer: (payload) => giftWrap07(signer, pub, payload),
+               unwrap: (ev) => giftUnwrap07(signer, ev) };
+    }
+
+    (async () => {
+      let id;
+      try { id = await makeIdentity(); } catch (e) { setStatus(e.message); return; }
       const pool = new SimplePool();
 
       // subscribe for the gift-wrapped ANSWER first, so we can't miss it
       let answered = false;
-      pool.subscribeMany(relays, [{ kinds: [1059], '#p': [myPub] }], {
+      pool.subscribeMany(relays, [{ kinds: [1059], '#p': [id.pub] }], {
         onevent: async (ev) => {
           if (answered) return;
           try {
-            const answer = await giftUnwrap(signer, ev);
+            const answer = await id.unwrap(ev);
             if (answer && answer.includes('m=application')) {
               answered = true;
               await pc.setRemoteDescription({ type: 'answer', sdp: answer });
@@ -316,10 +339,14 @@
         pc.addEventListener('icegatheringstatechange',
           () => { if (pc.iceGatheringState === 'complete') res(); });
       });
-      setStatus('gift-wrapping offer to the box…');
-      const wrap = await giftWrap(signer, myPub, pc.localDescription.sdp);
+      // offer envelope carries the SDP + (in code mode) the one-time code
+      const payload = JSON.stringify(code ? { sdp: pc.localDescription.sdp, code } : { sdp: pc.localDescription.sdp });
+      setStatus(id.mode === 'code' ? 'sending one-time-code offer…' : 'gift-wrapping offer to the box…');
+      const wrap = await id.wrapOffer(payload);
       await Promise.any(pool.publish(relays, wrap));
-      setStatus(`offer sent, signed as ${myPub.slice(0, 8)}… — waiting for the box`);
+      setStatus(id.mode === 'code'
+        ? 'offer sent with your one-time code — waiting for the box'
+        : `offer sent, signed as ${id.pub.slice(0, 8)}… — waiting for the box`);
     })();
   </script>
 </body>
