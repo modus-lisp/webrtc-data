@@ -76,12 +76,12 @@
 
 (defun parse-offer (payload)
   "An offer PAYLOAD is either a {\"sdp\",\"code\"} JSON envelope or a bare SDP string.
-Return (values SDP CODE)."
-  (or (ignore-errors
-        (let ((j (com.inuoe.jzon:parse payload)))
-          (when (and (hash-table-p j) (gethash "sdp" j))
-            (values (gethash "sdp" j) (gethash "code" j)))))
-      (values payload nil)))
+Return (values SDP CODE).  (Uses IF, not OR: OR would keep only the primary value and
+silently drop CODE.)"
+  (let ((j (ignore-errors (com.inuoe.jzon:parse payload))))
+    (if (and (hash-table-p j) (gethash "sdp" j))
+        (values (gethash "sdp" j) (gethash "code" j))
+        (values payload nil))))
 
 (defun glass-connect ()
   (let ((s (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
