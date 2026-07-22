@@ -62,17 +62,21 @@
 (defvar *spent* (make-hash-table :test 'equal) "nonce -> exp, for spent one-time codes")
 (defvar *spent-lock* (sb-thread:make-mutex :name "spent-codes"))
 
-(defun code-authorized-p (code)
-  "T iff CODE is a valid, unexpired, unspent one-time login code — and marks it spent."
-  (and (stringp code) (plusp (length code))
-       (multiple-value-bind (ok nonce exp) (glass-login:verify-token *box-secret* code)
-         (and ok nonce
-              (sb-thread:with-mutex (*spent-lock*)
-                (let ((now (- (get-universal-time) 2208988800)))
-                  (maphash (lambda (k v) (when (< v now) (remhash k *spent*))) *spent*))  ; prune
-                (unless (gethash nonce *spent*)
-                  (setf (gethash nonce *spent*) exp)
-                  t))))))
+(defun code-status (code)
+  "Classify CODE: :OK (valid, unexpired, unspent — marks it spent as a side effect),
+:SPENT, :EXPIRED, :BAD (wrong MAC / malformed), or :ABSENT.  Distinct reasons so a
+denied login is diagnosable."
+  (if (or (not (stringp code)) (zerop (length code)))
+      :absent
+      (multiple-value-bind (ok nonce exp) (glass-login:verify-token *box-secret* code)
+        (cond
+          ((null nonce) :bad)                          ; bad MAC / not a token
+          ((not ok) :expired)                          ; MAC good but past its expiry
+          (t (sb-thread:with-mutex (*spent-lock*)
+               (let ((now (- (get-universal-time) 2208988800)))
+                 (maphash (lambda (k v) (when (< v now) (remhash k *spent*))) *spent*))  ; prune
+               (if (gethash nonce *spent*) :spent
+                   (progn (setf (gethash nonce *spent*) exp) :ok))))))))
 
 (defun parse-offer (payload)
   "An offer PAYLOAD is either a {\"sdp\",\"code\"} JSON envelope or a bare SDP string.
@@ -169,13 +173,14 @@ silently drop CODE.)"
            (multiple-value-bind (offer-sdp code) (parse-offer payload)
              (when (and (stringp offer-sdp) (search "m=application" offer-sdp))   ; a data-channel offer
                ;; a valid one-time code OR an allowlisted signer authorizes the connection
-               (let ((via (cond ((code-authorized-p code) "code")
-                                ((authorized-p phone-pub) "allowlist")
-                                (t nil))))
+               (let* ((cstatus (code-status code))
+                      (via (cond ((eq cstatus :ok) "code")
+                                 ((authorized-p phone-pub) "allowlist")
+                                 (t nil))))
                  (cond
                    ((null via)
-                    (format t "~&@@ DENIED ~a... — no valid code, not on the allowlist~%"
-                            (subseq phone-pub 0 8))
+                    (format t "~&@@ DENIED ~a... — code:~(~a~), not on the allowlist~%"
+                            (subseq phone-pub 0 8) cstatus)
                     (finish-output))
                    (t
                     (format t "~&@@ offer from ~a... (via ~a) -> answering~%" (subseq phone-pub 0 8) via)
