@@ -6,15 +6,19 @@
   <title>glass over WebRTC · Nostr (NIP-07)</title>
   <style>
     html,body{margin:0;height:100%;background:#111;overflow:hidden}#screen{width:100vw;height:100vh}
-    #hud{position:fixed;top:6px;right:6px;z-index:10;font:11px/1.45 ui-monospace,Menlo,monospace;
-         color:#7CFC9B;background:rgba(0,0,0,.62);padding:6px 9px;border-radius:6px;
+    #hud{position:fixed;top:0;left:0;right:0;z-index:12;font:11px/1.4 ui-monospace,Menlo,monospace;
+         color:#7CFC9B;background:rgba(0,0,0,.72);padding:5px 8px;
          white-space:pre;pointer-events:none;text-shadow:0 0 2px #000}
     #hud b{color:#fff;font-weight:600}
+    #diag{position:fixed;top:74px;left:0;right:0;z-index:12;max-height:40vh;overflow:hidden;
+          font:10px/1.32 ui-monospace,Menlo,monospace;color:#a9d9ff;background:rgba(0,0,0,.5);
+          padding:4px 8px;white-space:pre-wrap;pointer-events:none;text-shadow:0 0 2px #000}
   </style>
 </head>
 <body>
   <div id="screen"></div>
   <div id="hud">connecting…</div>
+  <div id="diag"></div>
   <script type="module">
     import RFB from './novnc/core/rfb.js';
     import { generateSecretKey, getPublicKey, finalizeEvent, getEventHash } from 'https://esm.sh/nostr-tools@2.15.0/pure';
@@ -229,27 +233,69 @@
       }, opt);
     })();
 
-    // --- performance HUD: real rendered FPS + throughput + backpressure ---------
+    // --- diagnostics: on-screen lifecycle log + selected ICE path + transport bytes ----------
+    // Mobile has no console, so surface the whole connection lifecycle on the page.  The key
+    // tells for "connects but blank": the ICE PATH (host/srflx/relay) + transport rx bytes show
+    // if data is arriving at all; dc-in + fps show if it reaches the app and paints.
     let frames = 0, bytesIn = 0, msgsIn = 0;
-    // count a frame each time noVNC finishes consuming a FramebufferUpdate
     const origFBU = rfb._framebufferUpdate.bind(rfb);
     rfb._framebufferUpdate = function () { const done = origFBU(); if (done) frames++; return done; };
-    // count inbound bytes/messages without stealing noVNC's own onmessage handler
-    ch.addEventListener('message', e => {
-      bytesIn += (e.data.byteLength ?? e.data.length ?? 0); msgsIn++;
-    });
+    ch.addEventListener('message', e => { bytesIn += (e.data.byteLength ?? e.data.length ?? 0); msgsIn++; });
+
     const hud = document.getElementById('hud');
+    const diagEl = document.getElementById('diag');
+    const diagLines = [], tStart = performance.now();
+    const stamp = () => ((performance.now() - tStart) / 1000).toFixed(1).padStart(5, ' ');
+    function diag(msg) {
+      const line = `${stamp()} ${msg}`;
+      diagLines.push(line); if (diagLines.length > 60) diagLines.shift();
+      diagEl.textContent = diagLines.slice(-20).join('\n');
+      console.log('[diag]', line);
+    }
+    window.addEventListener('error', e => diag('JS-ERROR ' + (e.message || e.error)));
+    window.addEventListener('unhandledrejection', e => diag('REJECT ' + ((e.reason && e.reason.message) || e.reason)));
+    pc.addEventListener('iceconnectionstatechange', () => diag('ice ' + pc.iceConnectionState));
+    pc.addEventListener('connectionstatechange', () => diag('conn ' + pc.connectionState));
+    pc.addEventListener('icegatheringstatechange', () => diag('gather ' + pc.iceGatheringState));
+    pc.addEventListener('icecandidateerror', e => diag(`cand-err ${e.errorCode} ${e.url || ''} ${(e.errorText || '').slice(0,40)}`));
+    ch.addEventListener('open', () => diag('datachannel OPEN'));
+    ch.addEventListener('close', () => diag('datachannel CLOSE'));
+    ch.addEventListener('error', e => diag('datachannel ERROR ' + ((e.error && e.error.message) || '')));
+    rfb.addEventListener('connect', () => diag('RFB connect'));
+    rfb.addEventListener('disconnect', e => diag('RFB disconnect ' + ((e.detail && e.detail.clean) ? 'clean' : 'UNCLEAN')));
+    rfb.addEventListener('securityfailure', e => diag('RFB security-fail ' + ((e.detail && e.detail.reason) || '')));
+
+    // getStats: which candidate pair won (host/srflx/relay), its rtt, and transport rx bytes
+    let pathStr = 'path …', lastRx = 0, lastRxT = performance.now();
+    async function pollPath() {
+      try {
+        const s = await pc.getStats(); let pair = null;
+        s.forEach(r => { if (r.type === 'candidate-pair' && r.state === 'succeeded' && (r.nominated || r.selected)) pair = r; });
+        if (!pair) s.forEach(r => { if (r.type === 'transport' && r.selectedCandidatePairId) pair = s.get(r.selectedCandidatePairId); });
+        if (pair) {
+          const lc = s.get(pair.localCandidateId), rc = s.get(pair.remoteCandidateId);
+          const rtt = pair.currentRoundTripTime != null ? Math.round(pair.currentRoundTripTime * 1000) + 'ms' : '?';
+          const rx = pair.bytesReceived || 0, now = performance.now();
+          const rate = ((rx - lastRx) / 1024 / ((now - lastRxT) / 1000)) || 0; lastRx = rx; lastRxT = now;
+          const path = `${lc ? lc.candidateType : '?'}→${rc ? rc.candidateType : '?'}`;
+          if (pathStr.indexOf(path) < 0) diag('PATH ' + path + ' via ' + (rc ? rc.protocol + ' ' + (rc.address || '?') : '?'));
+          pathStr = `path ${path} rtt ${rtt} rx ${(rx/1024).toFixed(0)}KB ${rate.toFixed(0)}KB/s`;
+        } else pathStr = 'path (no pair)';
+      } catch (_) { pathStr = 'path stats-err'; }
+    }
+
     let last = performance.now();
     setInterval(() => {
+      pollPath();
       const now = performance.now(), dt = (now - last) / 1000; last = now;
       const fps = frames / dt, kbs = bytesIn / 1024 / dt, mps = msgsIn / dt;
       frames = bytesIn = msgsIn = 0;
       const buf = ch.bufferedAmount || 0;
       hud.innerHTML =
-        `<b>${fps.toFixed(0)}</b> fps   <b>${kbs.toFixed(0)}</b> KB/s\n` +
-        `${mps.toFixed(0)} msg/s   buf ${(buf/1024).toFixed(0)} KB\n` +
-        `${pc.connectionState} · nostr · ${rfb._fbName || 'rfb'}`;
-      // machine-readable series line (parsed by the perf harness)
+        `pc <b>${pc.connectionState}</b> · ice <b>${pc.iceConnectionState}</b> · dc <b>${ch.readyState}</b>\n` +
+        `${pathStr}\n` +
+        `dc-in <b>${kbs.toFixed(0)}</b>KB/s ${mps.toFixed(0)}msg · buf ${(buf/1024).toFixed(0)}KB · fps <b>${fps.toFixed(0)}</b>\n` +
+        `rfb ${rfb._rfbConnectionState || '?'} · ${rfb._fbName || '—'}`;
       console.log(`PERF ${(now/1000).toFixed(1)} ${fps.toFixed(1)} ${kbs.toFixed(1)} ${mps.toFixed(1)} ${(buf/1024).toFixed(1)}`);
     }, 1000);
 
