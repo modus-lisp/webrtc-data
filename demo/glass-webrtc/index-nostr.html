@@ -252,6 +252,29 @@
       diagEl.textContent = diagLines.slice(-20).join('\n');
       console.log('[diag]', line);
     }
+    // copy button: grab the whole report to the clipboard (so it's easy to paste back on mobile)
+    const copyBtn = document.createElement('button');
+    copyBtn.textContent = '⧉ copy';
+    copyBtn.style.cssText = 'position:fixed;top:3px;right:4px;z-index:14;font:11px ui-monospace,monospace;' +
+      'background:rgba(0,0,0,.8);color:#7CFC9B;border:1px solid #7CFC9B;border-radius:5px;padding:3px 8px';
+    document.body.appendChild(copyBtn);
+    copyBtn.addEventListener('click', async () => {
+      const report = [
+        'glass-webrtc diag @ ' + new Date().toISOString(),
+        'ua: ' + navigator.userAgent,
+        'url: ' + location.href.replace(/code=[^&]+/, 'code=…'),   // don't leak the code
+        '', hud.innerText, '--- log ---', ...diagLines,
+      ].join('\n');
+      let ok = false;
+      try { await navigator.clipboard.writeText(report); ok = true; } catch (_) {
+        const ta = document.createElement('textarea');           // iOS-safe fallback
+        ta.value = report; ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+        document.body.appendChild(ta); ta.focus(); ta.setSelectionRange(0, report.length);
+        try { ok = document.execCommand('copy'); } catch (_) {} ta.remove();
+      }
+      copyBtn.textContent = ok ? '✓ copied' : '✗ failed';
+      setTimeout(() => { copyBtn.textContent = '⧉ copy'; }, 1600);
+    });
     window.addEventListener('error', e => diag('JS-ERROR ' + (e.message || e.error)));
     window.addEventListener('unhandledrejection', e => diag('REJECT ' + ((e.reason && e.reason.message) || e.reason)));
     pc.addEventListener('iceconnectionstatechange', () => diag('ice ' + pc.iceConnectionState));
