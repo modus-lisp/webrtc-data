@@ -31,7 +31,10 @@
     // A STUN server so the browser also gathers a server-reflexive (public) candidate for
     // NAT traversal; host candidates still cover the LAN case. Non-trickle: we gather fully
     // (host + srflx) before signaling, since our answer is one-shot.
-    const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    const pc = new RTCPeerConnection({ iceServers: [
+      { urls: 'stun:stun.cloudflare.com:3478' },   // reachable through WARP (WARP is Cloudflare)
+      { urls: 'stun:stun.l.google.com:19302' },
+    ] });
     pc.oniceconnectionstatechange = () => log('ice', pc.iceConnectionState);
     pc.onconnectionstatechange = () => log('conn', pc.connectionState);
 
@@ -394,6 +397,8 @@
             const answer = await id.unwrap(ev);
             if (answer && answer.includes('m=application')) {
               answered = true;
+              const ac = (answer.match(/a=candidate[^\r\n]*/g) || []);
+              diag(`answer ${answer.length}B, ${ac.length} cand (${ac.filter(c=>c.includes('srflx')).length} srflx)`);
               await pc.setRemoteDescription({ type: 'answer', sdp: answer });
               setStatus('answer received — establishing WebRTC…');
             }
@@ -403,19 +408,25 @@
 
       setStatus('gathering ICE candidates…');
       await pc.setLocalDescription(await pc.createOffer());
-      await new Promise(res => {                          // non-trickle: gather fully first
-        if (pc.iceGatheringState === 'complete') return res();
-        pc.addEventListener('icegatheringstatechange',
-          () => { if (pc.iceGatheringState === 'complete') res(); });
+      // Non-trickle, but a blocked/slow STUN must NOT hang gathering (seen: 49s on cellular).
+      // Cap the wait and send whatever we have — host is instant; srflx if it arrives in time.
+      await new Promise(res => {
+        let done = false;
+        const finish = why => { if (!done) { done = true; diag('gather ' + why); res(); } };
+        if (pc.iceGatheringState === 'complete') return finish('complete');
+        pc.addEventListener('icegatheringstatechange', () => { if (pc.iceGatheringState === 'complete') finish('complete'); });
+        setTimeout(() => finish('timeout-6s'), 6000);
       });
-      // offer envelope carries the SDP + (in code mode) the one-time code
+      const cands = pc.localDescription.sdp.match(/a=candidate[^\r\n]*/g) || [];
+      const nSrflx = cands.filter(c => c.includes('srflx')).length;
+      const nRelay = cands.filter(c => c.includes('relay')).length;
+      diag(`offer ${cands.length} cand: ${cands.length - nSrflx - nRelay} host ${nSrflx} srflx ${nRelay} relay`);
       const payload = JSON.stringify(code ? { sdp: pc.localDescription.sdp, code } : { sdp: pc.localDescription.sdp });
       setStatus(id.mode === 'code' ? 'sending one-time-code offer…' : 'gift-wrapping offer to the box…');
       const wrap = await id.wrapOffer(payload);
       await Promise.any(pool.publish(relays, wrap));
-      setStatus(id.mode === 'code'
-        ? 'offer sent with your one-time code — waiting for the box'
-        : `offer sent, signed as ${id.pub.slice(0, 8)}… — waiting for the box`);
+      diag('offer published (' + id.mode + ')');
+      setStatus('offer sent — waiting for the box');
     })();
   </script>
 </body>
