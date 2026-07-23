@@ -55,28 +55,22 @@
   "T iff PUBKEY (hex) is on the allowlist.  No allowlist => NIL (deny all)."
   (and pubkey *allow* (member (string-downcase pubkey) *allow* :test #'string=) t))
 
-;; ---- one-time codes (magic-link login, keyed by *box-secret*) ----------------
+;; ---- login codes (magic-link, keyed by *box-secret*) ------------------------
 ;; A code arrives inside the offer envelope (see PARSE-OFFER); it was delivered to a
 ;; user via a gift-wrapped DM (login-link), so holding a valid one is proof enough —
-;; no browser signer needed.  We enforce single-use with a spent-nonce set.
-(defvar *spent* (make-hash-table :test 'equal) "nonce -> exp, for spent one-time codes")
-(defvar *spent-lock* (sb-thread:make-mutex :name "spent-codes"))
-
+;; no browser signer needed.  A code is REUSABLE until it expires: its TTL (+ the
+;; authenticated DM delivery) is the security boundary, and reuse is what lets a page
+;; reload / retry work (single-use burned the code on the first, possibly-failed, try).
 (defun code-status (code)
-  "Classify CODE: :OK (valid, unexpired, unspent — marks it spent as a side effect),
-:SPENT, :EXPIRED, :BAD (wrong MAC / malformed), or :ABSENT.  Distinct reasons so a
-denied login is diagnosable."
+  "Classify CODE: :OK (valid + unexpired), :EXPIRED, :BAD (wrong MAC / malformed), or
+:ABSENT.  Distinct reasons so a denied login is diagnosable."
   (if (or (not (stringp code)) (zerop (length code)))
       :absent
-      (multiple-value-bind (ok nonce exp) (glass-login:verify-token *box-secret* code)
+      (multiple-value-bind (ok nonce) (glass-login:verify-token *box-secret* code)
         (cond
           ((null nonce) :bad)                          ; bad MAC / not a token
           ((not ok) :expired)                          ; MAC good but past its expiry
-          (t (sb-thread:with-mutex (*spent-lock*)
-               (let ((now (- (get-universal-time) 2208988800)))
-                 (maphash (lambda (k v) (when (< v now) (remhash k *spent*))) *spent*))  ; prune
-               (if (gethash nonce *spent*) :spent
-                   (progn (setf (gethash nonce *spent*) exp) :ok))))))))
+          (t :ok)))))
 
 (defun parse-offer (payload)
   "An offer PAYLOAD is either a {\"sdp\",\"code\"} JSON envelope or a bare SDP string.
@@ -164,7 +158,11 @@ silently drop CODE.)"
   (finish-output)
   (cl-nostr.pool:pool-subscribe
    pool
-   (list (cl-nostr.filter:make-filter :kinds '(1059) :tags (list (cons "p" (list box-pub)))))
+   ;; :limit caps the initial backlog — this box pubkey has days of old gift-wraps on the
+   ;; relays; live offers still stream after EOSE.  The pool now keepalives + reconnects, so
+   ;; the subscription no longer dies on an idle relay drop.
+   (list (cl-nostr.filter:make-filter :kinds '(1059) :tags (list (cons "p" (list box-pub)))
+                                      :limit 20))
    :on-event
    (lambda (wrap relay)
      (declare (ignore relay))
