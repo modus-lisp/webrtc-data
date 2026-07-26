@@ -79,6 +79,13 @@ fewer per-packet CRC/GCM/syscall) per byte than the old 1024.")
 (defconstant +sctp-cwnd-init+ 32768)          ; larger initial window for a fast first paint on a
                                               ; clean path (RFC 4960's 4380 is ~3 MTU — too small
                                               ; when RTT is high and the pipe is loss-free)
+(defconstant +sctp-cwnd-floor+ 49152)         ; loss-tolerant floor: cwnd never backs off below this
+                                              ; on loss.  Standard Reno halving assumes every loss is
+                                              ; congestion; on a cellular relay the loss is RANDOM (RF)
+                                              ; on a pipe with huge spare bandwidth, so halving-to-1-MTU
+                                              ; strands cwnd at ~10KB and throughput at cwnd/RTT (~40KB/s
+                                              ; at 180ms).  A floor keeps ~floor/RTT flowing (~270KB/s).
+                                              ; Tune down if it induces loss (watch rtx in [stats]).
 (defconstant +sctp-send-q-max+ 512)          ; backpressure bound on the ready queue
 (defconstant +sctp-rto-init+ 1.0d0)          ; initial retransmit timeout (s)
 (defconstant +sctp-rto-min+  0.4d0)          ; snappy LAN recovery (RFC min is 1s)
@@ -324,7 +331,10 @@ retransmit every outstanding chunk (oldest first)."
       (when (and oldest (> (sctp-secs-since (txc-sent oldest)) (sctp-assoc-rto assoc)))
         (setf (sctp-assoc-ssthresh assoc)
               (max (floor (sctp-assoc-flight assoc) 2) (* 4 +sctp-mtu+)))
-        (setf (sctp-assoc-cwnd assoc) +sctp-mtu+)
+        ;; Loss-tolerant: hold the floor instead of collapsing to 1 MTU.  A single RTO on a
+        ;; random-loss path is a lost (re)transmit, not congestion; collapsing strands us for
+        ;; many high-RTT rounds.  A genuinely dead path is still caught by the RTO-strikes abort.
+        (setf (sctp-assoc-cwnd assoc) (max +sctp-cwnd-floor+ (floor (sctp-assoc-flight assoc) 2)))
         (setf (sctp-assoc-rto assoc) (min +sctp-rto-max+ (* 2 (sctp-assoc-rto assoc))))
         (when (>= (incf (sctp-assoc-rto-strikes assoc)) +sctp-max-rto-strikes+)
           (sctp-log assoc "~&  !! peer unreachable (~a RTO strikes) -> abort~%"
@@ -410,8 +420,10 @@ chunk reported missing >=3 times, then flush whatever the window now allows."
                            (push txc fast))))
                      out)
             (when fast
+              ;; Loss-tolerant multiplicative decrease: 3/4 (not Reno's 1/2) and never below the
+              ;; floor.  Random RF loss shouldn't halve a window that's nowhere near filling the pipe.
               (setf (sctp-assoc-ssthresh assoc)
-                    (max (floor (sctp-assoc-flight assoc) 2) (* 4 +sctp-mtu+)))
+                    (max (floor (* (sctp-assoc-flight assoc) 3) 4) +sctp-cwnd-floor+))
               (setf (sctp-assoc-cwnd assoc) (sctp-assoc-ssthresh assoc))
               (sctp-log assoc "~&  !! fast-retransmit ~a chunk(s)~%" (length fast))
               (incf (sctp-assoc-n-fast-rtx assoc) (length fast))
