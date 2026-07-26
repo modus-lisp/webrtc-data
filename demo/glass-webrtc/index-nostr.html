@@ -292,8 +292,15 @@
     rfb.addEventListener('connect', () => diag('RFB connect'));
     rfb.addEventListener('disconnect', e => diag('RFB disconnect ' + ((e.detail && e.detail.clean) ? 'clean' : 'UNCLEAN')));
     rfb.addEventListener('securityfailure', e => diag('RFB security-fail ' + ((e.detail && e.detail.reason) || '')));
-    // heartbeat: log elapsed + state every 10s so a stall is visible in the report
-    setInterval(() => diag(`♥ pc=${pc.connectionState} ice=${pc.iceConnectionState} dc=${ch.readyState} rfb=${rfb._rfbConnectionState || '?'}`), 10000);
+    // heartbeat every 10s — but only log it when something's NOT fully healthy or the state
+    // changed, so a steady-good session doesn't spam identical ♥ lines.
+    let lastHb = '';
+    setInterval(() => {
+      const hb = `pc=${pc.connectionState} ice=${pc.iceConnectionState} dc=${ch.readyState} rfb=${rfb._rfbConnectionState || '?'}`;
+      const healthy = pc.connectionState === 'connected' && ch.readyState === 'open' && rfb._rfbConnectionState === 'connected';
+      if (!healthy || hb !== lastHb) diag('♥ ' + hb);
+      lastHb = hb;
+    }, 10000);
 
     // getStats: which candidate pair won (host/srflx/relay), its rtt, and transport rx bytes
     let pathStr = 'path …', lastRx = 0, lastRxT = performance.now();

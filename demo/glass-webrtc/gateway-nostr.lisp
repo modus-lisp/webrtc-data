@@ -115,7 +115,23 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                                (when (or (null n) (zerop n)) (return))
                                (sctp-send-binary assoc sid (subseq buf 0 n))))
                          (error () nil))))
-                   :name "glass->ch"))
+                   :name "glass->ch")
+                  ;; SCTP health: per-2s rate + cwnd/flight/outq, to spot a relay-path stall.
+                  (bt:make-thread
+                   (lambda ()
+                     (let ((prev (sctp-stats assoc)) (tp (get-internal-real-time)))
+                       (loop until (eq (getf (sctp-stats assoc) :state) :aborted) do
+                         (sleep 2.0)
+                         (let* ((now (sctp-stats assoc)) (tn (get-internal-real-time))
+                                (dt (max 1d-3 (/ (float (- tn tp) 1d0) internal-time-units-per-second))))
+                           (flet ((d (k) (- (or (getf now k) 0) (or (getf prev k) 0))))
+                             (format *error-output*
+                                     "~&[stats] out ~,1fKB/s in ~,1fKB/s rtx ~a cwnd ~a flight ~a outq ~a srtt ~a~%"
+                                     (/ (d :bytes-out) 1024d0 dt) (/ (d :bytes-in) 1024d0 dt) (d :rtx)
+                                     (getf now :cwnd) (getf now :flight) (getf now :send-q)
+                                     (let ((s (getf now :srtt-ms))) (if s (format nil "~,1fms" s) "-"))))
+                           (setf prev now tp tn)))))
+                   :name "stats"))
                 :on-message
                 (lambda (assoc sid payload)
                   (declare (ignore assoc sid))
