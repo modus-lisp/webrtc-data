@@ -22,6 +22,7 @@ export default class ZRLEDecoder {
     }
 
     decodeRect(x, y, width, height, sock, display, depth) {
+        this._depth = depth;
         if (this._length === 0) {
             if (sock.rQwait("ZLib data length", 4)) {
                 return false;
@@ -82,11 +83,26 @@ export default class ZRLEDecoder {
 
     _readPixels(pixels) {
         let data = this._pixelBuffer;
+        if (this._depth === 16) {
+            // 16bpp RGB555 CPIXEL: 2 little-endian bytes, 5 bits per channel.
+            // noVNC's SetPixelFormat asked for red-shift=0/green=5/blue=10 (see
+            // RFB.messages.pixelFormat), and glass honours it, so red is in the low bits.
+            // Expand each 5-bit channel to 8 bits with (c<<3)|(c>>2).
+            const buffer = this._inflator.inflate(2*pixels);
+            for (let i = 0, j = 0; i < pixels*4; i += 4, j += 2) {
+                const v = buffer[j] | (buffer[j + 1] << 8);
+                const r = v & 0x1f, g = (v >> 5) & 0x1f, b = (v >> 10) & 0x1f;
+                data[i]     = (r << 3) | (r >> 2);
+                data[i + 1] = (g << 3) | (g >> 2);
+                data[i + 2] = (b << 3) | (b >> 2);
+                data[i + 3] = 255;
+            }
+            return data;
+        }
         const buffer = this._inflator.inflate(3*pixels);
-        // glass ignores our SetPixelFormat and always sends its native CPIXEL byte order
-        // B,G,R (red-shift=16), whereas noVNC's SetPixelFormat asked for R,G,B. Map to the
-        // canvas's R,G,B here so colours are correct (a no-op for grayscale/green content,
-        // which is why terminal-only testing never caught it).
+        // 24bpp: glass sends its native CPIXEL byte order B,G,R whereas our SetPixelFormat
+        // asked for R,G,B. Map to the canvas's R,G,B here so colours are correct (a no-op for
+        // grayscale/green content, which is why terminal-only testing never caught it).
         for (let i = 0, j = 0; i < pixels*4; i += 4, j += 3) {
             data[i]     = buffer[j + 2];  // R  <- glass byte 2
             data[i + 1] = buffer[j + 1];  // G  <- glass byte 1

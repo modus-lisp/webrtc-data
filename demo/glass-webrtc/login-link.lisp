@@ -47,7 +47,11 @@
              (box-kp (cl-nostr.keys:keypair-from-secret *box-secret*))
              (box-npub (cl-nostr.bech32:npub-encode (cl-nostr.keys:public-hex box-kp)))
              (token (glass-login:mint-token *box-secret* :ttl ttl))
-             (url (format nil "https://~a.nsite.lol/#box=~a&code=~a" *site* box-npub token))
+             ;; LOGIN_URL_BASE overrides the page location (e.g. a Blossom blob URL while an
+             ;; nsite gateway's cache catches up); default is the nsite site URL.
+             (base (or (uiop:getenv "LOGIN_URL_BASE")
+                       (format nil "https://~a.nsite.lol/" *site*)))
+             (url (format nil "~a#box=~a&code=~a" base box-npub token))
              (msg (format nil "Your one-time glass desktop link (expires in ~a min):~%~%~a"
                           (max 1 (round ttl 60)) url))
              (wrap (cl-nostr.nip59:build-giftwrap box-kp target msg))

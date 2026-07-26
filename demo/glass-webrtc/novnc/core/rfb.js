@@ -2222,7 +2222,12 @@ export default class RFB extends EventTargetMixin {
             this._asyncClipboard.grab();
         }
 
-        this._fbDepth = 24;
+        // Colour depth is opt-in per page via window.__glassFbDepth: the bandwidth-limited
+        // cellular page sets 16 (RGB555, ~1/3 fewer bytes/pixel through ZRLE — our decoder
+        // handles the 2-byte CPIXEL, see decoders/zrle.js, and glass honors the SetPixelFormat);
+        // everything else keeps 24-bit truecolor. Only glass builds that honor SetPixelFormat
+        // may be given 16 — an older build that ignores it would desync the 2-byte decoder.
+        this._fbDepth = (typeof window !== 'undefined' && window.__glassFbDepth === 16) ? 16 : 24;
 
         if (this._fbName === "Intel(r) AMT KVM") {
             Log.Warn("Intel AMT KVM only supports 8/16 bit depths. Using low color mode.");
@@ -2258,6 +2263,10 @@ export default class RFB extends EventTargetMixin {
             encs.push(encodings.encodingHextile);
             encs.push(encodings.encodingRRE);
             encs.push(encodings.encodingZlib);
+        } else if (this._fbDepth == 16) {
+            // Low-color (RGB555) still gets ZRLE — our decoder reads its 2-byte CPIXEL. Without
+            // this, low-color would fall back to Raw, which is far bigger than compressed ZRLE.
+            encs.push(encodings.encodingZRLE);
         }
         encs.push(encodings.encodingRaw);
 
