@@ -79,7 +79,7 @@ fewer per-packet CRC/GCM/syscall) per byte than the old 1024.")
 (defconstant +sctp-cwnd-init+ 32768)          ; larger initial window for a fast first paint on a
                                               ; clean path (RFC 4960's 4380 is ~3 MTU — too small
                                               ; when RTT is high and the pipe is loss-free)
-(defconstant +sctp-cwnd-floor+ 49152)         ; loss-tolerant floor: cwnd never backs off below this
+(defconstant +sctp-cwnd-floor+ 98304)         ; loss-tolerant floor: cwnd never backs off below this
                                               ; on loss.  Standard Reno halving assumes every loss is
                                               ; congestion; on a cellular relay the loss is RANDOM (RF)
                                               ; on a pipe with huge spare bandwidth, so halving-to-1-MTU
