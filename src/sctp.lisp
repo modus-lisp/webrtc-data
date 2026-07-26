@@ -76,7 +76,9 @@ consecutive-TSN chunks (RFC 4960 §6.9) and reassembled by the peer.  Sized to f
 MTU: 1152 + 12 (DATA hdr) + 4 (chunk hdr) + 12 (SCTP common) = 1180 <= +SCTP-MTU+ (1200), and
 + DTLS/GCM expansion (~37) still fits a 1500-byte Ethernet datagram — so fewer packets (and
 fewer per-packet CRC/GCM/syscall) per byte than the old 1024.")
-(defconstant +sctp-cwnd-init+ 4380)          ; min(4*MTU, max(2*MTU, 4380))
+(defconstant +sctp-cwnd-init+ 32768)          ; larger initial window for a fast first paint on a
+                                              ; clean path (RFC 4960's 4380 is ~3 MTU — too small
+                                              ; when RTT is high and the pipe is loss-free)
 (defconstant +sctp-send-q-max+ 512)          ; backpressure bound on the ready queue
 (defconstant +sctp-rto-init+ 1.0d0)          ; initial retransmit timeout (s)
 (defconstant +sctp-rto-min+  0.4d0)          ; snappy LAN recovery (RFC min is 1s)
@@ -426,7 +428,10 @@ chunk reported missing >=3 times, then flush whatever the window now allows."
       (setf (sctp-assoc-peer-cum-ack assoc) cum)
       (when (plusp acked)
         (if (<= (sctp-assoc-cwnd assoc) (sctp-assoc-ssthresh assoc))
-            (incf (sctp-assoc-cwnd assoc) (min acked +sctp-mtu+))          ; slow start
+            ;; slow start, Appropriate Byte Counting (RFC 3465): grow by the bytes ACKed, not
+            ;; capped at 1 MTU/SACK — otherwise a high-RTT path with delayed-acks (few, fat SACKs)
+            ;; never doubles cwnd per RTT and can't fill a clean pipe.
+            (incf (sctp-assoc-cwnd assoc) acked)
             (incf (sctp-assoc-cwnd assoc)                                   ; cong. avoidance
                   (max 1 (floor (* +sctp-mtu+ +sctp-mtu+) (sctp-assoc-cwnd assoc))))))
       ;; 5. the window may have opened — send more.
