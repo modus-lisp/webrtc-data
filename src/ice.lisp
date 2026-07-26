@@ -373,6 +373,10 @@ PEER-HOST is a 4-octet vector.  Replies ride Send indications until a channel bi
   agent)
 
 (defun ice-close (agent)
+  ;; Release the TURN allocation (Refresh lifetime 0) BEFORE tearing the socket down — otherwise
+  ;; it lingers on the server for its full lifetime (~600s) and a small relay-port range exhausts.
+  (let ((alloc (ice-agent-turn agent)))
+    (when alloc (ignore-errors (turn-refresh alloc :lifetime 0 :timeout 0.5))))
   (setf (ice-agent-stop agent) t)
   (ignore-errors (sb-bsd-sockets:socket-close (ice-agent-socket agent)))
   (ignore-errors (bt:destroy-thread (ice-agent-thread agent))))

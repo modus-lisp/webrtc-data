@@ -419,7 +419,7 @@
         const finish = why => { if (!done) { done = true; diag('gather ' + why); res(); } };
         if (pc.iceGatheringState === 'complete') return finish('complete');
         pc.addEventListener('icegatheringstatechange', () => { if (pc.iceGatheringState === 'complete') finish('complete'); });
-        setTimeout(() => finish('timeout-6s'), 6000);
+        setTimeout(() => finish('timeout-10s'), 10000);   // give TURN relay time to gather
       });
       const cands = pc.localDescription.sdp.match(/a=candidate[^\r\n]*/g) || [];
       const nSrflx = cands.filter(c => c.includes('srflx')).length;

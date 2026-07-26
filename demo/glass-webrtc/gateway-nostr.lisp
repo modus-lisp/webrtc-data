@@ -89,8 +89,9 @@ silently drop CODE.)"
 
 (defvar *last-assoc* nil)
 
-(defun run-session (conn)
-  "Drive DTLS, run the data channel, and bridge it to glass once the channel opens."
+(defun run-session (conn agent)
+  "Drive DTLS, run the data channel, and bridge it to glass once the channel opens.
+Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
   (let ((glass nil))
     (unwind-protect
          (handler-case
@@ -121,7 +122,8 @@ silently drop CODE.)"
                   (when (and glass (plusp (length payload)))
                     (sb-bsd-sockets:socket-send glass (as-u8vec payload) (length payload))))))
            (error (e) (format *error-output* "~&[gw-nostr] session error: ~a~%" e)))
-      (when glass (ignore-errors (sb-bsd-sockets:socket-close glass))))))
+      (when glass (ignore-errors (sb-bsd-sockets:socket-close glass)))
+      (ignore-errors (ice-close agent)))))   ; release the TURN allocation + ICE socket
 
 (defun process-offer (offer-sdp)
   "Parse an SDP OFFER, run the answerer (srflx + full-agent checks for off-LAN), spawn the
@@ -131,10 +133,12 @@ silently drop CODE.)"
          (conn  (webrtc-dtls-setup agent :remote-fingerprint (sdp-fingerprint offer)))
          (answer (ice-answer agent offer :fingerprint (dtls-conn-fingerprint conn)
                              :gather-srflx t                    ; advertise our public mapping
-                             :gather-relay (and (uiop:getenv "TURN_SERVER") t))))
+                             ;; a plist -> ice-gather-relay keys; a longer timeout so the Allocate
+                             ;; reliably completes (2s was racy under load).
+                             :gather-relay (and (uiop:getenv "TURN_SERVER") (list :timeout 6.0)))))
     (ice-serve agent)
     (ice-start-checks agent)                                    ; punch our NAT toward the phone
-    (bt:make-thread (lambda () (run-session conn)) :name "webrtc-session")
+    (bt:make-thread (lambda () (run-session conn agent)) :name "webrtc-session")
     answer))
 
 ;;; ---- Nostr signaling loop --------------------------------------------------
