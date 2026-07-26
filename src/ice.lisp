@@ -170,6 +170,14 @@ TURN_SERVER/TURN_USER/TURN_PASS.  Best-effort — returns T on success.  MUST ru
                   ;; Pre-install permission+channel for each known peer candidate.
                   (dolist (c (ice-agent-remote-candidates agent))
                     (ignore-errors (turn-install-peer alloc (ice-candidate-ip c) (ice-candidate-port c))))
+                  ;; Behind an frp/reverse-proxy TURN, the peer's packets reach the server from the
+                  ;; PROXY's address, not the peer's — so pre-permit that IP (env TURN_RELAY_PEER) or
+                  ;; the server drops the peer's first packet.  ICE-BIND-RELAY-PEER-ASYNC then binds a
+                  ;; channel off the address the server actually reports, keeping the relay symmetric
+                  ;; through the proxy.
+                  (let ((proxy (uiop:getenv "TURN_RELAY_PEER")))
+                    (when (and proxy (plusp (length proxy)))
+                      (ignore-errors (turn-create-permission alloc proxy))))
                   t))
             (error () nil)))))))
 
