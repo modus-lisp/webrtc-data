@@ -136,20 +136,25 @@
       const dist = ts => Math.hypot(ts[0].clientX - ts[1].clientX, ts[0].clientY - ts[1].clientY);
       // white cursor drawn as SVG: an inner ring is the pointer; an outer arc grows clockwise as the
       // press-and-hold arms and, when it closes into a full second concentric ring, the grab locks.
-      const NS = 'http://www.w3.org/2000/svg', C = 2 * Math.PI * 12, shadow = 'drop-shadow(0 0 3px rgba(0,0,0,.9))';
+      const NS = 'http://www.w3.org/2000/svg', C = 2 * Math.PI * 12;
       const svgEl = (n, a) => { const el = document.createElementNS(NS, n);
         for (const k in a) el.setAttribute(k, a[k]); return el; };
       const cur = svgEl('svg', { width: 40, height: 40, viewBox: '0 0 40 40' });
-      cur.style.cssText = 'position:fixed;margin:-20px 0 0 -20px;pointer-events:none;z-index:15;display:none;overflow:visible;' +
-        'filter:drop-shadow(0 0 1px rgba(0,0,0,.95)) drop-shadow(0 0 1px rgba(0,0,0,.85))';  // dark halo so the white ring shows on light backgrounds
-      const inner = svgEl('circle', { cx: 20, cy: 20, r: 8, fill: 'none', stroke: '#fff', 'stroke-width': 2 });
-      const arc = svgEl('circle', { cx: 20, cy: 20, r: 12, fill: 'none', stroke: '#fff', 'stroke-width': 2,
-        'stroke-linecap': 'round', transform: 'rotate(-90 20 20)', 'stroke-dasharray': C, 'stroke-dashoffset': C });
-      inner.style.filter = arc.style.filter = shadow;
-      cur.append(arc, inner); document.body.appendChild(cur);
-      const ringIdle = () => arc.setAttribute('stroke-dashoffset', C);            // outer arc hidden
-      const ringArm  = p  => arc.setAttribute('stroke-dashoffset', C * (1 - p));  // grows clockwise
-      const ringGrab = () => arc.setAttribute('stroke-dashoffset', 0);            // full second ring = grabbed
+      cur.style.cssText = 'position:fixed;margin:-20px 0 0 -20px;pointer-events:none;z-index:15;display:none;overflow:visible';
+      // each ring is drawn twice — a wider DARK stroke behind a white one — for a crisp dark outline,
+      // so the cursor reads on light AND dark backgrounds (a soft drop-shadow washed out on white).
+      const DARK = 'rgba(0,0,0,.9)';
+      const innerBg = svgEl('circle', { cx: 20, cy: 20, r: 8, fill: 'none', stroke: DARK, 'stroke-width': 5 });
+      const inner   = svgEl('circle', { cx: 20, cy: 20, r: 8, fill: 'none', stroke: '#fff', 'stroke-width': 2 });
+      const arcA = { cx: 20, cy: 20, r: 12, fill: 'none', 'stroke-linecap': 'round',
+                     transform: 'rotate(-90 20 20)', 'stroke-dasharray': C, 'stroke-dashoffset': C };
+      const arcBg = svgEl('circle', { ...arcA, stroke: DARK, 'stroke-width': 5 });
+      const arc   = svgEl('circle', { ...arcA, stroke: '#fff', 'stroke-width': 2 });
+      cur.append(arcBg, arc, innerBg, inner); document.body.appendChild(cur);    // dark backs drawn first
+      const setArc = o => { arc.setAttribute('stroke-dashoffset', o); arcBg.setAttribute('stroke-dashoffset', o); };
+      const ringIdle = () => setArc(C);                                          // outer arc hidden
+      const ringArm  = p  => setArc(C * (1 - p));                                // grows clockwise
+      const ringGrab = () => setArc(0);                                          // full second ring = grabbed
       const applyT = () => {                                 // push pan/zoom onto the canvas
         const c = canvasOf(); if (!c) return;
         if (zoom <= 1.001) { zoom = 1; tx = 0; ty = 0; c.style.transform = ''; }
