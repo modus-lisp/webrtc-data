@@ -13,12 +13,26 @@
     #diag{position:fixed;top:74px;left:0;right:0;z-index:12;max-height:40vh;overflow:hidden;
           font:10px/1.32 ui-monospace,Menlo,monospace;color:#a9d9ff;background:rgba(0,0,0,.5);
           padding:4px 8px;white-space:pre-wrap;pointer-events:none;text-shadow:0 0 2px #000}
+    /* clean connecting overlay (non-debug), covers the blank screen until the first frame paints */
+    #connstatus{position:fixed;inset:0;z-index:30;display:flex;align-items:center;justify-content:center;
+      background:radial-gradient(130% 100% at 50% 38%,#141a21 0%,#0b0d11 100%);color:#e8eef2;
+      font:15px/1.5 -apple-system,system-ui,sans-serif;transition:opacity .42s ease}
+    #connstatus .card{display:flex;flex-direction:column;align-items:center;gap:18px;text-align:center;padding:28px}
+    #connstatus .spinner{width:34px;height:34px;border-radius:50%;border:3px solid rgba(255,255,255,.15);
+      border-top-color:#7CFC9B;animation:spin .9s linear infinite}
+    #connstatus .msg{font-weight:500;letter-spacing:.01em;min-height:1.4em}
+    #connstatus .steps{display:flex;gap:10px;margin-top:4px}
+    #connstatus .steps i{width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,.16);
+      transition:background .3s ease}
+    #connstatus .steps i.on{background:#7CFC9B}
+    @keyframes spin{to{transform:rotate(360deg)}}
   </style>
 </head>
 <body>
   <div id="screen"></div>
   <div id="hud">connecting…</div>
   <div id="diag"></div>
+  <div id="connstatus"><div class="card"><div class="spinner"></div><div class="msg">Starting…</div><div class="steps"><i></i><i></i><i></i><i></i></div></div></div>
   <script type="module">
     import RFB from './novnc/core/rfb.js';
     import { generateSecretKey, getPublicKey, finalizeEvent, getEventHash } from 'https://esm.sh/nostr-tools@2.15.0/pure';
@@ -150,6 +164,29 @@
         else if (r.top > s.top) dy = s.top - r.top; else if (r.bottom < s.bottom) dy = s.bottom - r.bottom;
         if (dx || dy) { tx += dx; ty += dy; c.style.transform = `translate(${tx}px,${ty}px) scale(${zoom})`; }
       };
+      const SAFE = 0.25;                                     // cursor roams the central 50%; view pans past that
+      const followCursor = (frac = SAFE) => {                // pan a zoomed view to keep the cursor in a band
+        const c = canvasOf(); if (!c || zoom <= 1.001) return;
+        const s = screen.getBoundingClientRect(), r = c.getBoundingClientRect();
+        const sx = c.clientWidth ? r.width / c.clientWidth : 1, sy = c.clientHeight ? r.height / c.clientHeight : 1;
+        const cxs = r.left + vx * sx, cys = r.top + vy * sy; // cursor's screen position
+        const mx = s.width * frac, my = s.height * frac;
+        let dx = 0, dy = 0;
+        if (cxs < s.left + mx) dx = s.left + mx - cxs; else if (cxs > s.right - mx) dx = s.right - mx - cxs;
+        if (cys < s.top + my) dy = s.top + my - cys; else if (cys > s.bottom - my) dy = s.bottom - my - cys;
+        if (dx || dy) { tx += dx; ty += dy; applyT(); clampPan(); }  // clampPan stops us panning past the edge
+      };
+      const clampCursorToFrame = () => {                     // move the CURSOR (not the view) to keep it on-screen
+        const c = canvasOf(); if (!c || zoom <= 1.001) return false;
+        const s = screen.getBoundingClientRect(), r = c.getBoundingClientRect();
+        const sx = c.clientWidth ? r.width / c.clientWidth : 1, sy = c.clientHeight ? r.height / c.clientHeight : 1;
+        const EDGE = 24;                                      // keep the ~20px ring off the very edge
+        const loX = Math.max(0, (s.left + EDGE - r.left) / sx), hiX = Math.min(c.clientWidth - 1, (s.right - EDGE - r.left) / sx);
+        const loY = Math.max(0, (s.top + EDGE - r.top) / sy), hiY = Math.min(c.clientHeight - 1, (s.bottom - EDGE - r.top) / sy);
+        const nvx = Math.min(Math.max(vx, loX), hiX), nvy = Math.min(Math.max(vy, loY), hiY);
+        if (nvx !== vx || nvy !== vy) { vx = nvx; vy = nvy; return true; }
+        return false;
+      };
       const place = () => {                                  // ring at the cursor's framebuffer point
         const c = canvasOf(); if (!c) return;
         const r = c.getBoundingClientRect();
@@ -163,7 +200,7 @@
       const move = () => {
         const c = canvasOf(); if (!c) return;
         vx = Math.max(0, Math.min(c.clientWidth - 1, vx)); vy = Math.max(0, Math.min(c.clientHeight - 1, vy));
-        rfb._sendMouse(vx, vy, mask); place();
+        rfb._sendMouse(vx, vy, mask); followCursor(); place();
       };
       const click = bit => { rfb._sendMouse(vx, vy, mask | bit); rfb._sendMouse(vx, vy, mask); };
       const cancelHold = () => { if (holdRAF) { cancelAnimationFrame(holdRAF); holdRAF = 0; } if (!dragging) ringIdle(); };
@@ -201,13 +238,15 @@
           const my = (e.touches[0].clientY + e.touches[1].clientY) / 2;
           if (dPrev > 0) {
             const z2 = Math.max(1, Math.min(ZMAX, zoom * d / dPrev));
-            if (z2 !== zoom) {                                // zoom about the pinch midpoint
+            if (z2 !== zoom) {                                // zoom about the pinch midpoint (natural pinch)
               const r = canvasOf().getBoundingClientRect();
               tx += (mx - r.left) * (1 - z2 / zoom); ty += (my - r.top) * (1 - z2 / zoom); zoom = z2;
             }
           }
           const pdx = mx - mpx, pdy = my - mpy;
-          if (zoom > 1.001) { tx += pdx; ty += pdy; applyT(); clampPan(); }
+          if (zoom > 1.001) { tx += pdx; ty += pdy; applyT(); clampPan();
+            // zoom gesture stays pure: slide the CURSOR back on-screen instead of panning the view
+            if (clampCursorToFrame()) rfb._sendMouse(vx, vy, mask); }
           else {                                              // not zoomed: two-finger drag = scroll
             applyT(); scrollAcc += pdy;
             while (Math.abs(scrollAcc) >= SCROLL_PX) {
@@ -247,8 +286,25 @@
     // tells for "connects but blank": the ICE PATH (host/srflx/relay) + transport rx bytes show
     // if data is arriving at all; dc-in + fps show if it reaches the app and paints.
     let frames = 0, bytesIn = 0, msgsIn = 0;
+    // clean (non-debug) connecting overlay: spinner + friendly phase text, fades out on the first frame
+    const STEPS = ['Finding a route', 'Reaching the box', 'Connecting', 'Loading the screen'];
+    const connEl = document.getElementById('connstatus');
+    const connMsg = connEl.querySelector('.msg');
+    const stepDots = connEl.querySelectorAll('.steps i');
+    let curStep = -1;
+    const setStep = (i, label) => {                 // advance to step i (never backwards), light dots 0..i
+      if (i > curStep) curStep = i;
+      connMsg.textContent = label || STEPS[Math.max(0, curStep)] || '';
+      stepDots.forEach((d, k) => d.classList.toggle('on', k <= curStep));
+    };
+    const setConnRaw = m => { connMsg.textContent = m; };   // unmapped text (e.g. an error) shown verbatim
+    let connHidden = false;
+    const hideConn = () => { if (connHidden) return; connHidden = true; connEl.style.opacity = '0';
+      setTimeout(() => { connEl.style.display = 'none'; }, 440); };
+    let gotFirstFrame = false;
     const origFBU = rfb._framebufferUpdate.bind(rfb);
-    rfb._framebufferUpdate = function () { const done = origFBU(); if (done) frames++; return done; };
+    rfb._framebufferUpdate = function () { const done = origFBU();
+      if (done) { frames++; if (!gotFirstFrame) { gotFirstFrame = true; hideConn(); } } return done; };
     ch.addEventListener('message', e => { bytesIn += (e.data.byteLength ?? e.data.length ?? 0); msgsIn++; });
 
     const hud = document.getElementById('hud');
@@ -284,13 +340,31 @@
       copyBtn.textContent = ok ? '✓ copied' : '✗ failed';
       setTimeout(() => { copyBtn.textContent = '⧉ copy'; }, 1600);
     });
+    // debug toggle: bottom-left button to show/hide the whole diagnostics overlay (hud + log + copy)
+    const dbgBtn = document.createElement('button');
+    dbgBtn.textContent = '≡';
+    dbgBtn.style.cssText = 'position:fixed;bottom:14px;left:14px;z-index:31;width:52px;height:52px;' +
+      'border-radius:26px;border:0;background:rgba(0,0,0,.6);color:#7CFC9B;font-size:26px';
+    document.body.appendChild(dbgBtn);
+    let dbgOn = false;                              // debug overlay hidden by default; ≡ toggles it
+    const applyDbg = () => {
+      const d = dbgOn ? '' : 'none';
+      hud.style.display = d; diagEl.style.display = d; copyBtn.style.display = d;
+      dbgBtn.style.opacity = dbgOn ? '1' : '0.5';
+      // debug view and the clean connecting overlay are mutually exclusive: showing debug hides the
+      // overlay; hiding debug brings the overlay back if we're still connecting (before first frame).
+      if (dbgOn) connEl.style.display = 'none';
+      else if (!connHidden) { connEl.style.display = ''; connEl.style.opacity = ''; }
+    };
+    dbgBtn.addEventListener('click', () => { dbgOn = !dbgOn; applyDbg(); });
+    applyDbg();
     window.addEventListener('error', e => diag('JS-ERROR ' + (e.message || e.error)));
     window.addEventListener('unhandledrejection', e => diag('REJECT ' + ((e.reason && e.reason.message) || e.reason)));
     pc.addEventListener('iceconnectionstatechange', () => diag('ice ' + pc.iceConnectionState));
     pc.addEventListener('connectionstatechange', () => diag('conn ' + pc.connectionState));
     pc.addEventListener('icegatheringstatechange', () => diag('gather ' + pc.iceGatheringState));
     pc.addEventListener('icecandidateerror', e => diag(`cand-err ${e.errorCode} ${e.url || ''} ${(e.errorText || '').slice(0,40)}`));
-    ch.addEventListener('open', () => diag('datachannel OPEN'));
+    ch.addEventListener('open', () => { diag('datachannel OPEN'); setStep(3); });
     ch.addEventListener('close', () => diag('datachannel CLOSE'));
     ch.addEventListener('error', e => diag('datachannel ERROR ' + ((e.error && e.error.message) || '')));
     rfb.addEventListener('connect', () => diag('RFB connect'));
@@ -347,7 +421,16 @@
     //   * otherwise -> a NIP-07 signer (window.nostr) signs as your real identity, and the box
     //     admits you if you're on its allowlist.
     // The box npub + code live in the #hash fragment, which the nsite gateway never receives.
-    const setStatus = s => { hud.textContent = s; log(s); };
+    // hud gets the raw text (debug); the clean overlay advances the step dots by phase
+    const stepFor = {
+      'gathering ICE candidates…': 0,
+      'sending one-time-code offer…': 1,
+      'gift-wrapping offer to the box…': 1,
+      'offer sent — waiting for the box': 1,
+      'answer received — establishing WebRTC…': 2,
+    };
+    const setStatus = s => { hud.textContent = s; log(s);
+      const i = stepFor[s]; if (i !== undefined) setStep(i); else setConnRaw(s); };
     const params = new URLSearchParams(location.search);
     const hraw = location.hash.replace(/^#/, '');
     const hp = new URLSearchParams(hraw.includes('=') ? hraw : ('box=' + hraw));   // bare npub or box=/code=
