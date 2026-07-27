@@ -77,7 +77,7 @@ must run before ICE-SERVE (they use the ICE socket)."
                    :ip (ice-agent-local-ip agent) :port (ice-agent-port agent)
                    :srflx-ip (ice-agent-srflx-ip agent) :srflx-port (ice-agent-srflx-port agent)
                    :relay-ip (ice-agent-relay-ip agent) :relay-port (ice-agent-relay-port agent)
-                   :setup setup :mid (sdp-mid remote-sdp) :lite t))
+                   :setup setup :media (sdp-media remote-sdp) :lite t))
 
 (defun ice-send (agent bytes host port)
   "Send BYTES to HOST:PORT via the ICE socket.  If HOST is the keyword :RELAY, PORT is a bound
