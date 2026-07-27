@@ -140,7 +140,8 @@
       const svgEl = (n, a) => { const el = document.createElementNS(NS, n);
         for (const k in a) el.setAttribute(k, a[k]); return el; };
       const cur = svgEl('svg', { width: 40, height: 40, viewBox: '0 0 40 40' });
-      cur.style.cssText = 'position:fixed;margin:-20px 0 0 -20px;pointer-events:none;z-index:15;display:none;overflow:visible';
+      cur.style.cssText = 'position:fixed;margin:-20px 0 0 -20px;pointer-events:none;z-index:15;display:none;overflow:visible;' +
+        'filter:drop-shadow(0 0 1px rgba(0,0,0,.95)) drop-shadow(0 0 1px rgba(0,0,0,.85))';  // dark halo so the white ring shows on light backgrounds
       const inner = svgEl('circle', { cx: 20, cy: 20, r: 8, fill: 'none', stroke: '#fff', 'stroke-width': 2 });
       const arc = svgEl('circle', { cx: 20, cy: 20, r: 12, fill: 'none', stroke: '#fff', 'stroke-width': 2,
         'stroke-linecap': 'round', transform: 'rotate(-90 20 20)', 'stroke-dasharray': C, 'stroke-dashoffset': C });
