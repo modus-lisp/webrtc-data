@@ -15,6 +15,7 @@
            #:make-ice #:ice-answer #:ice-serve #:ice-start-checks #:ice-close
            #:ice-gather-srflx #:ice-gather-relay #:ice-agent-relay-ip #:ice-agent-relay-port
            #:ice-agent-srflx-ip #:ice-agent-srflx-port #:ice-agent-turn #:ice-agent-peer
+           #:ice-agent-on-media #:ice-send-to-peer            ; SRTP media demux + send (webrtc-media)
            #:ice-agent-local-ip #:ice-agent-port #:turn-start-refresh
            #:turn-allocate #:turn-alloc-relay-ip #:turn-alloc-relay-port #:make-turn-alloc
            #:turn-install-peer #:turn-create-permission #:turn-channel-bind #:turn-refresh

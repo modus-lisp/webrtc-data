@@ -18,7 +18,7 @@
   relay-ip relay-port                          ; TURN relayed transport address, if gathered
   turn                                         ; a TURN-ALLOC (allocation state), or NIL
   (remote-candidates '())                      ; the peer's candidates (from its offer), for our checks
-  (on-packet nil) (peer nil) (stop nil) (check-thread nil) thread)
+  (on-packet nil) (on-media nil) (peer nil) (stop nil) (check-thread nil) thread)
 
 (defparameter *stun-servers*
   (let ((env (uiop:getenv "STUN_SERVER")))     ; "host:port" — overrides for a local/test STUN
@@ -280,6 +280,21 @@ established or DURATION elapses.  Call after ICE-SERVE."
          :name "ice-checks"))
   agent)
 
+(defun %deliver-packet (agent pkt a b)
+  "Route a non-STUN datagram by the RFC 5764 first-byte demux: SRTP/SRTCP (128-191) to ON-MEDIA if
+one is set, else DTLS records (20-63) to ON-PACKET.  A/B are host+port, or a relay marker + chan/tgt."
+  (let ((b0 (and (plusp (length pkt)) (aref pkt 0))))
+    (if (and b0 (<= 128 b0 191) (ice-agent-on-media agent))
+        (funcall (ice-agent-on-media agent) pkt a b)
+        (when (ice-agent-on-packet agent)
+          (funcall (ice-agent-on-packet agent) pkt a b)))))
+
+(defun ice-send-to-peer (agent bytes)
+  "Send BYTES to the currently-selected ICE peer (direct or via the TURN relay) — the same path DTLS
+uses.  For outbound SRTP.  Returns NIL if no peer is selected yet."
+  (let ((p (ice-agent-peer agent)))
+    (when p (ice-send agent bytes (first p) (second p)))))
+
 (defun ice-dispatch (agent buf len host port)
   "Classify one received datagram (BUF[0:LEN] from HOST:PORT) and route it.
 
@@ -322,8 +337,7 @@ established or DURATION elapses.  Call after ICE-SERVE."
        (let ((pkt (subseq buf 0 len)))
          (if (and (>= len 20) (= (rd-u32be pkt 4) +stun-magic+))
              (ice-handle-stun agent pkt host port)
-             (when (ice-agent-on-packet agent)
-               (funcall (ice-agent-on-packet agent) pkt host port))))))))
+             (%deliver-packet agent pkt host port)))))))
 
 (defparameter *turn-debug* (and (uiop:getenv "WEBRTC_TURN_DEBUG") t))
 (defun tdbg (fmt &rest args)
@@ -341,8 +355,7 @@ is answered THROUGH the relay (and marks the peer relay-selected); anything else
       (progn
         ;; relayed DTLS/SCTP: make sure the DTLS send-fn returns through this channel
         (setf (ice-agent-peer agent) (list :relay chan))
-        (when (ice-agent-on-packet agent)
-          (funcall (ice-agent-on-packet agent) inner :relay chan)))))
+        (%deliver-packet agent inner :relay chan))))
 
 (defun ice-relayed-inner-send (agent inner peer-host peer-port)
   "Like ICE-RELAYED-INNER but for a peer reached via Data/Send indications (no channel yet):
@@ -352,8 +365,7 @@ PEER-HOST is a 4-octet vector.  Replies ride Send indications until a channel bi
         (ice-handle-stun agent inner :relay-send tgt)
         (progn
           (setf (ice-agent-peer agent) (list :relay-send tgt))
-          (when (ice-agent-on-packet agent)
-            (funcall (ice-agent-on-packet agent) inner :relay-send tgt))))))
+          (%deliver-packet agent inner :relay-send tgt)))))
 
 (defun ice-serve (agent)
   "Start the receive loop on its own thread.  Returns AGENT."
