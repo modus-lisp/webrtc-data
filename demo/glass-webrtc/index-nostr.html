@@ -58,6 +58,47 @@
     pc.oniceconnectionstatechange = () => log('ice', pc.iceConnectionState);
     pc.onconnectionstatechange = () => log('conn', pc.connectionState);
 
+    // --- two-way audio (G.711/SRTP): level meters + play the box's track ----------------------
+    let audioCtx = null;
+    const ensureCtx = () => (audioCtx ||= new (window.AudioContext || window.webkitAudioContext)());
+    const mkMeter = (label, color) => {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:7px;font:11px ui-monospace,monospace;color:#cdd6df';
+      const lab = document.createElement('span'); lab.textContent = label; lab.style.cssText = 'width:26px';
+      const bar = document.createElement('div'); bar.style.cssText = 'flex:1;height:8px;border-radius:4px;background:rgba(255,255,255,.14);overflow:hidden';
+      const fill = document.createElement('div'); fill.style.cssText = `height:100%;width:0%;background:${color};transition:width .05s linear`;
+      bar.appendChild(fill); row.append(lab, bar);
+      return { row, set: p => { fill.style.width = Math.max(0, Math.min(100, p * 140)) + '%'; } };
+    };
+    const audioPanel = document.createElement('div');
+    audioPanel.style.cssText = 'position:fixed;left:14px;bottom:78px;z-index:22;width:190px;display:none;' +
+      'flex-direction:column;gap:6px;background:rgba(0,0,0,.55);padding:9px 11px;border-radius:11px';
+    const sndBtn = document.createElement('button');
+    sndBtn.textContent = '🔊 tap to hear';
+    sndBtn.style.cssText = 'border:0;border-radius:7px;background:#7CFC9B;color:#04140a;font:600 12px system-ui;padding:6px;display:none';
+    sndBtn.addEventListener('click', () => { const c = ensureCtx(); c.resume && c.resume();
+      document.querySelectorAll('audio').forEach(a => a.play && a.play().catch(() => {})); sndBtn.style.display = 'none'; });
+    const txM = mkMeter('mic', '#7CFC9B'), rxM = mkMeter('box', '#8fbaff');
+    audioPanel.append(sndBtn, txM.row, rxM.row); document.body.appendChild(audioPanel);
+    const showAudio = () => { audioPanel.style.display = 'flex'; };
+    const meterStream = (stream, setter) => {
+      const ctx = ensureCtx(); const an = ctx.createAnalyser(); an.fftSize = 256;
+      ctx.createMediaStreamSource(stream).connect(an);
+      const buf = new Uint8Array(an.fftSize);
+      const tick = () => { an.getByteTimeDomainData(buf);
+        let s = 0; for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; s += v * v; }
+        setter(Math.sqrt(s / buf.length)); requestAnimationFrame(tick); };
+      tick();
+    };
+    pc.addEventListener('track', (e) => {
+      diag('audio track from box'); showAudio();
+      const stream = e.streams[0] || new MediaStream([e.track]);
+      const au = document.createElement('audio'); au.autoplay = true; au.playsInline = true; au.srcObject = stream;
+      document.body.appendChild(au);
+      const p = au.play && au.play(); if (p && p.catch) p.catch(() => { sndBtn.style.display = ''; });   // iOS: needs a tap
+      meterStream(stream, rxM.set);
+    });
+
     // We open the channel; noVNC 1.7 rides the RTCDataChannel directly.
     const ch = pc.createDataChannel('rfb', { ordered: true });
     ch.binaryType = 'arraybuffer';
@@ -510,6 +551,15 @@
         },
       });
 
+      // audio: add the mic so the offer carries m=audio (full duplex); recvonly if unavailable.
+      try {
+        const mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+        mic.getTracks().forEach(t => pc.addTrack(t, mic));
+        showAudio(); meterStream(mic, txM.set); diag('mic added — full duplex');
+      } catch (err) {
+        try { pc.addTransceiver('audio', { direction: 'recvonly' }); } catch (_) {}
+        diag('no mic (' + (err.name || err) + ') — recvonly (still hear the box)');
+      }
       setStatus('gathering ICE candidates…');
       await pc.setLocalDescription(await pc.createOffer());
       // Non-trickle, but a blocked/slow STUN must NOT hang gathering (seen: 49s on cellular).

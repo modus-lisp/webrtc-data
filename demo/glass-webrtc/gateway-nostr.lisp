@@ -14,6 +14,7 @@
 #+sbcl (setf (sb-ext:bytes-consed-between-gcs) (* 256 1024 1024))   ; fewer GCs on the send path
 (handler-bind ((warning #'muffle-warning))
   (asdf:load-system "webrtc-data")
+  (asdf:load-system "webrtc-media/rtc")     ; SRTP audio (beeping tone + level) over the same transport
   (asdf:load-system "cl-nostr"))
 (load (merge-pathnames "login-token.lisp" (or *load-pathname* *default-pathname-defaults*)))
 
@@ -106,11 +107,24 @@ silently drop CODE.)"
 (defun run-session (conn agent)
   "Drive DTLS, run the data channel, and bridge it to glass once the channel opens.
 Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
-  (let ((glass nil))
+  (let ((glass nil) (audio-stop nil))
     (unwind-protect
          (handler-case
              (progn
                (webrtc-dtls-run conn)
+               ;; audio rides the same transport: derive SRTP keys from the DTLS session, then
+               ;; beep a tone at the browser + report the level of whatever it sends back.
+               (setf audio-stop
+                     (ignore-errors
+                       (webrtc-media:start-audio
+                        agent (dtls-conn-session conn)
+                        :on-rx-level (let ((n 0))
+                                       (lambda (lvl)
+                                         (when (zerop (mod (incf n) 50))   ; ~1x/s
+                                           (format *error-output* "~&[audio] rx level ~,2f (mic from browser)~%" lvl)
+                                           (finish-output *error-output*))))
+                        :log (lambda (m) (format *error-output* "~&[audio] ~a~%" m)))))
+               (format *error-output* "~&[gw-nostr] audio started — beeping tone -> browser~%")
                (webrtc-serve-datachannel
                 conn :duration 3600.0
                 :on-ready
@@ -152,6 +166,7 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                   (when (and glass (plusp (length payload)))
                     (sb-bsd-sockets:socket-send glass (as-u8vec payload) (length payload))))))
            (error (e) (format *error-output* "~&[gw-nostr] session error: ~a~%" e)))
+      (when audio-stop (ignore-errors (funcall audio-stop)))
       (when glass (ignore-errors (sb-bsd-sockets:socket-close glass)))
       (ignore-errors (ice-close agent)))))   ; release the TURN allocation + ICE socket
 
