@@ -55,6 +55,20 @@
   "T iff PUBKEY (hex) is on the allowlist.  No allowlist => NIL (deny all)."
   (and pubkey *allow* (member (string-downcase pubkey) *allow* :test #'string=) t))
 
+;; ---- self-service link refresh: an allowlisted identity can DM the box (any short
+;; text containing "link") and get a fresh login link gift-wrapped back, so they don't
+;; need box shell access when a code expires.
+(defun link-request-p (payload)
+  "T iff PAYLOAD is a short plain-text DM asking for a link (not an SDP offer)."
+  (and (stringp payload) (<= (length payload) 64)
+       (search "link" (string-downcase payload))))
+(defparameter *nsite-npub*
+  (or (uiop:getenv "NSITE_NPUB")
+      "npub1ajvjnhgcmdxkng22lzsh22qvl63es78gk6p9mwksepju974teguq4l4evc"))
+(defparameter *link-base*                       ; LOGIN_URL_BASE lets us aim at a cache-busted ?v= URL
+  (or (uiop:getenv "LOGIN_URL_BASE") (format nil "https://~a.nsite.lol/" *nsite-npub*)))
+(defparameter *link-ttl* (or (ignore-errors (parse-integer (uiop:getenv "LINK_TTL"))) 1800))
+
 ;; ---- login codes (magic-link, keyed by *box-secret*) ------------------------
 ;; A code arrives inside the offer envelope (see PARSE-OFFER); it was delivered to a
 ;; user via a gift-wrapped DM (login-link), so holding a valid one is proof enough —
@@ -189,25 +203,41 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
      (handler-case
          (multiple-value-bind (payload phone-pub) (cl-nostr.nip59:unwrap-giftwrap kp wrap)
            (multiple-value-bind (offer-sdp code) (parse-offer payload)
-             (when (and (stringp offer-sdp) (search "m=application" offer-sdp))   ; a data-channel offer
-               ;; a valid one-time code OR an allowlisted signer authorizes the connection
-               (let* ((cstatus (code-status code))
-                      (via (cond ((eq cstatus :ok) "code")
-                                 ((authorized-p phone-pub) "allowlist")
-                                 (t nil))))
-                 (cond
-                   ((null via)
-                    (format t "~&@@ DENIED ~a... — code:~(~a~), not on the allowlist~%"
-                            (subseq phone-pub 0 8) cstatus)
-                    (finish-output))
-                   (t
-                    (format t "~&@@ offer from ~a... (via ~a) -> answering~%" (subseq phone-pub 0 8) via)
-                    (finish-output)
-                    (let* ((answer (process-offer offer-sdp))
-                           (reply  (cl-nostr.nip59:build-giftwrap kp phone-pub answer)))
-                      (cl-nostr.pool:pool-publish pool reply)
-                      (format t "@@ answer gift-wrapped -> ~a...~%" (subseq phone-pub 0 8))
-                      (finish-output))))))))
+             (cond
+               ((and (stringp offer-sdp) (search "m=application" offer-sdp))   ; a data-channel offer
+                ;; a valid one-time code OR an allowlisted signer authorizes the connection
+                (let* ((cstatus (code-status code))
+                       (via (cond ((eq cstatus :ok) "code")
+                                  ((authorized-p phone-pub) "allowlist")
+                                  (t nil))))
+                  (cond
+                    ((null via)
+                     (format t "~&@@ DENIED ~a... — code:~(~a~), not on the allowlist~%"
+                             (subseq phone-pub 0 8) cstatus)
+                     (finish-output))
+                    (t
+                     (format t "~&@@ offer from ~a... (via ~a) -> answering~%" (subseq phone-pub 0 8) via)
+                     (finish-output)
+                     (let* ((answer (process-offer offer-sdp))
+                            (reply  (cl-nostr.nip59:build-giftwrap kp phone-pub answer)))
+                       (cl-nostr.pool:pool-publish pool reply)
+                       (format t "@@ answer gift-wrapped -> ~a...~%" (subseq phone-pub 0 8))
+                       (finish-output))))))
+               ;; a fresh-link request from an allowlisted identity -> DM a new login link
+               ((and (link-request-p payload) (authorized-p phone-pub))
+                (let* ((token (glass-login:mint-token *box-secret* :ttl *link-ttl*))
+                       (url   (format nil "~a#box=~a&code=~a" *link-base* box-npub token))
+                       (msg   (format nil "Fresh glass login link (expires in ~a min):~%~%~a"
+                                      (max 1 (round *link-ttl* 60)) url))
+                       (reply (cl-nostr.nip59:build-giftwrap kp phone-pub msg)))
+                  (cl-nostr.pool:pool-publish pool reply)
+                  (format t "~&@@ link request from ~a... -> DM'd fresh link (ttl ~as)~%"
+                          (subseq phone-pub 0 8) *link-ttl*)
+                  (finish-output)))
+               ;; a link request from a non-allowlisted identity -> ignore, but note it
+               ((link-request-p payload)
+                (format t "~&@@ link request DENIED ~a... (not allowlisted)~%" (subseq phone-pub 0 8))
+                (finish-output)))))
        (error (e) (format t "~&@@ signal error: ~a~%" e) (finish-output)))))
   (format t "@@ subscribed; waiting for gift-wrapped offers~%")
   (finish-output)
