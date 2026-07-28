@@ -103,28 +103,39 @@ silently drop CODE.)"
     s))
 
 (defvar *last-assoc* nil)
+;; VP8 payload type the browser assigned in its offer (dynamic, varies) — bound per session.
+(defvar *video-pt* nil)
 
 (defun run-session (conn agent)
   "Drive DTLS, run the data channel, and bridge it to glass once the channel opens.
 Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
-  (let ((glass nil) (audio-stop nil))
+  (let ((glass nil) (audio-stop nil) (video-stop nil))
     (unwind-protect
          (handler-case
              (progn
                (webrtc-dtls-run conn)
                ;; audio rides the same transport: derive SRTP keys from the DTLS session, then
                ;; beep a tone at the browser + report the level of whatever it sends back.
-               (setf audio-stop
-                     (ignore-errors
-                       (webrtc-media:start-audio
-                        agent (dtls-conn-session conn)
-                        :on-rx-level (let ((n 0))
-                                       (lambda (lvl)
-                                         (when (zerop (mod (incf n) 50))   ; ~1x/s
-                                           (format *error-output* "~&[audio] rx level ~,2f (mic from browser)~%" lvl)
-                                           (finish-output *error-output*))))
-                        :log (lambda (m) (format *error-output* "~&[audio] ~a~%" m)))))
-               (format *error-output* "~&[gw-nostr] audio started — beeping tone -> browser~%")
+               (multiple-value-bind (astop ctx)
+                   (ignore-errors
+                     (webrtc-media:start-audio
+                      agent (dtls-conn-session conn)
+                      :on-rx-level (let ((n 0))
+                                     (lambda (lvl)
+                                       (when (zerop (mod (incf n) 50))   ; ~1x/s
+                                         (format *error-output* "~&[audio] rx level ~,2f (mic from browser)~%" lvl)
+                                         (finish-output *error-output*))))
+                      :log (lambda (m) (format *error-output* "~&[audio] ~a~%" m))))
+                 (setf audio-stop astop)
+                 (format *error-output* "~&[gw-nostr] audio started — beeping tone -> browser~%")
+                 ;; video: our from-scratch VP8 keyframes, over the same SRTP keys (own SSRC)
+                 (when (and ctx *video-pt*)
+                   (setf video-stop
+                         (ignore-errors
+                           (webrtc-media:start-video
+                            agent (dtls-conn-session conn) ctx :pt *video-pt*
+                            :log (lambda (m) (format *error-output* "~&[video] ~a~%" m)))))
+                   (format *error-output* "~&[gw-nostr] video started — VP8 pt=~a -> browser~%" *video-pt*)))
                (webrtc-serve-datachannel
                 conn :duration 3600.0
                 :on-ready
@@ -166,6 +177,7 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                   (when (and glass (plusp (length payload)))
                     (sb-bsd-sockets:socket-send glass (as-u8vec payload) (length payload))))))
            (error (e) (format *error-output* "~&[gw-nostr] session error: ~a~%" e)))
+      (when video-stop (ignore-errors (funcall video-stop)))
       (when audio-stop (ignore-errors (funcall audio-stop)))
       (when glass (ignore-errors (sb-bsd-sockets:socket-close glass)))
       (ignore-errors (ice-close agent)))))   ; release the TURN allocation + ICE socket
@@ -183,6 +195,9 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                              :gather-relay (and (uiop:getenv "TURN_SERVER") (list :timeout 6.0)))))
     (ice-serve agent)
     (ice-start-checks agent)                                    ; punch our NAT toward the phone
+    (setf *video-pt*                                            ; VP8 pt from the offer, if it wants video
+          (let ((v (find "video" (sdp-media offer) :key #'sdp-media-type :test #'string=)))
+            (and v (sdp-media-codec-pt v "VP8"))))
     (bt:make-thread (lambda () (run-session conn agent)) :name "webrtc-session")
     answer))
 

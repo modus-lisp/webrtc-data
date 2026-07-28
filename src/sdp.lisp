@@ -12,7 +12,7 @@
 (defstruct ice-candidate foundation component transport priority ip port type)
 
 (defstruct (sdp-media (:conc-name sdp-media-))
-  type mid (pts '()) (sctp-port 5000) (direction "sendrecv"))
+  type mid (pts '()) (sctp-port 5000) (direction "sendrecv") (rtpmap '()))  ; rtpmap: ((pt . "VP8") ...)
 
 (defstruct (sdp-session (:conc-name sdp-))
   ice-ufrag ice-pwd fingerprint setup (candidates '()) (media '()))
@@ -53,6 +53,13 @@ across all bundled m-lines; per-media a=mid / a=sctp-port / direction attach to 
           ((setf v (%aval line "a=ice-pwd:")) (setf (sdp-ice-pwd s) v))
           ((setf v (%aval line "a=fingerprint:sha-256 ")) (setf (sdp-fingerprint s) v))
           ((setf v (%aval line "a=setup:")) (setf (sdp-setup s) v))
+          ((setf v (%aval line "a=rtpmap:"))                  ; "97 VP8/90000" -> (97 . "VP8")
+           (when cur
+             (let* ((sp (position #\Space v)) (pt (ignore-errors (parse-integer v :end sp)))
+                    (rest (and sp (subseq v (1+ sp))))
+                    (slash (and rest (position #\/ rest)))
+                    (codec (and rest (subseq rest 0 (or slash (length rest))))))
+               (when pt (push (cons pt codec) (sdp-media-rtpmap cur))))))
           ((setf v (%aval line "a=mid:")) (when cur (setf (sdp-media-mid cur) v)))
           ((setf v (%aval line "a=sctp-port:")) (when cur (setf (sdp-media-sctp-port cur) (parse-integer v))))
           ((member line '("a=sendrecv" "a=sendonly" "a=recvonly" "a=inactive") :test #'string=)
@@ -65,6 +72,12 @@ across all bundled m-lines; per-media a=mid / a=sctp-port / direction attach to 
 ;;; Convenience for callers that only care about the data channel.
 (defun sdp-mid (s) (let ((m (find "application" (sdp-media s) :key #'sdp-media-type :test #'string=)))
                      (if m (sdp-media-mid m) (and (sdp-media s) (sdp-media-mid (first (sdp-media s)))))))
+
+(defun sdp-media-codec-pt (m codec)
+  "The payload type the peer assigned to CODEC (e.g. \"VP8\") in media section M, or NIL.
+Payload types are dynamic (96-127) and vary per browser/offer, so we must echo back theirs."
+  (car (find codec (sdp-media-rtpmap m) :key #'cdr
+             :test (lambda (a b) (and b (string-equal a b))))))
 
 (defun %candidates-block (ip port srflx-ip srflx-port relay-ip relay-port foundation priority)
   (concatenate 'string
@@ -99,6 +112,13 @@ the DTLS client; LITE advertises ICE-lite.  Audio is answered as G.711 PCMU (pt 
              (format out "m=audio ~d UDP/TLS/RTP/SAVPF 0~%c=IN IP4 ~a~%a=rtcp-mux~%a=mid:~a~%~
                           a=~:[inactive~;sendrecv~]~%a=rtpmap:0 PCMU/8000~%~a~a"
                      (if ok port 0) ip (sdp-media-mid m) ok shared own)))
+          ((string= (sdp-media-type m) "video")
+           ;; VP8 only (we encode it; forcing VP8 also keeps the return direction off H.264).
+           ;; sendonly: the box streams video to the browser, it sends none back.
+           (let ((pt (sdp-media-codec-pt m "VP8")))
+             (format out "m=video ~d UDP/TLS/RTP/SAVPF ~d~%c=IN IP4 ~a~%a=rtcp-mux~%a=mid:~a~%~
+                          a=~:[inactive~;sendonly~]~%~@[a=rtpmap:~d VP8/90000~%~]~a~a"
+                     (if pt port 0) (or pt 96) ip (sdp-media-mid m) pt pt shared own)))
           (t                                                   ; application / data channel
            (format out "m=application ~d UDP/DTLS/SCTP webrtc-datachannel~%c=IN IP4 ~a~%~
                         a=mid:~a~%a=sctp-port:~d~%a=max-message-size:65536~%~a~a"

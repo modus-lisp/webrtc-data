@@ -12,6 +12,7 @@
   (:export #:parse-sdp #:make-answer-sdp #:sdp-session
            #:sdp-ice-ufrag #:sdp-ice-pwd #:sdp-fingerprint #:sdp-setup
            #:sdp-candidates #:sdp-sctp-port #:sdp-mid
+           #:sdp-media #:sdp-media-type #:sdp-media-mid #:sdp-media-codec-pt
            #:make-ice #:ice-answer #:ice-serve #:ice-start-checks #:ice-close
            #:ice-gather-srflx #:ice-gather-relay #:ice-agent-relay-ip #:ice-agent-relay-port
            #:ice-agent-srflx-ip #:ice-agent-srflx-port #:ice-agent-turn #:ice-agent-peer

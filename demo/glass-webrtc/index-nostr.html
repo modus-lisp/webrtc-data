@@ -90,9 +90,22 @@
         setter(Math.sqrt(s / buf.length)); requestAnimationFrame(tick); };
       tick();
     };
+    // the box's VP8 video (our from-scratch encoder) shows in a corner panel
+    const vidEl = document.createElement('video');
+    vidEl.autoplay = true; vidEl.playsInline = true; vidEl.muted = true;
+    vidEl.style.cssText = 'position:fixed;right:14px;bottom:78px;z-index:22;width:128px;height:128px;' +
+      'border-radius:10px;background:#000;object-fit:contain;display:none;box-shadow:0 0 0 1px rgba(255,255,255,.25)';
+    document.body.appendChild(vidEl);
     pc.addEventListener('track', (e) => {
-      diag('audio track from box'); showAudio();
       const stream = e.streams[0] || new MediaStream([e.track]);
+      if (e.track.kind === 'video') {
+        diag('VIDEO track from box (VP8)');
+        vidEl.srcObject = stream; vidEl.style.display = '';
+        const vp = vidEl.play && vidEl.play(); if (vp && vp.catch) vp.catch(() => {});
+        e.track.addEventListener('unmute', () => diag('video track unmuted — frames arriving'));
+        return;
+      }
+      diag('audio track from box'); showAudio();
       const au = document.createElement('audio'); au.autoplay = true; au.playsInline = true; au.srcObject = stream;
       document.body.appendChild(au);
       const p = au.play && au.play(); if (p && p.catch) p.catch(() => { sndBtn.style.display = ''; });   // iOS: needs a tap
@@ -560,6 +573,8 @@
         try { pc.addTransceiver('audio', { direction: 'recvonly' }); } catch (_) {}
         diag('no mic (' + (err.name || err) + ') — recvonly (still hear the box)');
       }
+      // ask for the box's VP8 video (we only receive; the box encodes it from scratch)
+      try { pc.addTransceiver('video', { direction: 'recvonly' }); diag('video recvonly requested'); } catch (_) {}
       setStatus('gathering ICE candidates…');
       await pc.setLocalDescription(await pc.createOffer());
       // Non-trickle, but a blocked/slow STUN must NOT hang gathering (seen: 49s on cellular).
