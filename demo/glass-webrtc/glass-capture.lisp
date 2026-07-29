@@ -10,6 +10,7 @@
 
 (defstruct (capture (:conc-name cap-))
   socket width height cw ch y u v
+  (t-wait 0d0) (t-conv 0d0) (n-upd 0) (px 0)   ; capture-side timing
   mb-cols mb-rows dirty-mbs                    ; per-macroblock dirty flags, straight from RFB
   (dirty t) (lock (bt:make-lock)) (stop nil) thread)
 
@@ -108,24 +109,38 @@ encoder never has to rediscover it by comparing the whole screen."
   (let ((s (cap-socket c)))
     (%request-update c nil)                                  ; full frame first
     (loop until (cap-stop c) do
-      (let ((msg (aref (%rd s 1) 0)))
+      (let* ((tw (get-internal-real-time))
+             (msg (aref (%rd s 1) 0)))
+        (incf (cap-t-wait c) (/ (* 1000d0 (- (get-internal-real-time) tw))
+                                internal-time-units-per-second))
         (case msg
           (0 (%rd s 1)
-             (let ((n (%be16 (%rd s 2) 0)))
+             (let ((n (%be16 (%rd s 2) 0)) (tc (get-internal-real-time)))
                (bt:with-lock-held ((cap-lock c))
                  (dotimes (i n)
                    (let* ((h (%rd s 12)) (rx (%be16 h 0)) (ry (%be16 h 2))
                           (rw (%be16 h 4)) (rh (%be16 h 6)) (enc (%be32 h 8)))
                      (cond
-                       ((= enc 0) (%apply-rect c rx ry rw rh (%rd s (* rw rh 4)))
+                       ((= enc 0) (incf (cap-px c) (* rw rh))
+                                  (%apply-rect c rx ry rw rh (%rd s (* rw rh 4)))
                                   (%mark-dirty c rx ry rw rh))
                        (t (error "capture: unexpected encoding ~a" enc)))))
-                 (setf (cap-dirty c) t)))
+                 (setf (cap-dirty c) t)
+                 (incf (cap-n-upd c))
+                 (incf (cap-t-conv c) (/ (* 1000d0 (- (get-internal-real-time) tc))
+                                         internal-time-units-per-second))))
              (%request-update c t))                          ; ask for the next incremental
           (1 (%rd s 5))                                      ; SetColourMapEntries (ignored)
           (2 nil)                                            ; Bell
           (3 (let* ((h (%rd s 7)) (len (%be32 h 3))) (%rd s len)))   ; ServerCutText
           (t (error "capture: unknown server message ~a" msg)))))))
+
+(defun capture-stats (c)
+  "Capture-side timing since the last call: how long glass kept us waiting for an update, and how
+long converting its rectangles to YUV took.  Resets the counters."
+  (prog1 (list :updates (cap-n-upd c) :wait-ms (cap-t-wait c) :convert-ms (cap-t-conv c)
+               :px (cap-px c))
+    (setf (cap-n-upd c) 0 (cap-t-wait c) 0d0 (cap-t-conv c) 0d0 (cap-px c) 0)))
 
 (defun capture-start (host port)
   "Connect + run the capture loop on its own thread.  Returns the CAPTURE."

@@ -146,7 +146,11 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                             agent (dtls-conn-session conn) ctx :pt *video-pt*
                             :qi *video-qi* :fps *video-fps*
                             :source (when cap (lambda () (capture-take cap)))
-                            :log (lambda (m) (format *error-output* "~&[video] ~a~%" m)))))
+                            :log (lambda (m)
+                                   (let ((cs (and cap (capture-stats cap))))
+                                     (format *error-output* "~&[video] ~a~@[ | glass wait ~,0fms conv ~,0fms upd ~a px ~a~]~%"
+                                             m (and cs (getf cs :wait-ms)) (and cs (getf cs :convert-ms))
+                                             (and cs (getf cs :updates)) (and cs (getf cs :px))))))))
                    (format *error-output* "~&[gw-nostr] video started — VP8 pt=~a qi=~a fps=~a~%"
                            *video-pt* *video-qi* *video-fps*)))
                (webrtc-serve-datachannel
