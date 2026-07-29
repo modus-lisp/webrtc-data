@@ -93,6 +93,7 @@
 
 (defun describe-devices ()
   "Human-readable listing of enrolled terminals."
+  (sync-devices)
   (let ((now (%unix-now)) (rows '()))
     (bt:with-lock-held (*devices-lock*)
       (maphash (lambda (pk exp) (when (> exp now) (push (cons pk exp) rows))) *devices*))
@@ -111,6 +112,7 @@
 
 (defun revoke-devices (arg)
   "Un-enrol terminals matching ARG (an 8+ char pubkey prefix, or \"all\").  Returns a reply string."
+  (sync-devices)
   (let ((killed '()))
     (bt:with-lock-held (*devices-lock*)
       (cond
@@ -153,6 +155,7 @@
                                    (or *load-pathname* *default-pathname-defaults*)))))
 (defvar *devices* (make-hash-table :test 'equal))     ; pubkey-hex -> expiry (unix)
 (defvar *devices-lock* (bt:make-lock))
+(defvar *devices-mtime* nil)
 
 (defun %unix-now () (- (get-universal-time) (encode-universal-time 0 0 0 1 1 1970 0)))
 
@@ -178,6 +181,18 @@
                    *devices*)))
     (error () nil)))
 
+(defun sync-devices ()
+  "Re-read DEVICE_FILE if it changed underneath us.  The file — not this process's memory — is the
+source of truth, so a separate tool (a glass admin app, a shell one-liner) can list or revoke
+terminals and the gateway will honour it on the next check without a restart."
+  (handler-case
+      (let ((mt (file-write-date *device-file*)))
+        (unless (eql mt *devices-mtime*)
+          (setf *devices-mtime* mt)
+          (bt:with-lock-held (*devices-lock*) (clrhash *devices*))
+          (load-devices)))
+    (error () nil)))
+
 (defun enrol-device (pubkey)
   "Trust PUBKEY to request its own magic links for *DEVICE-TTL*.  Renews an existing enrolment."
   (when pubkey
@@ -186,6 +201,7 @@
     (save-devices)))
 
 (defun device-enrolled-p (pubkey)
+  (sync-devices)
   (and pubkey
        (bt:with-lock-held (*devices-lock*)
          (let ((exp (gethash (string-downcase pubkey) *devices*)))
