@@ -151,8 +151,11 @@
 (defparameter *device-ttl* (or (ignore-errors (parse-integer (uiop:getenv "DEVICE_TTL"))) 86400))
 (defparameter *device-file*
   (or (uiop:getenv "DEVICE_FILE")
-      (namestring (merge-pathnames ".glass-devices"
-                                   (or *load-pathname* *default-pathname-defaults*)))))
+      ;; make-pathname with an explicit :type nil — merge-pathnames would inherit "lisp" from
+      ;; gateway-nostr.lisp and write ".glass-devices.lisp", i.e. a data file that looks like
+      ;; source in a directory we load source from.
+      (namestring (make-pathname :name ".glass-devices" :type nil
+                                 :defaults (or *load-pathname* *default-pathname-defaults*)))))
 (defvar *devices* (make-hash-table :test 'equal))     ; pubkey-hex -> expiry (unix)
 (defvar *devices-lock* (bt:make-lock))
 (defvar *devices-mtime* nil)
