@@ -12,7 +12,7 @@
   socket width height cw ch y u v
   (t-wait 0d0) (t-conv 0d0) (n-upd 0) (px 0)   ; capture-side timing
   mb-cols mb-rows dirty-mbs                    ; per-macroblock dirty flags, straight from RFB
-  (dirty t) (lock (bt:make-lock)) (stop nil) thread)
+  (dirty nil) (lock (bt:make-lock)) (stop nil) thread)   ; dirty only after a real update
 
 (defun %rd (stream n)
   (let ((buf (make-array n :element-type '(unsigned-byte 8))) (got 0))
