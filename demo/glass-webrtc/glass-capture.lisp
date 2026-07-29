@@ -10,6 +10,7 @@
 
 (defstruct (capture (:conc-name cap-))
   socket width height cw ch y u v
+  host port (n-reconnect 0)                    ; for the supervisor
   (t-wait 0d0) (t-conv 0d0) (n-upd 0) (px 0) (n-copy 0)   ; capture-side timing
   mb-cols mb-rows dirty-mbs                    ; per-macroblock dirty flags, straight from RFB
   (dirty nil) (lock (bt:make-lock)) (stop nil) thread)   ; dirty only after a real update
@@ -24,6 +25,8 @@
 
 (defun %be16 (b i) (logior (ash (aref b i) 8) (aref b (1+ i))))
 (defun %be32 (b i) (let ((v 0)) (dotimes (k 4 v) (setf v (logior (ash v 8) (aref b (+ i k)))))))
+(defun %s32 (v) (if (>= v #x80000000) (- v #x100000000) v))   ; encodings are SIGNED
+(defconstant +rfb-last-rect+ -224)                            ; "no more rects in this update"
 
 (defun capture-connect (host port)
   "RFB handshake with glass; returns a CAPTURE with allocated planes (native 32bpp, Raw)."
@@ -53,7 +56,7 @@
         (finish-output s)
         (let* ((cw (ceiling w 2)) (ch (ceiling h 2))
                (mc (ceiling w 16)) (mr (ceiling h 16))
-               (c (make-capture :socket s :width w :height h :cw cw :ch ch
+               (c (make-capture :socket s :width w :height h :cw cw :ch ch :host host :port port
                                 :mb-cols mc :mb-rows mr
                                 :dirty-mbs (make-array (* mc mr) :element-type 'bit :initial-element 1)
                                 :y (make-array (* w h) :element-type '(unsigned-byte 8) :initial-element 16)
@@ -158,12 +161,23 @@ active desktop), and on generic arithmetic it was costing ~14% of wall-clock."
                (dotimes (i n)
                  (let* ((h (%rd s 12)) (rx (%be16 h 0)) (ry (%be16 h 2))
                         (rw (%be16 h 4)) (rh (%be16 h 6)) (enc (%be32 h 8)))
-                   (push (cond
-                           ((= enc 0) (list :raw rx ry rw rh (%rd s (* rw rh 4))))
-                           ((= enc 1) (let ((cp (%rd s 4)))
-                                        (list :copy rx ry rw rh (%be16 cp 0) (%be16 cp 2))))
-                           (t (error "capture: unexpected encoding ~a" enc)))
-                         rects)))
+                   (let ((e (%s32 enc)))
+                     ;; sanity-check geometry first: %apply-rect runs with (safety 0), so an
+                     ;; out-of-range rect would scribble past the planes instead of erroring.
+                     ;; Out of range means desync or a resize — either way, resynchronise.
+                     (when (and (member e '(0 1))
+                                (or (> (+ rx rw) (cap-width c)) (> (+ ry rh) (cap-height c))))
+                       (error "capture: rect ~ax~a+~a+~a outside ~ax~a — desync or resize"
+                              rw rh rx ry (cap-width c) (cap-height c)))
+                     (cond
+                       ((= e 0) (push (list :raw rx ry rw rh (%rd s (* rw rh 4))) rects))
+                       ((= e 1) (let ((cp (%rd s 4)))
+                                  (push (list :copy rx ry rw rh (%be16 cp 0) (%be16 cp 2)) rects)))
+                       ((= e +rfb-last-rect+) (return))       ; carries no data; update ends here
+                       ;; An encoding we did not ask for means we can no longer know how many
+                       ;; bytes it occupies, so the stream is unparseable from here.  Signal, and
+                       ;; let the supervisor reconnect — one strange rect must not end the video.
+                       (t (error "capture: unexpected encoding ~a (~a)" e enc))))))
                (setf tc (get-internal-real-time))
                (bt:with-lock-held ((cap-lock c))
                  (dolist (r (nreverse rects))
@@ -186,17 +200,48 @@ active desktop), and on generic arithmetic it was costing ~14% of wall-clock."
   "Capture-side timing since the last call: how long glass kept us waiting for an update, and how
 long converting its rectangles to YUV took.  Resets the counters."
   (prog1 (list :updates (cap-n-upd c) :wait-ms (cap-t-wait c) :convert-ms (cap-t-conv c)
-               :px (cap-px c) :copies (cap-n-copy c))
+               :px (cap-px c) :copies (cap-n-copy c) :reconnects (cap-n-reconnect c))
     (setf (cap-n-upd c) 0 (cap-t-wait c) 0d0 (cap-t-conv c) 0d0 (cap-px c) 0 (cap-n-copy c) 0)))
 
+(defun %capture-reconnect (c)
+  "Re-handshake with glass on a fresh socket and force a full refresh.  The framebuffer planes are
+kept, but every macroblock is marked dirty so the viewer converges again from whatever it had."
+  (ignore-errors (close (cap-socket c)))
+  (let ((fresh (capture-connect (cap-host c) (cap-port c))))
+    (bt:with-lock-held ((cap-lock c))
+      (setf (cap-socket c) (cap-socket fresh))
+      ;; the desktop may have resized while we were away — adopt the new geometry and planes
+      (unless (and (= (cap-width fresh) (cap-width c)) (= (cap-height fresh) (cap-height c)))
+        (format *error-output* "~&[capture] desktop resized ~ax~a -> ~ax~a~%"
+                (cap-width c) (cap-height c) (cap-width fresh) (cap-height fresh))
+        (setf (cap-width c) (cap-width fresh) (cap-height c) (cap-height fresh)
+              (cap-cw c) (cap-cw fresh) (cap-ch c) (cap-ch fresh)
+              (cap-mb-cols c) (cap-mb-cols fresh) (cap-mb-rows c) (cap-mb-rows fresh)
+              (cap-y c) (cap-y fresh) (cap-u c) (cap-u fresh) (cap-v c) (cap-v fresh)
+              (cap-dirty-mbs c) (cap-dirty-mbs fresh)))
+      (fill (cap-dirty-mbs c) 1)
+      (setf (cap-dirty c) t))
+    (incf (cap-n-reconnect c))))
+
 (defun capture-start (host port)
-  "Connect + run the capture loop on its own thread.  Returns the CAPTURE."
+  "Connect + run the capture loop under a supervisor.  A parse desync or a dropped socket
+RECONNECTS rather than ending the video: the capture feeds the only picture the viewer has, so
+losing this thread freezes the screen with no way back.  Returns the CAPTURE."
   (let ((c (capture-connect host port)))
     (setf (cap-thread c)
-          (bt:make-thread (lambda ()
-                            (handler-case (capture-run c)
-                              (error (e) (format *error-output* "~&[capture] ~a~%" e))))
-                          :name "glass-capture"))
+          (bt:make-thread
+           (lambda ()
+             (loop until (cap-stop c) do
+               (handler-case (capture-run c)
+                 (error (e)
+                   (when (cap-stop c) (return))
+                   (format *error-output* "~&[capture] ~a — reconnecting~%" e)
+                   (finish-output *error-output*)
+                   (sleep 0.25)
+                   (handler-case (%capture-reconnect c)
+                     (error (e2) (format *error-output* "~&[capture] reconnect failed: ~a~%" e2)
+                       (sleep 1.0)))))))
+           :name "glass-capture"))
     c))
 
 (defun capture-stop (c)
