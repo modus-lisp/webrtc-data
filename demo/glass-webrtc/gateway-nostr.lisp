@@ -64,6 +64,71 @@
   "T iff PAYLOAD is a short plain-text DM asking for a link (not an SDP offer)."
   (and (stringp payload) (<= (length payload) 64)
        (search "link" (string-downcase payload))))
+
+;; ---- DM command surface ------------------------------------------------------
+;; The box has no HTTP and no console, but it does have an authenticated DM channel, so that is
+;; where administration lives.  Commands are short text DMs; the reply is plain text.
+;;
+;;   link                 -> a fresh magic link          (allowlist or an enrolled device)
+;;   devices              -> list enrolled terminals     (allowlist ONLY)
+;;   revoke <prefix|all>  -> un-enrol one or all         (allowlist ONLY)
+;;   help                 -> this list
+;;
+;; Management is restricted to the allowlist on purpose: a device key is a bearer credential that
+;; could be lifted from a browser, and it must not be able to keep itself alive, revoke the others,
+;; or enumerate the fleet.  It can only ask for a link.
+(defun parse-command (payload)
+  "A short text DM -> (values VERB ARG), or NIL if it is not a command."
+  (when (and (stringp payload) (<= (length payload) 80))
+    (let* ((txt (string-trim '(#\Space #\Tab #\Newline #\Return) (string-downcase payload)))
+           (sp (position #\Space txt))
+           (verb (if sp (subseq txt 0 sp) txt))
+           (arg (and sp (string-trim '(#\Space) (subseq txt (1+ sp))))))
+      (cond ((zerop (length txt)) nil)
+            ((search "link" verb) (values :link nil))
+            ((string= verb "devices") (values :devices nil))
+            ((string= verb "revoke") (values :revoke arg))
+            ((or (string= verb "help") (string= verb "?")) (values :help nil))
+            (t nil)))))
+
+(defun describe-devices ()
+  "Human-readable listing of enrolled terminals."
+  (let ((now (%unix-now)) (rows '()))
+    (bt:with-lock-held (*devices-lock*)
+      (maphash (lambda (pk exp) (when (> exp now) (push (cons pk exp) rows))) *devices*))
+    (if (null rows)
+        "No terminals are enrolled."
+        (format nil "~a enrolled terminal~:p:~%~{~a~%~}~@
+                     Use \"revoke <first-8>\" or \"revoke all\"."
+                (length rows)
+                (mapcar (lambda (r)
+                          (let ((hrs (/ (- (cdr r) now) 3600.0)))
+                            (if (< hrs 1)
+                                (format nil "  ~a  expires in ~d min" (subseq (car r) 0 8)
+                                        (max 1 (round (* hrs 60))))
+                                (format nil "  ~a  expires in ~,1f h" (subseq (car r) 0 8) hrs))))
+                        (sort rows #'> :key #'cdr))))))
+
+(defun revoke-devices (arg)
+  "Un-enrol terminals matching ARG (an 8+ char pubkey prefix, or \"all\").  Returns a reply string."
+  (let ((killed '()))
+    (bt:with-lock-held (*devices-lock*)
+      (cond
+        ((and arg (string= arg "all"))
+         (maphash (lambda (pk exp) (declare (ignore exp)) (push pk killed)) *devices*)
+         (clrhash *devices*))
+        ((and arg (>= (length arg) 4))
+         (maphash (lambda (pk exp) (declare (ignore exp))
+                    (when (and (>= (length pk) (length arg))
+                               (string= arg (subseq pk 0 (length arg))))
+                      (push pk killed)))
+                  *devices*)
+         (dolist (pk killed) (remhash pk *devices*)))))
+    (save-devices)
+    (cond ((null arg) "Usage: revoke <first-8-of-pubkey> | revoke all")
+          ((null killed) (format nil "Nothing matched \"~a\"." arg))
+          (t (format nil "Revoked ~a terminal~:p:~%~{  ~a~%~}" (length killed)
+                     (mapcar (lambda (pk) (subseq pk 0 8)) killed))))))
 (defparameter *nsite-npub*
   (or (uiop:getenv "NSITE_NPUB")
       "npub1ajvjnhgcmdxkng22lzsh22qvl63es78gk6p9mwksepju974teguq4l4evc"))
@@ -360,23 +425,42 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                        (cl-nostr.pool:pool-publish pool reply)
                        (format t "@@ answer gift-wrapped -> ~a...~%" (subseq phone-pub 0 8))
                        (finish-output))))))
-               ;; a fresh-link request from an allowlisted identity -> DM a new login link
-               ((and (link-request-p payload)
-                     (or (authorized-p phone-pub) (device-enrolled-p phone-pub)))
-                (let* ((token (glass-login:mint-token *box-secret* :ttl *link-ttl*))
-                       (url   (format nil "~a#box=~a&code=~a" *link-base* box-npub token))
-                       (msg   (format nil "Fresh glass login link (expires in ~a min):~%~%~a"
-                                      (max 1 (round *link-ttl* 60)) url))
-                       (reply (cl-nostr.nip59:build-giftwrap kp phone-pub msg)))
-                  (cl-nostr.pool:pool-publish pool reply)
-                  (format t "~&@@ link request from ~a... (~a) -> DM'd fresh link (ttl ~as)~%"
-                          (subseq phone-pub 0 8)
-                          (if (authorized-p phone-pub) "allowlist" "enrolled device") *link-ttl*)
-                  (finish-output)))
-               ;; a link request from a non-allowlisted identity -> ignore, but note it
-               ((link-request-p payload)
-                (format t "~&@@ link request DENIED ~a... (not allowlisted)~%" (subseq phone-pub 0 8))
-                (finish-output)))))
+               ;; ---- command DMs ----
+               (t
+                (multiple-value-bind (verb arg) (parse-command payload)
+                  (when verb
+                    (let* ((admin (authorized-p phone-pub))     ; the box's own npub
+                           (dev   (device-enrolled-p phone-pub))
+                           (who   (subseq phone-pub 0 8))
+                           (reply
+                             (case verb
+                               (:link
+                                ;; the one command an enrolled device may also use
+                                (if (or admin dev)
+                                    (let ((token (glass-login:mint-token *box-secret* :ttl *link-ttl*)))
+                                      (format nil "Fresh glass login link (expires in ~a min):~%~%~a#box=~a&code=~a"
+                                              (max 1 (round *link-ttl* 60)) *link-base* box-npub token))
+                                    :denied))
+                               (:devices (if admin (describe-devices) :denied))
+                               (:revoke  (if admin (revoke-devices arg) :denied))
+                               (:help
+                                (if (or admin dev)
+                                    (format nil "Commands:~%  link~%~@[~a~]"
+                                            (and admin "  devices~%  revoke <first-8> | revoke all~%"))
+                                    :denied))
+                               (t nil))))
+                      (cond
+                        ((null reply) nil)
+                        ((eq reply :denied)
+                         (format t "~&@@ ~(~a~) DENIED ~a... (~:[not authorised~;device: management is allowlist-only~])~%"
+                                 verb who dev)
+                         (finish-output))
+                        (t
+                         (cl-nostr.pool:pool-publish
+                          pool (cl-nostr.nip59:build-giftwrap kp phone-pub reply))
+                         (format t "~&@@ ~(~a~) from ~a... (~a) -> replied~%"
+                                 verb who (if admin "allowlist" "enrolled device"))
+                         (finish-output))))))))
        (error (e) (format t "~&@@ signal error: ~a~%" e) (finish-output)))))
   (format t "@@ subscribed; waiting for gift-wrapped offers~%")
   (finish-output)
