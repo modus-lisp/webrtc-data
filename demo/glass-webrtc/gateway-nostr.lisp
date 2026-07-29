@@ -71,6 +71,61 @@
   (or (uiop:getenv "LOGIN_URL_BASE") (format nil "https://~a.nsite.lol/" *nsite-npub*)))
 (defparameter *link-ttl* (or (ignore-errors (parse-integer (uiop:getenv "LINK_TTL"))) 1800))
 
+;; ---- enrolled devices ("remember this terminal") -----------------------------
+;; A browser cannot hold the user's Nostr identity without a signer, so instead each page keeps
+;; its OWN key and signs its offers with it.  When such an offer is admitted by a valid one-time
+;; code, we ENROL that sender for DEVICE_TTL (default 24h): afterwards the device can ask us for
+;; a fresh magic link itself, over the same gift-wrapped DM channel, with no user involved.
+;;
+;; This is a deliberate trust delegation — the device key becomes a bearer credential — so it is
+;; bounded two ways: it only ever comes from a session that already authenticated, and it lapses
+;; unless refreshed by connecting.  Enrolments are persisted because the gateway restarts often
+;; (a keepalive supervises it) and an in-memory set would silently un-enrol every device on deploy.
+(defparameter *device-ttl* (or (ignore-errors (parse-integer (uiop:getenv "DEVICE_TTL"))) 86400))
+(defparameter *device-file*
+  (or (uiop:getenv "DEVICE_FILE")
+      (namestring (merge-pathnames ".glass-devices"
+                                   (or *load-pathname* *default-pathname-defaults*)))))
+(defvar *devices* (make-hash-table :test 'equal))     ; pubkey-hex -> expiry (unix)
+(defvar *devices-lock* (bt:make-lock))
+
+(defun %unix-now () (- (get-universal-time) (encode-universal-time 0 0 0 1 1 1970 0)))
+
+(defun load-devices ()
+  (handler-case
+      (with-open-file (s *device-file* :if-does-not-exist nil)
+        (when s
+          (bt:with-lock-held (*devices-lock*)
+            (loop for line = (read-line s nil) while line do
+              (let* ((sp (position #\Space line))
+                     (pk (and sp (subseq line 0 sp)))
+                     (exp (and sp (ignore-errors (parse-integer (subseq line (1+ sp)))))))
+                (when (and pk exp (> exp (%unix-now)))
+                  (setf (gethash (string-downcase pk) *devices*) exp)))))))
+    (error () nil)))
+
+(defun save-devices ()
+  (handler-case
+      (with-open-file (s *device-file* :direction :output :if-exists :supersede
+                                       :if-does-not-exist :create)
+        (bt:with-lock-held (*devices-lock*)
+          (maphash (lambda (pk exp) (when (> exp (%unix-now)) (format s "~a ~a~%" pk exp)))
+                   *devices*)))
+    (error () nil)))
+
+(defun enrol-device (pubkey)
+  "Trust PUBKEY to request its own magic links for *DEVICE-TTL*.  Renews an existing enrolment."
+  (when pubkey
+    (bt:with-lock-held (*devices-lock*)
+      (setf (gethash (string-downcase pubkey) *devices*) (+ (%unix-now) *device-ttl*)))
+    (save-devices)))
+
+(defun device-enrolled-p (pubkey)
+  (and pubkey
+       (bt:with-lock-held (*devices-lock*)
+         (let ((exp (gethash (string-downcase pubkey) *devices*)))
+           (and exp (> exp (%unix-now)) t)))))
+
 ;; ---- login codes (magic-link, keyed by *box-secret*) ------------------------
 ;; A code arrives inside the offer envelope (see PARSE-OFFER); it was delivered to a
 ;; user via a gift-wrapped DM (login-link), so holding a valid one is proof enough —
@@ -242,6 +297,8 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
             (or (uiop:getenv "NSITE_NPUB")
                 "npub1ajvjnhgcmdxkng22lzsh22qvl63es78gk6p9mwksepju974teguq4l4evc")
             box-npub))
+  (load-devices)
+  (format t "@@ devices:    ~a enrolled (ttl ~ah)~%" (hash-table-count *devices*) (round *device-ttl* 3600))
   (format t "@@ relays:     ~a~%" *relays*)
   (if *allow*
       (format t "@@ allowlist:  ~{~a~^, ~}~%" (mapcar (lambda (h) (subseq h 0 12)) *allow*))
@@ -265,8 +322,15 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                ((and (stringp offer-sdp) (search "m=application" offer-sdp))   ; a data-channel offer
                 ;; a valid one-time code OR an allowlisted signer authorizes the connection
                 (let* ((cstatus (code-status code))
+                       ;; Three ways in, with deliberately different lifetimes:
+                       ;;   allowlist — the npub this box was started for.  Always authorised.
+                       ;;   code      — a one-time magic link.  Valid for its own TTL.
+                       ;;   device    — a browser we enrolled after it came in on a valid code.
+                       ;;               Authorised for *DEVICE-TTL* (~24h) and renewed by use, so
+                       ;;               an active terminal keeps working and an idle one lapses.
                        (via (cond ((eq cstatus :ok) "code")
                                   ((authorized-p phone-pub) "allowlist")
+                                  ((device-enrolled-p phone-pub) "device")
                                   (t nil))))
                   (cond
                     ((null via)
@@ -275,6 +339,9 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                      (finish-output))
                     (t
                      (format t "~&@@ offer from ~a... (via ~a) -> answering~%" (subseq phone-pub 0 8) via)
+                     ;; remember this terminal, and renew it on every admitted connection: use
+                     ;; keeps a device alive, disuse lets it expire
+                     (enrol-device phone-pub)
                      (finish-output)
                      (let* ((answer (process-offer offer-sdp))
                             ;; RENEW: a client that authenticated with a valid code gets a fresh
@@ -282,7 +349,7 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                             ;; keeps the credential alive and a dropped session never needs a new
                             ;; magic link.  Renewal rides the exchange that already proved who they
                             ;; are — no new message type, no new crypto.
-                            (payload (if (eq cstatus :ok)
+                            (payload (if (or (eq cstatus :ok) (string= via "device"))
                                          (let ((ht (make-hash-table :test 'equal)))
                                            (setf (gethash "sdp" ht) answer
                                                  (gethash "code" ht)
@@ -294,15 +361,17 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                        (format t "@@ answer gift-wrapped -> ~a...~%" (subseq phone-pub 0 8))
                        (finish-output))))))
                ;; a fresh-link request from an allowlisted identity -> DM a new login link
-               ((and (link-request-p payload) (authorized-p phone-pub))
+               ((and (link-request-p payload)
+                     (or (authorized-p phone-pub) (device-enrolled-p phone-pub)))
                 (let* ((token (glass-login:mint-token *box-secret* :ttl *link-ttl*))
                        (url   (format nil "~a#box=~a&code=~a" *link-base* box-npub token))
                        (msg   (format nil "Fresh glass login link (expires in ~a min):~%~%~a"
                                       (max 1 (round *link-ttl* 60)) url))
                        (reply (cl-nostr.nip59:build-giftwrap kp phone-pub msg)))
                   (cl-nostr.pool:pool-publish pool reply)
-                  (format t "~&@@ link request from ~a... -> DM'd fresh link (ttl ~as)~%"
-                          (subseq phone-pub 0 8) *link-ttl*)
+                  (format t "~&@@ link request from ~a... (~a) -> DM'd fresh link (ttl ~as)~%"
+                          (subseq phone-pub 0 8)
+                          (if (authorized-p phone-pub) "allowlist" "enrolled device") *link-ttl*)
                   (finish-output)))
                ;; a link request from a non-allowlisted identity -> ignore, but note it
                ((link-request-p payload)

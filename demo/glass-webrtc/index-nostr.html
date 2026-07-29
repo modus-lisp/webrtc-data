@@ -610,7 +610,7 @@
     const urlCode = hp.get('code') || params.get('code') || '';
     if (urlCode && codeAlive(urlCode)) storeCode(urlCode);      // fresh link: remember it
     // prefer whichever credential is actually still valid
-    const code = (codeAlive(urlCode) ? urlCode : '') || loadCode() || urlCode;
+    let code = (codeAlive(urlCode) ? urlCode : '') || loadCode() || urlCode;
     window.__expiredCode = Boolean(code) && !codeAlive(code);
     const boxPub = boxArg.startsWith('npub') ? decode(boxArg).data : boxArg;
     const relays = (params.get('relays') ||
@@ -636,10 +636,53 @@
       return rumor.content;
     }
 
-    // Choose an identity from the URL: a code -> ephemeral key (no signer); else -> NIP-07.
+    // ---- device identity ("remember this terminal") ----------------------------------------
+    // The code path used a throwaway key per load, so the box could never recognise this browser
+    // again.  Instead keep ONE key per box in localStorage and sign with it: the box enrols the
+    // sender of any code-authorised offer for 24h, after which this device can ask for its own
+    // fresh magic link over the same gift-wrapped DM channel — no user, no NIP-07 signer.
+    const hex = u8 => [...u8].map(b => b.toString(16).padStart(2, '0')).join('');
+    const unhex = h => new Uint8Array(h.match(/../g).map(x => parseInt(x, 16)));
+    const DEV_KEY = 'glass-device:' + (hp.get('box') || params.get('box') || 'default');
+    const hasDevice = () => { try { const h = localStorage.getItem(DEV_KEY); return !!h && h.length === 64; }
+                              catch (_) { return false; } };
+    const deviceSecret = () => {
+      try {
+        let h = localStorage.getItem(DEV_KEY);
+        if (!h || h.length !== 64) { h = hex(generateSecretKey()); localStorage.setItem(DEV_KEY, h); }
+        return unhex(h);
+      } catch (_) { return generateSecretKey(); }      // private browsing: this load only
+    };
+
+    // Ask the box for a fresh code, signed by this device.  Reuses the self-service 'link' DM the
+    // box already answers; the box decides whether this device is still enrolled.
+    async function requestFreshCode(pool, sk) {
+      const mine = getPublicKey(sk);
+      return new Promise(resolve => {
+        let done = false, sub = null;
+        const finish = v => { if (!done) { done = true; try { sub && sub.close(); } catch (_) {} resolve(v); } };
+        try {
+          sub = pool.subscribeMany(relays, [{ kinds: [1059], '#p': [mine] }], {
+            onevent: ev => {
+              try {
+                const r = unwrapEvent(ev, sk);
+                if (r && r.pubkey === boxPub) {
+                  const m = String(r.content).match(/code=([A-Za-z0-9.\-_]+)/);
+                  if (m && codeAlive(m[1])) finish(m[1]);
+                }
+              } catch (_) {}
+            },
+          });
+          pool.publish(relays, wrapEvent({ kind: 14, content: 'link', tags: [['p', boxPub]] }, sk, boxPub));
+        } catch (_) { finish(null); }
+        setTimeout(() => finish(null), 15000);
+      });
+    }
+
+    // Choose an identity from the URL: a code -> this device's key; else -> NIP-07.
     async function makeIdentity() {
       if (code) {
-        const sk = generateSecretKey();
+        const sk = deviceSecret();
         return {
           pub: getPublicKey(sk), mode: 'code',
           wrapOffer: (payload) => wrapEvent({ kind: 14, content: payload, tags: [['p', boxPub]] }, sk, boxPub),
@@ -660,16 +703,21 @@
       let id;
       // An expired credential is a distinct, actionable failure — say so up front rather than
       // letting it surface as an unexplained connection timeout minutes later.
-      if (window.__expiredCode) {
-        const when = new Date(codeExp(code));
-        setConnRaw('This link has expired');
+      // An enrolled device is admitted on its own key, so a stale code is no reason not to try:
+      // connect first (fast path) and only fall back to asking for a new link if the box stays
+      // silent.  Give up only when there is genuinely nothing to try.
+      const showNoCredential = () => {
+        const when = codeExp(code) ? new Date(codeExp(code)) : null;
+        setConnRaw(code ? 'This link has expired' : 'This terminal is not enrolled');
         connMsg.insertAdjacentHTML('afterend',
           '<div style="max-width:22em;font-size:13px;line-height:1.5;opacity:.75;margin-top:2px">' +
-          'It was valid until ' + when.toLocaleString() + '.<br>DM <b>link</b> to the box for a new one.</div>');
-        connEl.querySelector('.spinner').style.display = 'none';
-        diag('code expired at ' + when.toISOString());
-        return;
-      }
+          (when ? 'It was valid until ' + when.toLocaleString() + '.<br>' : '') +
+          'DM <b>link</b> to the box for a new one.</div>');
+        const sp = connEl.querySelector('.spinner'); if (sp) sp.style.display = 'none';
+        diag('no usable credential' + (when ? ' (expired ' + when.toISOString() + ')' : ''));
+      };
+      if (!code && !hasDevice() && !window.nostr) { showNoCredential(); return; }
+      window.__showNoCredential = showNoCredential;
       try { id = await makeIdentity(); } catch (e) { setStatus(e.message); return; }
       const pool = new SimplePool();
 
@@ -690,6 +738,7 @@
               answered = true;
               const ac = (answer.match(/a=candidate[^\r\n]*/g) || []);
               diag(`answer ${answer.length}B, ${ac.length} cand (${ac.filter(c=>c.includes('srflx')).length} srflx)`);
+              clearTimeout(window.__answerWatchdog);
               await pc.setRemoteDescription({ type: 'answer', sdp: answer });
               setStatus('answer received — establishing WebRTC…');
             }
@@ -728,6 +777,17 @@
       await Promise.any(pool.publish(relays, wrap));
       diag('offer published (' + id.mode + ')');
       setStatus('offer sent — waiting for the box');
+      // Silence usually means our credential is dead.  If this terminal is still enrolled the box
+      // will answer a device-signed link request, and we can carry on without the user.
+      window.__answerWatchdog = setTimeout(async () => {
+        if (pc.remoteDescription) return;
+        if (!hasDevice()) return window.__showNoCredential();
+        diag('no answer — asking the box for a fresh code');
+        setConnRaw('Renewing access…');
+        const fresh = await requestFreshCode(pool, deviceSecret());
+        if (fresh) { storeCode(fresh); diag('renewed — reloading'); location.reload(); }
+        else window.__showNoCredential();
+      }, 18000);
     })();
   </script>
 </body>
