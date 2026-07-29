@@ -96,13 +96,53 @@
     vidEl.style.cssText = 'position:fixed;right:14px;bottom:78px;z-index:22;width:128px;height:128px;' +
       'border-radius:10px;background:#000;object-fit:contain;display:none;box-shadow:0 0 0 1px rgba(255,255,255,.25)';
     document.body.appendChild(vidEl);
+    // VIDEO-PRIMARY: the desktop arrives as VP8 video instead of over the VNC data channel.
+    // noVNC's canvas stays (invisible) because the touch layer maps coordinates through it and
+    // input still rides the data channel — we just don't look at its pixels.
+    const videoPrimary = new URLSearchParams(location.search).get('video') !== '0';
+    // The video mirrors the canvas's ON-SCREEN rect, so it inherits the pan/zoom transform the
+    // touch layer applies to the canvas without us transforming it twice.  Coalesced into one
+    // rAF per change: polling this on a timer while pinching thrashed the compositor and hung
+    // the page on iOS.
+    let syncPending = false;
+    const syncVideoNow = () => {
+      syncPending = false;
+      if (!videoPrimary) return;
+      const c = document.querySelector('#screen canvas'); if (!c) return;
+      const r = c.getBoundingClientRect();
+      if (!r.width || !r.height) return;
+      vidEl.style.left = r.left + 'px'; vidEl.style.top = r.top + 'px';
+      vidEl.style.width = r.width + 'px'; vidEl.style.height = r.height + 'px';
+    };
+    const syncVideo = () => { if (!syncPending) { syncPending = true; requestAnimationFrame(syncVideoNow); } };
+    window.__syncVideo = syncVideo;                 // the touch layer calls this after pan/zoom
+    window.addEventListener('resize', syncVideo);
+    window.addEventListener('orientationchange', syncVideo);
     pc.addEventListener('track', (e) => {
       const stream = e.streams[0] || new MediaStream([e.track]);
       if (e.track.kind === 'video') {
         diag('VIDEO track from box (VP8)');
-        vidEl.srcObject = stream; vidEl.style.display = '';
+        vidEl.srcObject = stream;
+        if (videoPrimary) {                       // the video IS the desktop
+          vidEl.style.cssText = 'position:fixed;z-index:5;background:#000;object-fit:fill;' +
+            'left:0;top:0;width:1px;height:1px';
+          const c = document.querySelector('#screen canvas');
+          if (c) c.style.opacity = '0';           // keep it for input geometry, hide its pixels
+          window.__vidEl = vidEl; window.__videoPrimary = true;
+          syncVideo();
+          // the loading overlay is normally dismissed by the first VNC framebuffer update, but
+          // video-primary suppresses those entirely — so dismiss it on the first VIDEO frame.
+          const firstFrame = () => { syncVideo(); hideConn(); };
+          vidEl.addEventListener('loadeddata', firstFrame, { once: true });
+          vidEl.addEventListener('playing', firstFrame, { once: true });
+          if (vidEl.requestVideoFrameCallback) vidEl.requestVideoFrameCallback(firstFrame);
+          setTimeout(firstFrame, 8000);           // belt-and-braces: never strand the overlay
+          diag('video is the primary view');
+        } else {
+          vidEl.style.display = '';
+        }
         const vp = vidEl.play && vidEl.play(); if (vp && vp.catch) vp.catch(() => {});
-        e.track.addEventListener('unmute', () => diag('video track unmuted — frames arriving'));
+        e.track.addEventListener('unmute', () => { diag('video unmuted — frames arriving'); if (videoPrimary) syncVideo(); });
         return;
       }
       diag('audio track from box'); showAudio();
@@ -213,6 +253,24 @@
         const c = canvasOf(); if (!c) return;
         if (zoom <= 1.001) { zoom = 1; tx = 0; ty = 0; c.style.transform = ''; }
         else { c.style.transformOrigin = '0 0'; c.style.transform = `translate(${tx}px,${ty}px) scale(${zoom})`; }
+        syncVid(c);
+      };
+      // Keep the video glued to the canvas by giving it the IDENTICAL transform, rather than
+      // re-positioning it from the canvas's (already transformed) rect: transforms are composited,
+      // so both surfaces move together on the same frame instead of the video lagging a layout
+      // behind.  The plain box is only written while unzoomed, where it is stable.
+      const syncVid = (c) => {
+        const v = window.__vidEl; if (!v || !window.__videoPrimary) return;
+        if (zoom <= 1.001) {
+          const r = c.getBoundingClientRect();
+          if (!r.width) return;
+          v.style.transform = '';
+          v.style.left = r.left + 'px'; v.style.top = r.top + 'px';
+          v.style.width = r.width + 'px'; v.style.height = r.height + 'px';
+        } else {
+          v.style.transformOrigin = '0 0';
+          v.style.transform = `translate(${tx}px,${ty}px) scale(${zoom})`;
+        }
       };
       const clampPan = () => {                               // keep the zoomed canvas covering #screen
         const c = canvasOf(); if (!c || zoom <= 1.001) return;
@@ -222,7 +280,8 @@
         else if (r.left > s.left) dx = s.left - r.left; else if (r.right < s.right) dx = s.right - r.right;
         if (r.height <= s.height) dy = s.top + (s.height - r.height) / 2 - r.top;
         else if (r.top > s.top) dy = s.top - r.top; else if (r.bottom < s.bottom) dy = s.bottom - r.bottom;
-        if (dx || dy) { tx += dx; ty += dy; c.style.transform = `translate(${tx}px,${ty}px) scale(${zoom})`; }
+        if (dx || dy) { tx += dx; ty += dy; c.style.transform = `translate(${tx}px,${ty}px) scale(${zoom})`;
+                        syncVid(c); }
       };
       const SAFE = 0.25;                                     // cursor roams the central 50%; view pans past that
       const followCursor = (frac = SAFE) => {                // pan a zoomed view to keep the cursor in a band

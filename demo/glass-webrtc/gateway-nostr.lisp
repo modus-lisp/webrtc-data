@@ -17,6 +17,7 @@
   (asdf:load-system "webrtc-media/rtc")     ; SRTP audio (beeping tone + level) over the same transport
   (asdf:load-system "cl-nostr"))
 (load (merge-pathnames "login-token.lisp" (or *load-pathname* *default-pathname-defaults*)))
+(load (merge-pathnames "glass-capture.lisp" (or *load-pathname* *default-pathname-defaults*)))
 
 (in-package #:webrtc-data)
 
@@ -105,11 +106,17 @@ silently drop CODE.)"
 (defvar *last-assoc* nil)
 ;; VP8 payload type the browser assigned in its offer (dynamic, varies) — bound per session.
 (defvar *video-pt* nil)
+;; VIDEO_PRIMARY=1 -> the desktop is delivered as VP8 video, and the RFB data channel is used for
+;; INPUT ONLY: we swallow the browser's FramebufferUpdateRequests so glass never sends pixels down
+;; the SCTP path.  Otherwise both paths would carry the same screen and compete for bandwidth.
+(defparameter *video-primary* (and (uiop:getenv "VIDEO_PRIMARY") t))
+(defparameter *video-qi* (or (ignore-errors (parse-integer (uiop:getenv "VIDEO_QI"))) 12))
+(defparameter *video-fps* (or (ignore-errors (parse-integer (uiop:getenv "VIDEO_FPS"))) 4))
 
 (defun run-session (conn agent)
   "Drive DTLS, run the data channel, and bridge it to glass once the channel opens.
 Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
-  (let ((glass nil) (audio-stop nil) (video-stop nil))
+  (let ((glass nil) (audio-stop nil) (video-stop nil) (cap nil))
     (unwind-protect
          (handler-case
              (progn
@@ -130,12 +137,18 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                  (format *error-output* "~&[gw-nostr] audio started — beeping tone -> browser~%")
                  ;; video: our from-scratch VP8 keyframes, over the same SRTP keys (own SSRC)
                  (when (and ctx *video-pt*)
+                   (when *video-primary*
+                     (setf cap (ignore-errors (capture-start *glass-host* *glass-port*)))
+                     (format *error-output* "~&[gw-nostr] desktop capture ~:[FAILED~;up~] (video-primary)~%" cap))
                    (setf video-stop
                          (ignore-errors
                            (webrtc-media:start-video
                             agent (dtls-conn-session conn) ctx :pt *video-pt*
+                            :qi *video-qi* :fps *video-fps*
+                            :source (when cap (lambda () (capture-take cap)))
                             :log (lambda (m) (format *error-output* "~&[video] ~a~%" m)))))
-                   (format *error-output* "~&[gw-nostr] video started — VP8 pt=~a -> browser~%" *video-pt*)))
+                   (format *error-output* "~&[gw-nostr] video started — VP8 pt=~a qi=~a fps=~a~%"
+                           *video-pt* *video-qi* *video-fps*)))
                (webrtc-serve-datachannel
                 conn :duration 3600.0
                 :on-ready
@@ -175,8 +188,14 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                 (lambda (assoc sid payload)
                   (declare (ignore assoc sid))
                   (when (and glass (plusp (length payload)))
-                    (sb-bsd-sockets:socket-send glass (as-u8vec payload) (length payload))))))
+                    (let ((bytes (as-u8vec payload)))
+                      ;; in video-primary mode drop FramebufferUpdateRequest (type 3, 10 bytes) so
+                      ;; glass sends no pixels over SCTP; everything else (input) passes through
+                      (if (and *video-primary* (= 10 (length bytes)) (= 3 (aref bytes 0)))
+                          nil
+                          (sb-bsd-sockets:socket-send glass bytes (length bytes))))))))
            (error (e) (format *error-output* "~&[gw-nostr] session error: ~a~%" e)))
+      (when cap (ignore-errors (capture-stop cap)))
       (when video-stop (ignore-errors (funcall video-stop)))
       (when audio-stop (ignore-errors (funcall audio-stop)))
       (when glass (ignore-errors (sb-bsd-sockets:socket-close glass)))
