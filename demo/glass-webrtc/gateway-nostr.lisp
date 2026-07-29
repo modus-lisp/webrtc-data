@@ -112,6 +112,10 @@ silently drop CODE.)"
 (defparameter *video-primary* (and (uiop:getenv "VIDEO_PRIMARY") t))
 (defparameter *video-qi* (or (ignore-errors (parse-integer (uiop:getenv "VIDEO_QI"))) 12))
 (defparameter *video-fps* (or (ignore-errors (parse-integer (uiop:getenv "VIDEO_FPS"))) 4))
+;; quality adapts between VIDEO_QI (sharpest) and VIDEO_MAX_QI, steering toward VIDEO_TARGET_KBS;
+;; once the screen is quiet, coarsely-coded macroblocks are re-coded at VIDEO_QI.
+(defparameter *video-max-qi* (or (ignore-errors (parse-integer (uiop:getenv "VIDEO_MAX_QI"))) 44))
+(defparameter *video-target-kbs* (or (ignore-errors (parse-integer (uiop:getenv "VIDEO_TARGET_KBS"))) 150))
 
 (defun run-session (conn agent)
   "Drive DTLS, run the data channel, and bridge it to glass once the channel opens.
@@ -145,6 +149,7 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                            (webrtc-media:start-video
                             agent (dtls-conn-session conn) ctx :pt *video-pt*
                             :qi *video-qi* :fps *video-fps*
+                            :max-qi *video-max-qi* :target-kbs *video-target-kbs*
                             :source (when cap (lambda () (capture-take cap)))
                             :log (lambda (m)
                                    (let ((cs (and cap (capture-stats cap))))
