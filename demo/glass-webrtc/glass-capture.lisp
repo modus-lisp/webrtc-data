@@ -75,12 +75,19 @@ encoder never has to rediscover it by comparing the whole screen."
         (when (and (>= my 0) (>= mx 0)) (setf (aref d (+ (* my mc) mx)) 1))))))
 
 (defun %apply-rect (c rx ry rw rh data)
-  "Convert one BGRX rectangle into the Y/U/V planes (BT.601, 4:2:0)."
-  (let ((y (cap-y c)) (u (cap-u c)) (v (cap-v c))
-        (w (cap-width c)) (cw (cap-cw c)))
+  "Convert one BGRX rectangle into the Y/U/V planes (BT.601, 4:2:0).
+Typed throughout: this runs per PIXEL over every changed rectangle (millions per second on an
+active desktop), and on generic arithmetic it was costing ~14% of wall-clock."
+  (declare (type (simple-array (unsigned-byte 8) (*)) data)
+           (type fixnum rx ry rw rh)
+           (optimize (speed 3) (safety 0)))
+  (let ((y (the (simple-array (unsigned-byte 8) (*)) (cap-y c)))
+        (u (the (simple-array (unsigned-byte 8) (*)) (cap-u c)))
+        (v (the (simple-array (unsigned-byte 8) (*)) (cap-v c)))
+        (w (the fixnum (cap-width c))) (cw (the fixnum (cap-cw c))))
     ;; luma, every pixel
     (dotimes (row rh)
-      (let ((base (* row rw 4)) (out (* (+ ry row) w)))
+      (let ((base (the fixnum (* row rw 4))) (out (the fixnum (* (+ ry row) w))))
         (dotimes (col rw)
           (let* ((o (+ base (* col 4)))
                  (b (aref data o)) (g (aref data (+ o 1))) (r (aref data (+ o 2))))
