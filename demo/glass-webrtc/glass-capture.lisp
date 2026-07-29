@@ -10,7 +10,7 @@
 
 (defstruct (capture (:conc-name cap-))
   socket width height cw ch y u v
-  (t-wait 0d0) (t-conv 0d0) (n-upd 0) (px 0)   ; capture-side timing
+  (t-wait 0d0) (t-conv 0d0) (n-upd 0) (px 0) (n-copy 0)   ; capture-side timing
   mb-cols mb-rows dirty-mbs                    ; per-macroblock dirty flags, straight from RFB
   (dirty nil) (lock (bt:make-lock)) (stop nil) thread)   ; dirty only after a real update
 
@@ -46,7 +46,10 @@
         ;; native 32bpp BGRX, Raw only
         (write-sequence (concatenate '(vector (unsigned-byte 8))
                                      (vector 0 0 0 0 32 24 0 1 0 255 0 255 0 255 16 8 0 0 0 0)) s)
-        (write-sequence (concatenate '(vector (unsigned-byte 8)) (vector 2 0 0 1 0 0 0 0)) s)
+        ;; SetEncodings: CopyRect (1) then Raw (0).  glass emits CopyRect when a window MOVES,
+        ;; which costs 4 bytes on the wire instead of repainting the region.
+        (write-sequence (concatenate '(vector (unsigned-byte 8))
+                                     (vector 2 0 0 2  0 0 0 1  0 0 0 0)) s)
         (finish-output s)
         (let* ((cw (ceiling w 2)) (ch (ceiling h 2))
                (mc (ceiling w 16)) (mr (ceiling h 16))
@@ -73,6 +76,31 @@ encoder never has to rediscover it by comparing the whole screen."
     (loop for my from (floor ry 16) to (min (1- mr) (floor (+ ry rh -1) 16)) do
       (loop for mx from (floor rx 16) to (min (1- mc) (floor (+ rx rw -1) 16)) do
         (when (and (>= my 0) (>= mx 0)) (setf (aref d (+ (* my mc) mx)) 1))))))
+
+(defun %copy-region (plane stride dx dy sx sy w h)
+  "Move a W x H region from (SX,SY) to (DX,DY) within PLANE.  Row order is chosen so overlapping
+moves (the common case when a window slides) don't clobber their own source."
+  (declare (type (simple-array (unsigned-byte 8) (*)) plane)
+           (type fixnum stride dx dy sx sy w h) (optimize (speed 3) (safety 0)))
+  (if (< dy sy)
+      (dotimes (r h)                                     ; moving up: copy top-down
+        (replace plane plane :start1 (+ (* (+ dy r) stride) dx)
+                             :end1 (+ (* (+ dy r) stride) dx w)
+                             :start2 (+ (* (+ sy r) stride) sx)))
+      (loop for r from (1- h) downto 0 do                ; moving down: copy bottom-up
+        (replace plane plane :start1 (+ (* (+ dy r) stride) dx)
+                             :end1 (+ (* (+ dy r) stride) dx w)
+                             :start2 (+ (* (+ sy r) stride) sx)))))
+
+(defun %apply-copyrect (c dx dy w h sx sy)
+  "Apply an RFB CopyRect to the Y/U/V planes.  Chroma is 4:2:0, so its coordinates halve — only
+exact even offsets stay aligned, which is what a window move gives us."
+  (%copy-region (cap-y c) (cap-width c) dx dy sx sy w h)
+  (let ((cw (cap-cw c)))
+    (%copy-region (cap-u c) cw (floor dx 2) (floor dy 2) (floor sx 2) (floor sy 2)
+                  (floor w 2) (floor h 2))
+    (%copy-region (cap-v c) cw (floor dx 2) (floor dy 2) (floor sx 2) (floor sy 2)
+                  (floor w 2) (floor h 2))))
 
 (defun %apply-rect (c rx ry rw rh data)
   "Convert one BGRX rectangle into the Y/U/V planes (BT.601, 4:2:0).
@@ -131,6 +159,11 @@ active desktop), and on generic arithmetic it was costing ~14% of wall-clock."
                        ((= enc 0) (incf (cap-px c) (* rw rh))
                                   (%apply-rect c rx ry rw rh (%rd s (* rw rh 4)))
                                   (%mark-dirty c rx ry rw rh))
+                       ((= enc 1)                        ; CopyRect: 4 bytes of source coords
+                        (let* ((cp (%rd s 4)) (sx (%be16 cp 0)) (sy (%be16 cp 2)))
+                          (incf (cap-n-copy c))
+                          (%apply-copyrect c rx ry rw rh sx sy)
+                          (%mark-dirty c rx ry rw rh)))
                        (t (error "capture: unexpected encoding ~a" enc)))))
                  (setf (cap-dirty c) t)
                  (incf (cap-n-upd c))
@@ -146,8 +179,8 @@ active desktop), and on generic arithmetic it was costing ~14% of wall-clock."
   "Capture-side timing since the last call: how long glass kept us waiting for an update, and how
 long converting its rectangles to YUV took.  Resets the counters."
   (prog1 (list :updates (cap-n-upd c) :wait-ms (cap-t-wait c) :convert-ms (cap-t-conv c)
-               :px (cap-px c))
-    (setf (cap-n-upd c) 0 (cap-t-wait c) 0d0 (cap-t-conv c) 0d0 (cap-px c) 0)))
+               :px (cap-px c) :copies (cap-n-copy c))
+    (setf (cap-n-upd c) 0 (cap-t-wait c) 0d0 (cap-t-conv c) 0d0 (cap-px c) 0 (cap-n-copy c) 0)))
 
 (defun capture-start (host port)
   "Connect + run the capture loop on its own thread.  Returns the CAPTURE."

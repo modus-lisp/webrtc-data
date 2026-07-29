@@ -148,9 +148,9 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                             :source (when cap (lambda () (capture-take cap)))
                             :log (lambda (m)
                                    (let ((cs (and cap (capture-stats cap))))
-                                     (format *error-output* "~&[video] ~a~@[ | glass wait ~,0fms conv ~,0fms upd ~a px ~a~]~%"
+                                     (format *error-output* "~&[video] ~a~@[ | glass wait ~,0fms conv ~,0fms upd ~a px ~a copies ~a~]~%"
                                              m (and cs (getf cs :wait-ms)) (and cs (getf cs :convert-ms))
-                                             (and cs (getf cs :updates)) (and cs (getf cs :px))))))))
+                                             (and cs (getf cs :updates)) (and cs (getf cs :px)) (and cs (getf cs :copies))))))))
                    (format *error-output* "~&[gw-nostr] video started — VP8 pt=~a qi=~a fps=~a~%"
                            *video-pt* *video-qi* *video-fps*)))
                (webrtc-serve-datachannel
