@@ -94,7 +94,7 @@
     const vidEl = document.createElement('video');
     vidEl.autoplay = true; vidEl.playsInline = true; vidEl.muted = true;
     vidEl.style.cssText = 'position:fixed;right:14px;bottom:78px;z-index:22;width:128px;height:128px;' +
-      'border-radius:10px;background:#000;object-fit:contain;display:none;box-shadow:0 0 0 1px rgba(255,255,255,.25)';
+      'border-radius:10px;background:#000;object-fit:contain;display:none;pointer-events:none;box-shadow:0 0 0 1px rgba(255,255,255,.25)';
     document.body.appendChild(vidEl);
     // VIDEO-PRIMARY: the desktop arrives as VP8 video instead of over the VNC data channel.
     // noVNC's canvas stays (invisible) because the touch layer maps coordinates through it and
@@ -124,8 +124,11 @@
         diag('VIDEO track from box (VP8)');
         vidEl.srcObject = stream;
         if (videoPrimary) {                       // the video IS the desktop
+          // pointer-events:none is essential — the virtual trackpad listens on #screen BENEATH
+          // this element, so without it the video swallows every touch that lands on the desktop
+          // and gestures only work in the margins around it.
           vidEl.style.cssText = 'position:fixed;z-index:5;background:#000;object-fit:fill;' +
-            'left:0;top:0;width:1px;height:1px';
+            'pointer-events:none;left:0;top:0;width:1px;height:1px';
           const c = document.querySelector('#screen canvas');
           if (c) c.style.opacity = '0';           // keep it for input geometry, hide its pixels
           window.__vidEl = vidEl; window.__videoPrimary = true;
