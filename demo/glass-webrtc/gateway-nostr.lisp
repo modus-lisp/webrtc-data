@@ -277,7 +277,19 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                      (format t "~&@@ offer from ~a... (via ~a) -> answering~%" (subseq phone-pub 0 8) via)
                      (finish-output)
                      (let* ((answer (process-offer offer-sdp))
-                            (reply  (cl-nostr.nip59:build-giftwrap kp phone-pub answer)))
+                            ;; RENEW: a client that authenticated with a valid code gets a fresh
+                            ;; one back with the answer, so simply reconnecting before it expires
+                            ;; keeps the credential alive and a dropped session never needs a new
+                            ;; magic link.  Renewal rides the exchange that already proved who they
+                            ;; are — no new message type, no new crypto.
+                            (payload (if (eq cstatus :ok)
+                                         (let ((ht (make-hash-table :test 'equal)))
+                                           (setf (gethash "sdp" ht) answer
+                                                 (gethash "code" ht)
+                                                 (glass-login:mint-token *box-secret* :ttl *link-ttl*))
+                                           (com.inuoe.jzon:stringify ht))
+                                         answer))
+                            (reply  (cl-nostr.nip59:build-giftwrap kp phone-pub payload)))
                        (cl-nostr.pool:pool-publish pool reply)
                        (format t "@@ answer gift-wrapped -> ~a...~%" (subseq phone-pub 0 8))
                        (finish-output))))))

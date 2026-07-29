@@ -595,7 +595,23 @@
     const hp = new URLSearchParams(hraw.includes('=') ? hraw : ('box=' + hraw));   // bare npub or box=/code=
     const boxArg = hp.get('box') || params.get('box') ||
       '75427ab8309aad26beea8142edf427674e4544604ae4dc5045108ad21fc8a0db';   // dev fallback
-    const code = hp.get('code') || params.get('code') || '';
+    // ---- credential handling --------------------------------------------------------------
+    // The token is  nonce.exp.mac  with exp a unix time, so the browser can judge its own
+    // credential without asking anyone: an expired link is reported as expired instead of
+    // surfacing later as a mysterious connection failure.  A valid code is kept in
+    // localStorage (per box) and refreshed from every successful answer, so a reload — or a
+    // reconnect after a drop — does not need a new magic link.
+    const codeExp = c => { const p = String(c || '').split('.'); const e = parseInt(p[1], 10);
+                           return (p.length === 3 && isFinite(e)) ? e * 1000 : 0; };
+    const codeAlive = (c, marginMs = 0) => { const e = codeExp(c); return e > 0 && (e - marginMs) > Date.now(); };
+    const CODE_KEY = 'glass-code:' + (hp.get('box') || params.get('box') || 'default');
+    const storeCode = c => { try { if (codeAlive(c)) localStorage.setItem(CODE_KEY, c); } catch (_) {} };
+    const loadCode = () => { try { const c = localStorage.getItem(CODE_KEY); return codeAlive(c) ? c : ''; } catch (_) { return ''; } };
+    const urlCode = hp.get('code') || params.get('code') || '';
+    if (urlCode && codeAlive(urlCode)) storeCode(urlCode);      // fresh link: remember it
+    // prefer whichever credential is actually still valid
+    const code = (codeAlive(urlCode) ? urlCode : '') || loadCode() || urlCode;
+    window.__expiredCode = Boolean(code) && !codeAlive(code);
     const boxPub = boxArg.startsWith('npub') ? decode(boxArg).data : boxArg;
     const relays = (params.get('relays') ||
       'wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net').split(',');
@@ -642,6 +658,18 @@
 
     (async () => {
       let id;
+      // An expired credential is a distinct, actionable failure — say so up front rather than
+      // letting it surface as an unexplained connection timeout minutes later.
+      if (window.__expiredCode) {
+        const when = new Date(codeExp(code));
+        setConnRaw('This link has expired');
+        connMsg.insertAdjacentHTML('afterend',
+          '<div style="max-width:22em;font-size:13px;line-height:1.5;opacity:.75;margin-top:2px">' +
+          'It was valid until ' + when.toLocaleString() + '.<br>DM <b>link</b> to the box for a new one.</div>');
+        connEl.querySelector('.spinner').style.display = 'none';
+        diag('code expired at ' + when.toISOString());
+        return;
+      }
       try { id = await makeIdentity(); } catch (e) { setStatus(e.message); return; }
       const pool = new SimplePool();
 
@@ -651,7 +679,13 @@
         onevent: async (ev) => {
           if (answered) return;
           try {
-            const answer = await id.unwrap(ev);
+            let answer = await id.unwrap(ev);
+            // the answer may be a {sdp, code} envelope: the box renews our credential on every
+            // authenticated connection, so store the new one before using the SDP
+            try {
+              const env = JSON.parse(answer);
+              if (env && env.sdp) { if (env.code) { storeCode(env.code); diag('credential renewed'); } answer = env.sdp; }
+            } catch (_) { /* plain SDP */ }
             if (answer && answer.includes('m=application')) {
               answered = true;
               const ac = (answer.match(/a=candidate[^\r\n]*/g) || []);
