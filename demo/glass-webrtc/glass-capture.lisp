@@ -10,6 +10,7 @@
 
 (defstruct (capture (:conc-name cap-))
   socket width height cw ch y u v
+  mb-cols mb-rows dirty-mbs                    ; per-macroblock dirty flags, straight from RFB
   (dirty t) (lock (bt:make-lock)) (stop nil) thread)
 
 (defun %rd (stream n)
@@ -47,7 +48,10 @@
         (write-sequence (concatenate '(vector (unsigned-byte 8)) (vector 2 0 0 1 0 0 0 0)) s)
         (finish-output s)
         (let* ((cw (ceiling w 2)) (ch (ceiling h 2))
+               (mc (ceiling w 16)) (mr (ceiling h 16))
                (c (make-capture :socket s :width w :height h :cw cw :ch ch
+                                :mb-cols mc :mb-rows mr
+                                :dirty-mbs (make-array (* mc mr) :element-type 'bit :initial-element 1)
                                 :y (make-array (* w h) :element-type '(unsigned-byte 8) :initial-element 16)
                                 :u (make-array (* cw ch) :element-type '(unsigned-byte 8) :initial-element 128)
                                 :v (make-array (* cw ch) :element-type '(unsigned-byte 8) :initial-element 128))))
@@ -60,6 +64,14 @@
                             (ldb (byte 8 8) (cap-width c)) (ldb (byte 8 0) (cap-width c))
                             (ldb (byte 8 8) (cap-height c)) (ldb (byte 8 0) (cap-height c))) s)
     (finish-output s)))
+
+(defun %mark-dirty (c rx ry rw rh)
+  "Flag the macroblocks this update rectangle touches.  glass already knows what changed, so the
+encoder never has to rediscover it by comparing the whole screen."
+  (let ((d (cap-dirty-mbs c)) (mc (cap-mb-cols c)) (mr (cap-mb-rows c)))
+    (loop for my from (floor ry 16) to (min (1- mr) (floor (+ ry rh -1) 16)) do
+      (loop for mx from (floor rx 16) to (min (1- mc) (floor (+ rx rw -1) 16)) do
+        (when (and (>= my 0) (>= mx 0)) (setf (aref d (+ (* my mc) mx)) 1))))))
 
 (defun %apply-rect (c rx ry rw rh data)
   "Convert one BGRX rectangle into the Y/U/V planes (BT.601, 4:2:0)."
@@ -105,7 +117,8 @@
                    (let* ((h (%rd s 12)) (rx (%be16 h 0)) (ry (%be16 h 2))
                           (rw (%be16 h 4)) (rh (%be16 h 6)) (enc (%be32 h 8)))
                      (cond
-                       ((= enc 0) (%apply-rect c rx ry rw rh (%rd s (* rw rh 4))))
+                       ((= enc 0) (%apply-rect c rx ry rw rh (%rd s (* rw rh 4)))
+                                  (%mark-dirty c rx ry rw rh))
                        (t (error "capture: unexpected encoding ~a" enc)))))
                  (setf (cap-dirty c) t)))
              (%request-update c t))                          ; ask for the next incremental
@@ -129,9 +142,13 @@
   (ignore-errors (close (cap-socket c))))
 
 (defun capture-take (c)
-  "If the desktop changed since the last call, return (values Y U V w h cw ch); else NIL."
+  "If the desktop changed since the last call, return (values Y U V w h dirty-mbs); else NIL.
+DIRTY-MBS flags exactly the macroblocks glass reported as updated, so the encoder can go straight
+to them instead of scanning the screen."
   (bt:with-lock-held ((cap-lock c))
     (when (cap-dirty c)
       (setf (cap-dirty c) nil)
-      (values (copy-seq (cap-y c)) (copy-seq (cap-u c)) (copy-seq (cap-v c))
-              (cap-width c) (cap-height c) (cap-cw c) (cap-ch c)))))
+      (let ((d (cap-dirty-mbs c)))
+        (setf (cap-dirty-mbs c) (make-array (length d) :element-type 'bit :initial-element 0))
+        (values (copy-seq (cap-y c)) (copy-seq (cap-u c)) (copy-seq (cap-v c))
+                (cap-width c) (cap-height c) d)))))
