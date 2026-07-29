@@ -150,21 +150,28 @@ active desktop), and on generic arithmetic it was costing ~14% of wall-clock."
                                 internal-time-units-per-second))
         (case msg
           (0 (%rd s 1)
-             (let ((n (%be16 (%rd s 2) 0)) (tc (get-internal-real-time)))
+             ;; Read the whole update off the socket BEFORE taking the lock.  Holding it across
+             ;; blocking reads meant capture-take (and therefore the encoder) stalled behind
+             ;; glass's network I/O, which showed up as a delivered frame rate far below the
+             ;; update rate.  The lock now covers only the (fast, typed) plane writes.
+             (let ((n (%be16 (%rd s 2) 0)) (rects '()) (tc 0))
+               (dotimes (i n)
+                 (let* ((h (%rd s 12)) (rx (%be16 h 0)) (ry (%be16 h 2))
+                        (rw (%be16 h 4)) (rh (%be16 h 6)) (enc (%be32 h 8)))
+                   (push (cond
+                           ((= enc 0) (list :raw rx ry rw rh (%rd s (* rw rh 4))))
+                           ((= enc 1) (let ((cp (%rd s 4)))
+                                        (list :copy rx ry rw rh (%be16 cp 0) (%be16 cp 2))))
+                           (t (error "capture: unexpected encoding ~a" enc)))
+                         rects)))
+               (setf tc (get-internal-real-time))
                (bt:with-lock-held ((cap-lock c))
-                 (dotimes (i n)
-                   (let* ((h (%rd s 12)) (rx (%be16 h 0)) (ry (%be16 h 2))
-                          (rw (%be16 h 4)) (rh (%be16 h 6)) (enc (%be32 h 8)))
-                     (cond
-                       ((= enc 0) (incf (cap-px c) (* rw rh))
-                                  (%apply-rect c rx ry rw rh (%rd s (* rw rh 4)))
-                                  (%mark-dirty c rx ry rw rh))
-                       ((= enc 1)                        ; CopyRect: 4 bytes of source coords
-                        (let* ((cp (%rd s 4)) (sx (%be16 cp 0)) (sy (%be16 cp 2)))
-                          (incf (cap-n-copy c))
-                          (%apply-copyrect c rx ry rw rh sx sy)
-                          (%mark-dirty c rx ry rw rh)))
-                       (t (error "capture: unexpected encoding ~a" enc)))))
+                 (dolist (r (nreverse rects))
+                   (destructuring-bind (kind rx ry rw rh a &optional b) r
+                     (ecase kind
+                       (:raw (incf (cap-px c) (* rw rh)) (%apply-rect c rx ry rw rh a))
+                       (:copy (incf (cap-n-copy c)) (%apply-copyrect c rx ry rw rh a b)))
+                     (%mark-dirty c rx ry rw rh)))
                  (setf (cap-dirty c) t)
                  (incf (cap-n-upd c))
                  (incf (cap-t-conv c) (/ (* 1000d0 (- (get-internal-real-time) tc))
