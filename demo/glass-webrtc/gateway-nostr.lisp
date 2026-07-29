@@ -460,7 +460,7 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                           pool (cl-nostr.nip59:build-giftwrap kp phone-pub reply))
                          (format t "~&@@ ~(~a~) from ~a... (~a) -> replied~%"
                                  verb who (if admin "allowlist" "enrolled device"))
-                         (finish-output))))))))
+                         (finish-output))))))))))
        (error (e) (format t "~&@@ signal error: ~a~%" e) (finish-output)))))
   (format t "@@ subscribed; waiting for gift-wrapped offers~%")
   (finish-output)
