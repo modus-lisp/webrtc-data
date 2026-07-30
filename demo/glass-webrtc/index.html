@@ -93,7 +93,7 @@
     (() => {
       const screen = document.getElementById('screen');
       const canvasOf = () => screen.querySelector('canvas');
-      const SENS = 1.6, TAP_MS = 250, TAP_SLOP = 10, SCROLL_PX = 24, ZMAX = 6;
+      const SENS = 1.6, TAP_MS = 250, TAP_SLOP = 10, SCROLL_PX = 24, ZMAX = 6, SL_SLOP = 30;
       const HOLD_MS = 500, ARM_AT = HOLD_MS / 2;             // press-and-hold to grab; arm at half
       let vx = 0, vy = 0, posInit = false, mask = 0;         // cursor (element px) + held buttons
       let lastX = 0, lastY = 0, startT = 0, moved = 0, fingers = 0;
@@ -101,6 +101,7 @@
       let zoom = 1, tx = 0, ty = 0;                          // our canvas transform (pan + zoom)
       let multi = false, multiT = 0, dPrev = 0, mpx = 0, mpy = 0, pinchMoved = 0;
       let slRAF = 0, slStart = 0, scrollLock = false, slAccX = 0, slAccY = 0;   // two-finger scroll-lock
+      let slBaseX = 0, slBaseY = 0, slBaseD = 0;             // hold-start baseline (net-displacement arming)
       const nowMs = () => performance.now();
       const dist = ts => Math.hypot(ts[0].clientX - ts[1].clientX, ts[0].clientY - ts[1].clientY);
       // white cursor drawn as SVG: an inner ring is the pointer; an outer arc grows clockwise as the
@@ -185,7 +186,8 @@
           dPrev = dist(e.touches);
           mpx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
           mpy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
-          scrollLock = false; placeClient(mpx, mpy); startSLHold();   // arm two-finger scroll-lock
+          scrollLock = false; placeClient(mpx, mpy);
+          slBaseX = mpx; slBaseY = mpy; slBaseD = dPrev; startSLHold();   // arm two-finger scroll-lock (net-displacement)
           return;
         }
         multi = false; const t = e.touches[0];               // fresh one-finger gesture
@@ -196,18 +198,23 @@
         e.preventDefault(); e.stopPropagation();
         if (e.touches.length >= 2) {                          // pinch = zoom, translate = pan/scroll
           cancelHold();
+          const d = dist(e.touches);
+          const mx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+          const my = (e.touches[0].clientY + e.touches[1].clientY) / 2;
           if (scrollLock) {                                   // scroll-lock: two-finger drag scrolls H+V; no zoom/pan
-            const mx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
-            const my = (e.touches[0].clientY + e.touches[1].clientY) / 2;
             const pdx = mx - mpx, pdy = my - mpy;
             slAccY += pdy; slAccX += pdx;
             while (Math.abs(slAccY) >= SCROLL_PX) { const dn = slAccY > 0; click(dn ? (1 << 4) : (1 << 3)); slAccY += dn ? -SCROLL_PX : SCROLL_PX; }
             while (Math.abs(slAccX) >= SCROLL_PX) { const rt = slAccX > 0; click(rt ? (1 << 6) : (1 << 5)); slAccX += rt ? -SCROLL_PX : SCROLL_PX; }
-            dPrev = dist(e.touches); mpx = mx; mpy = my; placeClient(mx, my); ringGrab(); return;
+            dPrev = d; mpx = mx; mpy = my; placeClient(mx, my); ringGrab(); return;
           }
-          const d = dist(e.touches);
-          const mx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
-          const my = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+          if (slRAF) {                                        // ring still arming: park (no zoom/pan) unless a real pinch/pan
+            if (Math.hypot(mx - slBaseX, my - slBaseY) > SL_SLOP || Math.abs(d - slBaseD) > SL_SLOP) {
+              cancelSL();                                     // deliberate movement -> fall through to pinch/pan
+            } else {
+              dPrev = d; mpx = mx; mpy = my; placeClient(mx, my); return;   // held still -> keep arming the ring
+            }
+          }
           if (dPrev > 0) {
             const z2 = Math.max(1, Math.min(ZMAX, zoom * d / dPrev));
             if (z2 !== zoom) {                                // zoom about the pinch midpoint
@@ -224,7 +231,6 @@
             }
           }
           pinchMoved += Math.abs(d - dPrev) + Math.abs(pdx) + Math.abs(pdy);
-          if (slRAF && pinchMoved > TAP_SLOP) cancelSL();     // moved before the ring closed -> normal pinch/pan
           dPrev = d; mpx = mx; mpy = my; place(); return;
         }
         if (multi) { lastX = e.touches[0].clientX; lastY = e.touches[0].clientY; return; }  // leftover finger
