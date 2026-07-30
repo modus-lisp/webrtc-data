@@ -396,7 +396,6 @@
       // Hold two fingers still and the ring arms at their midpoint; when it closes, "scroll lock"
       // engages: two-finger drag then scrolls content BOTH axes (wheel events) and no longer
       // zooms/pans the view.  Move before it closes -> arming cancels -> normal pinch/zoom/pan.
-      const placeClient = (x, y) => { cur.style.left = x + 'px'; cur.style.top = y + 'px'; cur.style.display = 'block'; };
       const cancelSL = () => { if (slRAF) { cancelAnimationFrame(slRAF); slRAF = 0; } if (!scrollLock) ringIdle(); };
       const startSLHold = () => {                            // arm scroll-lock; a real pinch/pan cancels it
         slStart = nowMs();
@@ -417,7 +416,7 @@
           dPrev = dist(e.touches);
           mpx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
           mpy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
-          scrollLock = false; placeClient(mpx, mpy);
+          scrollLock = false; place();
           slBaseX = mpx; slBaseY = mpy; slBaseD = dPrev; startSLHold();   // arm two-finger scroll-lock (net-displacement)
           return;
         }
@@ -437,13 +436,13 @@
             slAccY += pdy; slAccX += pdx;
             while (Math.abs(slAccY) >= SCROLL_PX) { const dn = slAccY > 0; click(dn ? (1 << 4) : (1 << 3)); slAccY += dn ? -SCROLL_PX : SCROLL_PX; }
             while (Math.abs(slAccX) >= SCROLL_PX) { const rt = slAccX > 0; click(rt ? (1 << 6) : (1 << 5)); slAccX += rt ? -SCROLL_PX : SCROLL_PX; }
-            dPrev = d; mpx = mx; mpy = my; placeClient(mx, my); ringGrab(); return;
+            dPrev = d; mpx = mx; mpy = my; place(); ringGrab(); return;
           }
           if (slRAF) {                                        // ring still arming: park (no zoom/pan) unless a real pinch/pan
             if (Math.hypot(mx - slBaseX, my - slBaseY) > SL_SLOP || Math.abs(d - slBaseD) > SL_SLOP) {
               cancelSL();                                     // deliberate movement -> fall through to pinch/pan
             } else {
-              dPrev = d; mpx = mx; mpy = my; placeClient(mx, my); return;   // held still -> keep arming the ring
+              dPrev = d; mpx = mx; mpy = my; place(); return;   // held still -> keep arming the ring
             }
           }
           if (dPrev > 0) {
