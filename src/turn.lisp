@@ -118,19 +118,29 @@ WANT-TYPES, or TIMEOUT elapses.  Returns (values type attrs) or NIL.  Non-matchi
                       (return (values type attrs)))))))))))))
 
 (defun %turn-request (alloc type extra &key (want-success nil) (timeout 2.0) authed)
-  "Send one TURN request of TYPE with EXTRA attrs (auth attrs + MI added when AUTHED) and wait,
-via the shared socket, for its reply.  Returns (values success-type-or-error-type attrs tid).
-Use only BEFORE ice-serve starts (it reads the socket directly)."
+  "Send a TURN request of TYPE with EXTRA attrs (auth attrs + MI added when AUTHED) and wait, via
+the shared socket, for its reply.  Retransmits the SAME request (same transaction id, so it is
+idempotent — the server dedupes by txid and never double-allocates) on a STUN-style backoff until
+a matching reply arrives or TIMEOUT elapses, so a single dropped datagram (common on lossy/cellular
+paths) no longer fails the whole transaction (RFC 5389 §7.2.1).  Returns (values
+success-type-or-error-type attrs tid).  Use only BEFORE ice-serve starts (it reads the socket)."
   (let* ((tid (stun-transaction-id))
          (attrs (if authed (%turn-auth-attrs alloc extra) extra))
          (msg (encode-stun type tid attrs
-                           :integrity-key (and authed (turn-alloc-key alloc)))))
-    (%send-to-server alloc msg)
-    (multiple-value-bind (rtype rattrs)
-        (%recv-stun-blocking (turn-alloc-socket alloc) tid
-                             (list want-success (logior type #x0110)) ; success | error type
-                             timeout)
-      (values rtype rattrs tid))))
+                           :integrity-key (and authed (turn-alloc-key alloc))))
+         (want (list want-success (logior type #x0110)))   ; success | error type
+         (deadline (+ (get-internal-real-time) (round (* timeout internal-time-units-per-second))))
+         (rto 0.5))
+    (flet ((remain () (/ (- deadline (get-internal-real-time)) internal-time-units-per-second)))
+      (loop
+        (%send-to-server alloc msg)                        ; (re)transmit — same tid, idempotent
+        (let ((r (remain)))
+          (when (<= r 0) (return (values nil nil tid)))
+          (multiple-value-bind (rtype rattrs)
+              (%recv-stun-blocking (turn-alloc-socket alloc) tid want (min rto r))
+            (when rtype (return (values rtype rattrs tid))))
+          (when (<= (remain) 0) (return (values nil nil tid)))
+          (setf rto (min 2.0 (* rto 2))))))))
 
 ;;; ---- Allocate (RFC 5766 §6) ------------------------------------------------------------
 
