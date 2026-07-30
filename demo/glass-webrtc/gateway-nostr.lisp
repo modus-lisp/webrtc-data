@@ -254,6 +254,14 @@ silently drop CODE.)"
     s))
 
 (defvar *last-assoc* nil)
+
+;; Connection health, counted rather than only logged.  These ride the stats file, so the pipeline
+;; monitor shows them: a failed session should be visible in the UI instead of buried in a log nobody
+;; is tailing at the moment it happens.
+(defvar *sessions-ok* 0)
+(defvar *sessions-failed* 0)
+(defvar *last-error* nil)
+(defvar *no-relay-count* 0)
 ;; VP8 payload type the browser assigned in its offer (dynamic, varies) — bound per session.
 (defvar *video-pt* nil)
 ;; VIDEO_PRIMARY=1 -> the desktop is delivered as VP8 video, and the RFB data channel is used for
@@ -304,6 +312,10 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                             :on-stats (lambda (v)
                                         (write-stats
                                          (list :video v
+                                               :sessions-ok *sessions-ok*
+                                               :sessions-failed *sessions-failed*
+                                               :no-relay *no-relay-count*
+                                               :last-error *last-error*
                                                :devices (hash-table-count *devices*)
                                                :glass (list :host *glass-host* :port *glass-port*)
                                                :qi-base *video-qi* :target-kbs *video-target-kbs*)))
@@ -319,6 +331,7 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                 :on-ready
                 (lambda (assoc sid)
                   (setf glass (glass-connect) *last-assoc* assoc)
+                  (incf *sessions-ok*)
                   (format *error-output* "~&[gw-nostr] channel open -> glass ~a:~a~%"
                           *glass-host* *glass-port*)
                   ;; glass -> browser: one message per read (SCTP fragments it)
@@ -359,7 +372,11 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                       (if (and *video-primary* (= 10 (length bytes)) (= 3 (aref bytes 0)))
                           nil
                           (sb-bsd-sockets:socket-send glass bytes (length bytes))))))))
-           (error (e) (format *error-output* "~&[gw-nostr] session error: ~a~%" e)))
+           (error (e)
+             (incf *sessions-failed*)
+             (setf *last-error* (let ((s (princ-to-string e)))
+                                  (subseq s 0 (min 72 (length s)))))
+             (format *error-output* "~&[gw-nostr] session error: ~a~%" e)))
       (when cap (ignore-errors (capture-stop cap)))
       (when video-stop (ignore-errors (funcall video-stop)))
       (when audio-stop (ignore-errors (funcall audio-stop)))
@@ -377,6 +394,20 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                              ;; a plist -> ice-gather-relay keys; a longer timeout so the Allocate
                              ;; reliably completes (2s was racy under load).
                              :gather-relay (and (uiop:getenv "TURN_SERVER") (list :timeout 6.0)))))
+    ;; A missing relay candidate is THE failure that kills cellular: without it a hard-NAT peer has
+    ;; no pairable path at all, and the symptom ("no ICE peer within 20s") appears 20 s later at the
+    ;; far end, which is a terrible place to learn it.  So if gathering produced no relay, retry once
+    ;; — an Allocate lost to a single dropped packet is worth ~150 ms to recover — and if it still
+    ;; fails, say so loudly and count it.
+    (when (and (uiop:getenv "TURN_SERVER") (null (ice-agent-relay-ip agent)))
+      (format t "~&@@ WARN no relay candidate — retrying TURN allocate~%")
+      (finish-output)
+      (ignore-errors (ice-gather-relay agent :timeout 6.0))
+      (unless (ice-agent-relay-ip agent)
+        (incf *no-relay-count*)
+        (setf *last-error* "no relay candidate (cellular peers cannot pair)")
+        (format t "~&@@ ERROR still no relay candidate: a hard-NAT peer WILL fail to connect~%")
+        (finish-output)))
     ;; What we actually advertised: without a relay line a hard-NAT (cellular) peer has no
     ;; pairable path, so log it per answer — this is the first thing to check on "ice failed".
     (format t "~&@@ ice: srflx=~a:~a relay=~a:~a  peer-cands=~a~%"
