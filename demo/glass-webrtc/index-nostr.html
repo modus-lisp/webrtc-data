@@ -178,6 +178,8 @@
     const rfb = new RFB(document.getElementById('screen'), ch, {});
     rfb.scaleViewport = true;
     rfb.focusOnClick = true;
+    rfb.showDotCursor = true;      // desktop: draw a dot when the remote cursor is empty, so a
+                                   // mouse user is never left with no pointer at all
     rfb.addEventListener('connect', () => { log('RFB connected'); rfb.focus(); });
     rfb.addEventListener('disconnect', e => log('RFB disconnect', e.detail));
 
