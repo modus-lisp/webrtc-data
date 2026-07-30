@@ -149,6 +149,17 @@
 ;; unless refreshed by connecting.  Enrolments are persisted because the gateway restarts often
 ;; (a keepalive supervises it) and an in-memory set would silently un-enrol every device on deploy.
 (defparameter *device-ttl* (or (ignore-errors (parse-integer (uiop:getenv "DEVICE_TTL"))) 86400))
+;; Live pipeline stats, written as data rather than only logged, so a UI can present them instead of
+;; a human grepping the log.  Same file-as-source-of-truth arrangement as the device store: any
+;; process can read it, no IPC.
+(defparameter *stats-file* (or (uiop:getenv "STATS_FILE") "/tmp/glass-stats.sexp"))
+(defun write-stats (plist)
+  (handler-case
+      (with-open-file (s *stats-file* :direction :output :if-exists :supersede
+                                      :if-does-not-exist :create)
+        (let ((*print-readably* nil) (*print-pretty* nil))
+          (prin1 plist s) (terpri s)))
+    (error () nil)))
 (defparameter *device-file*
   (or (uiop:getenv "DEVICE_FILE")
       ;; make-pathname with an explicit :type nil — merge-pathnames would inherit "lisp" from
@@ -290,6 +301,12 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                             :qi *video-qi* :fps *video-fps*
                             :max-qi *video-max-qi* :target-kbs *video-target-kbs*
                             :source (when cap (lambda () (capture-take cap)))
+                            :on-stats (lambda (v)
+                                        (write-stats
+                                         (list :video v
+                                               :devices (hash-table-count *devices*)
+                                               :glass (list :host *glass-host* :port *glass-port*)
+                                               :qi-base *video-qi* :target-kbs *video-target-kbs*)))
                             :log (lambda (m)
                                    (let ((cs (and cap (capture-stats cap))))
                                      (format *error-output* "~&[video] ~a~@[ | glass wait ~,0fms conv ~,0fms upd ~a px ~a copies ~a rc ~a~]~%"
@@ -360,6 +377,12 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                              ;; a plist -> ice-gather-relay keys; a longer timeout so the Allocate
                              ;; reliably completes (2s was racy under load).
                              :gather-relay (and (uiop:getenv "TURN_SERVER") (list :timeout 6.0)))))
+    ;; What we actually advertised: without a relay line a hard-NAT (cellular) peer has no
+    ;; pairable path, so log it per answer — this is the first thing to check on "ice failed".
+    (format t "~&@@ ice: srflx=~a:~a relay=~a:~a  peer-cands=~a~%"
+            (ice-agent-srflx-ip agent) (ice-agent-srflx-port agent)
+            (ice-agent-relay-ip agent) (ice-agent-relay-port agent)
+            (length (ice-agent-remote-candidates agent)))
     (ice-serve agent)
     (ice-start-checks agent)                                    ; punch our NAT toward the phone
     (setf *video-pt*                                            ; VP8 pt from the offer, if it wants video
