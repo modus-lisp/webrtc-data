@@ -167,9 +167,29 @@ TURN_SERVER/TURN_USER/TURN_PASS.  Best-effort — returns T on success.  MUST ru
                              (turn-alloc-mapped-ip alloc) (not (ice-agent-srflx-ip agent)))
                     (setf (ice-agent-srflx-ip agent) (turn-alloc-mapped-ip alloc)
                           (ice-agent-srflx-port agent) (turn-alloc-mapped-port alloc)))
-                  ;; Pre-install permission+channel for each known peer candidate.
-                  (dolist (c (ice-agent-remote-candidates agent))
-                    (ignore-errors (turn-install-peer alloc (ice-candidate-ip c) (ice-candidate-port c))))
+                  ;; Pre-install permissions for the peer's candidates — but ONE PER UNIQUE IP,
+                  ;; and permissions only.
+                  ;;
+                  ;; A TURN permission is keyed on the peer's IP ADDRESS, not on ip:port (RFC 5766
+                  ;; §9; our own PERMS table is keyed that way too).  A modern browser offers dozens
+                  ;; of candidates that share a handful of IPs — a recent cellular offer carried 66
+                  ;; candidates, 45 of them srflx, from only a few addresses.  Doing
+                  ;; CreatePermission+ChannelBind per CANDIDATE therefore meant ~132 blocking
+                  ;; round-trips to a TURN server across the internet, before the answer could be
+                  ;; sent: redundant, slow, and it burned a channel number per candidate.  Worse, it
+                  ;; failed silently under IGNORE-ERRORS, so the permission that actually mattered —
+                  ;; the one for the address the peer really checks from — could simply never land,
+                  ;; and the peer's checks were then dropped by the server.  Which looks exactly like
+                  ;; "ice failed / no pair" with a relay candidate present on both sides.
+                  ;;
+                  ;; ChannelBind is a SEND-side optimization, not a prerequisite for receiving, so it
+                  ;; is left to ICE-BIND-RELAY-PEER-ASYNC once traffic actually arrives.
+                  (let ((seen (make-hash-table :test 'equal)))
+                    (dolist (c (ice-agent-remote-candidates agent))
+                      (let ((ip (ice-candidate-ip c)))
+                        (unless (gethash ip seen)
+                          (setf (gethash ip seen) t)
+                          (ignore-errors (turn-create-permission alloc ip))))))
                   ;; Behind an frp/reverse-proxy TURN, the peer's packets reach the server from the
                   ;; PROXY's address, not the peer's — so pre-permit that IP (env TURN_RELAY_PEER) or
                   ;; the server drops the peer's first packet.  ICE-BIND-RELAY-PEER-ASYNC then binds a

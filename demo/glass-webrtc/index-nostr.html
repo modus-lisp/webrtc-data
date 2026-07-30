@@ -130,17 +130,34 @@
           syncVideo();
           // the loading overlay is normally dismissed by the first VNC framebuffer update, but
           // video-primary suppresses those entirely — so dismiss it on the first VIDEO frame.
-          const firstFrame = () => { syncVideo(); hideConn(); };
-          vidEl.addEventListener('loadeddata', firstFrame, { once: true });
-          vidEl.addEventListener('playing', firstFrame, { once: true });
+          // Dismiss on a REAL first frame.  requestVideoFrameCallback fires per presented frame,
+          // so it is the only honest signal here — 'playing' and 'unmute' both fire on negotiation,
+          // before any pixels exist.
+          const firstFrame = () => { syncVideo(); hideConn(); diag('first video frame'); };
           if (vidEl.requestVideoFrameCallback) vidEl.requestVideoFrameCallback(firstFrame);
-          setTimeout(firstFrame, 8000);           // belt-and-braces: never strand the overlay
+          else vidEl.addEventListener('loadeddata', firstFrame, { once: true });
+          // A timed failsafe must NOT hide the overlay: a blank screen with no explanation is worse
+          // than a spinner.  If nothing has arrived by now, say what state we are actually in.
+          setTimeout(() => {
+            if (connHidden) return;
+            if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+              setConnRaw('Connected — waiting for the first frame…');
+            } else {
+              setConnRaw('Could not reach your desktop');
+              connMsg.insertAdjacentHTML('afterend',
+                '<div style="max-width:22em;font-size:13px;line-height:1.5;opacity:.75;margin-top:2px">' +
+                'The connection did not establish (ICE ' + pc.iceConnectionState + ').<br>' +
+                'Tap ≡ for the log, or reload to try again.</div>');
+              const sp = connEl.querySelector('.spinner'); if (sp) sp.style.display = 'none';
+            }
+          }, 12000);
           diag('video is the primary view');
         } else {
           vidEl.style.display = '';
         }
         const vp = vidEl.play && vidEl.play(); if (vp && vp.catch) vp.catch(() => {});
-        e.track.addEventListener('unmute', () => { diag('video unmuted — frames arriving'); if (videoPrimary) syncVideo(); });
+        // unmute fires on negotiation, not on pixels — do not claim frames from it
+        e.track.addEventListener('unmute', () => { diag('video track unmuted (negotiated)'); if (videoPrimary) syncVideo(); });
         return;
       }
       diag('audio track from box (muted)');
@@ -553,7 +570,13 @@
     applyDbg();
     window.addEventListener('error', e => diag('JS-ERROR ' + (e.message || e.error)));
     window.addEventListener('unhandledrejection', e => diag('REJECT ' + ((e.reason && e.reason.message) || e.reason)));
-    pc.addEventListener('iceconnectionstatechange', () => diag('ice ' + pc.iceConnectionState));
+    pc.addEventListener('iceconnectionstatechange', () => {
+      diag('ice ' + pc.iceConnectionState);
+      if (pc.iceConnectionState === 'failed' && !connHidden) {
+        setConnRaw('Could not reach your desktop');
+        const sp = connEl.querySelector('.spinner'); if (sp) sp.style.display = 'none';
+      }
+    });
     pc.addEventListener('connectionstatechange', () => diag('conn ' + pc.connectionState));
     pc.addEventListener('icegatheringstatechange', () => diag('gather ' + pc.iceGatheringState));
     pc.addEventListener('icecandidateerror', e => diag(`cand-err ${e.errorCode} ${e.url || ''} ${(e.errorText || '').slice(0,40)}`));

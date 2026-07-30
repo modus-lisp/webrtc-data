@@ -207,6 +207,9 @@ with long-term credentials.  On success record the XOR-RELAYED-ADDRESS + LIFETIM
 (defun turn-create-permission (alloc peer-ip &key (timeout 2.0))
   "Install a permission so the server relays peer->us traffic from PEER-IP (a dotted string).
 Idempotent per IP within an allocation's permission lifetime."
+  ;; already permitted: skip the round trip.  Permissions are per-IP, and a browser offers
+  ;; many candidates per address.
+  (when (gethash peer-ip (turn-alloc-perms alloc)) (return-from turn-create-permission t))
   (multiple-value-bind (rtype)
       (%turn-request alloc +turn-create-perm+
                      (list (cons +attr-xor-peer-address+ (xor-mapped-address (%inet peer-ip) 0)))
