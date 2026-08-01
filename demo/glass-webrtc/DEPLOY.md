@@ -13,13 +13,12 @@ pipeline is generated from it.
 | `nsite-index.html` (build dir) | `index-nostr.html` with the bundle spliced back in place of the module body | no — generated |
 | `index.html`, `index-ws.html` | older standalone pages, each with its own hand-copied gesture layer | only for local `gateway.lisp` testing |
 
-An earlier version of this file had the relationship backwards — it named `entry.mjs` as the real
-source and said `index-nostr.html` never reaches the phone. Following that would mean editing a
-generated file and losing the work at the next build. The deployed blob demonstrably carries
-`index-nostr.html`'s markup (its overlay and diag strings are present verbatim).
+The direction matters: `mkbundle.py` reads `index-nostr.html` and *writes* `entry.mjs`, so edits to
+`entry.mjs` are destroyed by the next build. (The deployed blob carries `index-nostr.html`'s markup
+verbatim, which is how to confirm this for yourself.)
 
-`index.html` / `index-ws.html` *are* separate copies, and the warning holds for them: a touch-layer
-fix applied there has no effect on the device.
+`index.html` / `index-ws.html` are genuinely separate copies of the touch layer, so a fix applied
+there has no effect on the device.
 
 ## The pipeline
 
@@ -69,27 +68,78 @@ publishing rewrites the whole site's root, so treat it as a deploy, not a test.
 same path in the manifest, so the browser is free to serve its cached copy — that is why `?v=`
 never busted anything. A new path cannot be mistaken for the previous build.
 
-Keep `LOGIN_URL_BASE` (in the gateway's keepalive env) pointing at a path that exists; the box mints
-login links from it. It is read **once, at gateway start** (`defparameter` + `getenv`), so editing
-the keepalive script is not enough — restart the gateway or it keeps handing out the old path.
+## Shipping a change: the whole procedure
 
-## Knowing what is actually live
-
-Editing the source, building, and publishing are three separate steps, and stopping after step one
-or two leaves no visible trace. The only source of truth for what the phone gets is the blob hash:
+Edit, build, and publish are three separate steps, and stopping after any one of them leaves no
+visible trace — the phone just keeps loading the old page. Do all six:
 
 ```sh
-sha256sum <build-dir>/nsite-index.html      # what you built
-grep 'site hash' <publish log>              # what was published
+# 1. edit the source (the ONLY file you edit)
+$EDITOR index-nostr.html
+
+# 2. build — self-check must read "leftover esm.sh: 0 | import-from-url: 0"
+cd <build-dir> && python3 mkbundle.py
+
+# 3. publish under a NEW tag — watch for at least one "accepted=T"
+SITE_VERSION=k25 sbcl --script publish.lisp
+
+# 4. verify all four hops; every line should say MATCH
+sbcl --script check-deploy.lisp <build-dir>/nsite-build/nsite-index.html
+
+# 5. aim the login links at whatever step 4 says is actually serving the new build
+#    (in the gateway's keepalive env), then RESTART the gateway — LOGIN_URL_BASE is
+#    read once at startup, so editing the script alone changes nothing
+export LOGIN_URL_BASE='https://<npub>.nsite.lol/k25.html'   # or the blob URL, below
+
+# 6. DM the box "link" and load the result
 ```
 
-If they differ, the build was never published. As of this writing they *do* differ — the build dir
-holds `5337f775…` while the live `/k23.html` is `d93fd843…`, and `index-nostr.html` has been edited
-again since that build. So there are two generations of changes not on the device, which is exactly
-the state that produces "I fixed it but the phone still misbehaves."
+`check-deploy.lisp` (in this directory) walks build → Blossom → relays → gateway and prints what
+each hop holds, so the first mismatch names the broken hop. It is read-only and needs no secret:
 
-Nothing warns you about this. Publishing is cheap (~50 s); when in doubt, rebuild and republish
-under a new tag.
+```
+[build]   f05ec8fc28ba0348  …/nsite-index.html
+[blossom] https://cdn.hzrd149.com    http 200 f05ec8fc28ba0348  MATCH
+[relays]  kind 15128  /k24a.html -> f05ec8fc28ba0348  MATCH
+[gateway] /index.html    http 200  d93fd8435746fca4  *** STALE — serving an older build ***
+```
+
+## Delivering the page: two URLs
+
+| URL | current? | notes |
+|---|---|---|
+| `https://<site-npub>.nsite.lol/<tag>.html` | **only if the gateway has caught up** | the nice URL; stable origin, so an enrolled device key persists |
+| `https://cdn.hzrd149.com/<blob-sha256>` | **always** | the blob itself, straight from Blossom |
+
+The blob URL works because the published page is entirely self-contained — that is exactly what the
+build's `import-from-url 0` check guarantees — and because `#box=…&code=…` is a client-side
+fragment. Use it whenever the gateway is stale, or to test a build before publishing at all.
+
+One consequence worth knowing: the blob URL is a **different origin**, so `localStorage` starts
+empty there and the phone's enrolled device key does not carry over. It re-enrols on first connect
+using the code in the link, which is invisible in practice — but it does mean the box will show a
+second enrolled terminal for that phone.
+
+## If the gateway will not pick it up
+
+This has happened, and it is not something this repo can fix. What was established:
+
+- the blob was on **both** Blossom servers, fetchable by hash, `200 text/html`
+- the kind-15128 manifest was on nos.lol and relay.primal.net, naming the new blob for `/`,
+  `/index.html` and `/<tag>.html`
+- the site's own kind-10002 list names damus / nos.lol / primal — so a gateway following it would
+  find the manifest
+- the gateway nonetheless served a blob it had cached **14 hours earlier**, with
+  `cache-control: max-age=3600` and a matching stale `etag`, and returned 404 for the new path
+  (the signature of a cached *manifest*: it is answering from an older file list)
+
+So: relays fine, Blossom fine, gateway stuck. **Do not switch event kinds to chase it.** Publishing
+the legacy kind-34128 per-path events as an experiment changed nothing — they were accepted by
+damus/nos.lol/primal, pointed at the correct blob, and the gateway still served the old build.
+
+Fall back to the blob URL and move on. `nsite.gs` did not resolve when tried as an alternate
+gateway; if another public nsite gateway is available it is worth a try, since the manifest is
+already correct and public.
 
 ## Where the build dir is
 
@@ -131,38 +181,7 @@ The gateway's 404 page suggests nsyte, but neither `nsyte` nor `deno` is install
 no nsyte config — `k23` was published with this same `publish.lisp`. So kind **15128** is the format
 this site actually uses and it does work; do not switch formats to chase a 404. (Publishing legacy
 kind-34128 per-path events as an experiment changed nothing — they were accepted by damus/nos.lol/
-primal and the gateway still served the old build.)
-
-## Current state — built and published, not yet served
-
-As of this writing the pipeline is verified end to end **except** the last hop:
-
-| stage | state |
-|---|---|
-| source `index-nostr.html` | has both pending fixes (committed) |
-| build `nsite-index.html` | `f05ec8fc28ba0348…`, clean self-check (`esm.sh 0 / import-from-url 0`) |
-| Blossom | `f05ec8fc…` fetchable, `200 text/html`, from `cdn.hzrd149.com` |
-| relays | manifest accepted (`accepted=T`), and a query returns it with `path /k24a.html -> f05ec8fc…` |
-| **gateway** | **still serves `d93fd843…` (k23) at `/index.html`, 404 on `/k24a.html`** |
-
-So the manifest is live and correct on the relays; the gateway has not picked it up. Cause not
-established — most likely gateway-side caching. Left for whoever deploys next: re-publish under a
-fresh tag with the fixed publisher and see whether it appears; if it still does not, the question is
-which relays *the gateway* reads (its view came from somewhere) rather than anything in this repo.
-
-**Not yet on the device**, waiting on that last hop:
-- scroll-lock no longer moves the cursor to the two-finger midpoint (the ring stays at the pointer,
-  where it can actually be seen)
-- `rfb.showDotCursor = true` so a desktop mouse user is never left with no pointer at all
-
-**Serving the blob directly bypasses the gateway** — the page is self-contained (that is what the
-build's `import-from-url 0` check guarantees), and the `#box=…&code=…` fragment is client-side:
-
-```
-https://cdn.hzrd149.com/<blob-sha256>#box=<box-npub>&code=<code>
-```
-
-Useful for testing a build before, or instead of, waiting on the gateway.
+primal and the gateway still served the old build — see "If the gateway will not pick it up".)
 
 ## Recommendation
 
