@@ -1,1 +1,9 @@
 *.fasl
+
+# Runtime state, not source: the gateway rewrites this as terminals enrol and lapse, and it holds
+# device pubkeys.  Tracking it made every session show up as a diff.
+demo/glass-webrtc/.glass-devices
+
+# Holds live TURN credentials and the box's allowlist.  The launcher is deliberately NOT in the
+# repo; see DEPLOY.md / README for the variables it sets.
+demo/glass-webrtc/gw-keepalive.sh
