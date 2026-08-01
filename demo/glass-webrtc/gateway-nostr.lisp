@@ -93,6 +93,8 @@
             ((or (string= verb "help") (string= verb "?")) (values :help nil))
             (t nil)))))
 
+(defun %unix-now () (- (get-universal-time) (encode-universal-time 0 0 0 1 1 1970 0)))
+
 (defun describe-devices ()
   "Human-readable listing of enrolled terminals."
   (sync-devices)
@@ -136,7 +138,10 @@
 (defparameter *nsite-npub*
   (or (uiop:getenv "NSITE_NPUB")
       "npub1ajvjnhgcmdxkng22lzsh22qvl63es78gk6p9mwksepju974teguq4l4evc"))
-(defparameter *link-base*                       ; LOGIN_URL_BASE lets us aim at a cache-busted ?v= URL
+;; LOGIN_URL_BASE aims the link at a specific published build.  It must name a PATH (/k23.html), not
+;; a ?v= query: an nsite gateway resolves a request by path against the kind-15128 manifest, so a
+;; query string selects the same blob and the browser is free to keep serving its cached copy.
+(defparameter *link-base*
   (or (uiop:getenv "LOGIN_URL_BASE") (format nil "https://~a.nsite.lol/" *nsite-npub*)))
 (defparameter *link-ttl* (or (ignore-errors (parse-integer (uiop:getenv "LINK_TTL"))) 1800))
 
@@ -172,8 +177,6 @@
 (defvar *devices* (make-hash-table :test 'equal))     ; pubkey-hex -> expiry (unix)
 (defvar *devices-lock* (bt:make-lock))
 (defvar *devices-mtime* nil)
-
-(defun %unix-now () (- (get-universal-time) (encode-universal-time 0 0 0 1 1 1970 0)))
 
 (defun load-devices ()
   (handler-case
@@ -276,8 +279,64 @@ silently drop CODE.)"
 ;; once the screen is quiet, coarsely-coded macroblocks are re-coded at VIDEO_QI.
 (defparameter *video-max-qi* (or (ignore-errors (parse-integer (uiop:getenv "VIDEO_MAX_QI"))) 44))
 (defparameter *video-target-kbs* (or (ignore-errors (parse-integer (uiop:getenv "VIDEO_TARGET_KBS"))) 150))
+;; VIDEO_TARGET_KBS is not only a rate: the sender paces a big frame's packets at that rate, and
+;; the pacing sleeps in the encode loop — so it also bounds how often the screen is looked at at
+;; all.  Set too low, a scroll is answered by fewer, larger jumps and the viewer falls behind.
+;; VIDEO_MAX_FRAME_KB bounds a SINGLE frame (latency, not average rate); macroblocks that do not
+;; fit are carried into the next one.  VIDEO_CLEANUP_MS is how long the screen must be quiet
+;; before coarsely-coded macroblocks are re-coded at VIDEO_QI.
+(defparameter *video-max-frame-kb* (or (ignore-errors (parse-integer (uiop:getenv "VIDEO_MAX_FRAME_KB"))) 32))
+(defparameter *video-cleanup-ms* (or (ignore-errors (parse-integer (uiop:getenv "VIDEO_CLEANUP_MS"))) 700))
 
-(defun run-session (conn agent)
+;;; ---- one live session per terminal ------------------------------------------
+;; A phone never says goodbye.  It locks its screen, changes network, or just reloads the page and
+;; offers again — and nothing in WebRTC tells the answerer the old session died.  Sessions used to run
+;; to their full DURATION regardless, so every reconnect STACKED another live one: another TURN
+;; allocation (coturn enforces a per-user quota over a finite relay-port range), another RFB
+;; connection to glass, and another VP8 encoder pumping frames at a peer that stopped listening.
+;; Three reconnects in, we are competing with ourselves for the bandwidth we are trying to measure.
+;;
+;; So: at most one session per terminal, enforced two ways.  A new offer retires that pubkey's
+;; previous session before answering, and every session also dies on its own once the peer goes quiet
+;; — which is the case a registry cannot catch, the phone that leaves and never comes back.
+;;
+;; A DUPLICATE OFFER IS NOT A RECONNECT, and telling them apart is what makes any of this safe.  We
+;; subscribe to three relays, so one published offer reaches us three-plus times; retiring on each
+;; copy closes the very agent the phone is completing checks against, and the connection dies with
+;; "ice failed / no pair" while the box logs a perfectly healthy answer.  The ICE ufrag is the
+;; discriminator: it is minted per PeerConnection, so copies of one offer share it and a genuine new
+;; offer never does.  Same ufrag => re-send the SAME answer and touch nothing, which is also the
+;; right response to a phone that simply missed the first one.
+
+(defstruct (sess (:conc-name sess-)) ufrag agent answer (at 0))
+
+(defvar *live* (make-hash-table :test 'equal))     ; phone pubkey -> its live SESS
+(defvar *live-lock* (bt:make-lock))
+(defparameter *peer-silence-limit* 30.0)           ; RFC 7675 consent is 30s; match it
+
+(defun forget-session (pub agent)
+  "Drop PUB's registry entry, but only if it is still AGENT — a reconnect may already have replaced it."
+  (bt:with-lock-held (*live-lock*)
+    (let ((s (gethash pub *live*)))
+      (when (and s (eq agent (sess-agent s))) (remhash pub *live*)))))
+
+(defun retire-session (pub &key (why "superseded"))
+  "Close PUB's live session, if any.  Closing the ICE agent is what ends it: the session loop's
+ALIVE-P sees the agent stopped and unwinds, which is what releases the TURN allocation."
+  (let ((old (bt:with-lock-held (*live-lock*)
+               (prog1 (gethash pub *live*) (remhash pub *live*)))))
+    (when old
+      (format t "~&@@ retiring previous session for ~a... (~a)~%" (subseq pub 0 8) why)
+      (finish-output)
+      (ignore-errors (ice-close (sess-agent old))))))
+
+(defun peer-alive-p (agent)
+  "NIL once the agent is closed or the peer has been silent past the consent limit."
+  (and (not (ice-agent-stop agent))
+       (let ((quiet (ice-silent-secs agent)))
+         (or (null quiet) (< quiet *peer-silence-limit*)))))
+
+(defun run-session (conn agent &key pub)
   "Drive DTLS, run the data channel, and bridge it to glass once the channel opens.
 Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
   (let ((glass nil) (audio-stop nil) (video-stop nil) (cap nil))
@@ -310,6 +369,7 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                             agent (dtls-conn-session conn) ctx :pt *video-pt*
                             :qi *video-qi* :fps *video-fps*
                             :max-qi *video-max-qi* :target-kbs *video-target-kbs*
+                            :max-frame-kb *video-max-frame-kb* :cleanup-ms *video-cleanup-ms*
                             :source (when cap (lambda () (capture-take cap)))
                             :on-stats (lambda (v)
                                         (write-stats
@@ -326,10 +386,12 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                                      (format *error-output* "~&[video] ~a~@[ | glass wait ~,0fms conv ~,0fms upd ~a px ~a copies ~a rc ~a~]~%"
                                              m (and cs (getf cs :wait-ms)) (and cs (getf cs :convert-ms))
                                              (and cs (getf cs :updates)) (and cs (getf cs :px)) (and cs (getf cs :copies)) (and cs (getf cs :reconnects))))))))
-                   (format *error-output* "~&[gw-nostr] video started — VP8 pt=~a qi=~a fps=~a~%"
-                           *video-pt* *video-qi* *video-fps*)))
+                   (format *error-output* "~&[gw-nostr] video started — VP8 pt=~a qi=~a fps=~a maxqi=~a target=~aKB/s frame<=~aKB cleanup=~ams backlog-qi=~a/~ax~%"
+                           *video-pt* *video-qi* *video-fps* *video-max-qi* *video-target-kbs*
+                           *video-max-frame-kb* *video-cleanup-ms*
+                           webrtc-media.vp8::*backlog-qi* webrtc-media.vp8::*backlog-x*)))
                (webrtc-serve-datachannel
-                conn :duration 3600.0
+                conn :duration 3600.0 :alive-p (lambda () (peer-alive-p agent))
                 :on-ready
                 (lambda (assoc sid)
                   (setf glass (glass-connect) *last-assoc* assoc)
@@ -384,15 +446,67 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
              (setf *last-error* (let ((s (princ-to-string e)))
                                   (subseq s 0 (min 72 (length s)))))
              (format *error-output* "~&[gw-nostr] session error: ~a~%" e)))
+      (let ((quiet (ice-silent-secs agent)))
+        (when (and quiet (>= quiet *peer-silence-limit*))
+          (format *error-output* "~&[gw-nostr] peer silent ~,0fs — closing session~%" quiet)))
+      (when pub (forget-session pub agent))
       (when cap (ignore-errors (capture-stop cap)))
       (when video-stop (ignore-errors (funcall video-stop)))
       (when audio-stop (ignore-errors (funcall audio-stop)))
       (when glass (ignore-errors (sb-bsd-sockets:socket-close glass)))
       (ignore-errors (ice-close agent)))))   ; release the TURN allocation + ICE socket
 
-(defun process-offer (offer-sdp)
+
+;;; ---- replay defence ----------------------------------------------------------
+;; The subscription asks each relay for :limit 20 of the backlog, and the pool reconnects on an idle
+;; drop — so every reconnect re-delivers up to 20 old gift-wraps, per relay, indefinitely.  Those are
+;; real, correctly-signed, authorised offers from PeerConnections that died hours ago.  Answering them
+;; wastes an ICE agent and a TURN allocation each, and — far worse, once sessions supersede — a replay
+;; arriving behind a live offer RETIRES THE SESSION THE PHONE IS CURRENTLY CHECKING AGAINST.  The box
+;; logs a healthy answer and the phone reports "ice failed / no pair", with nothing connecting the two.
+;;
+;; Three guards, cheapest first.  The rumor's created_at is the honest clock here: NIP-59 randomises
+;; the seal and wrap timestamps to resist correlation, but the rumor keeps real time, and it is inside
+;; the signed seal so a relay cannot forge it.
+(defvar *seen-wraps* (make-hash-table :test 'equal))
+(defvar *seen-lock* (bt:make-lock))
+;; 10 minutes, not 3: the real replays are HOURS old, so a wide window kills them just as dead, and
+;; the cost of being wrong is asymmetric — too tight and a phone whose clock lags rejects every offer
+;; with no way to tell from the far end, which is the failure mode we just spent an afternoon on.
+(defparameter *offer-max-age* 600)
+
+(defun wrap-seen-p (id)
+  "T if we have already processed wrap ID.  Also the 3-relay fan-out deduplicator."
+  (when id
+    (bt:with-lock-held (*seen-lock*)
+      (prog1 (gethash id *seen-wraps*)
+        (when (> (hash-table-count *seen-wraps*) 4096) (clrhash *seen-wraps*))
+        (setf (gethash id *seen-wraps*) t)))))
+
+(defun process-offer (offer-sdp &key pub (at 0))
   "Parse an SDP OFFER, run the answerer (srflx + full-agent checks for off-LAN), spawn the
-   glass-bridged session, and return the ANSWER SDP."
+   glass-bridged session, and return the ANSWER SDP.  PUB is the offering terminal, whose previous
+   session is retired first — before we allocate, so its relay port is free for reuse."
+  (let* ((probe (parse-sdp offer-sdp))
+         (ufrag (sdp-ice-ufrag probe))
+         (dup (and pub ufrag
+                   (let ((s (bt:with-lock-held (*live-lock*) (gethash pub *live*))))
+                     (and s (equal ufrag (sess-ufrag s)) s)))))
+    (when dup
+      (format t "~&@@ duplicate offer from ~a... (ufrag ~a) — re-sending the same answer~%"
+              (subseq pub 0 8) ufrag)
+      (finish-output)
+      (return-from process-offer (sess-answer dup))))
+  ;; Supersede only for an offer at least as new as the live one.  Without this a replay retires a
+  ;; live session; with it, an out-of-order replay is simply ignored.
+  (when pub
+    (let ((live (bt:with-lock-held (*live-lock*) (gethash pub *live*))))
+      (cond ((null live) nil)
+            ((>= at (sess-at live)) (retire-session pub))
+            (t (format t "~&@@ ignoring offer older than the live session for ~a... (~a < ~a)~%"
+                       (subseq pub 0 8) at (sess-at live))
+               (finish-output)
+               (return-from process-offer nil)))))
   (let* ((offer (parse-sdp offer-sdp))
          (agent (make-ice :local-ip (uiop:getenv "ICE_LOCAL_IP")))
          (conn  (webrtc-dtls-setup agent :remote-fingerprint (sdp-fingerprint offer)))
@@ -426,7 +540,11 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
     (setf *video-pt*                                            ; VP8 pt from the offer, if it wants video
           (let ((v (find "video" (sdp-media offer) :key #'sdp-media-type :test #'string=)))
             (and v (sdp-media-codec-pt v "VP8"))))
-    (bt:make-thread (lambda () (run-session conn agent)) :name "webrtc-session")
+    (when pub
+      (bt:with-lock-held (*live-lock*)
+        (setf (gethash pub *live*)
+              (make-sess :ufrag (sdp-ice-ufrag offer) :agent agent :answer answer :at at))))
+    (bt:make-thread (lambda () (run-session conn agent :pub pub)) :name "webrtc-session")
     answer))
 
 ;;; ---- Nostr signaling loop --------------------------------------------------
@@ -461,9 +579,21 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
    (lambda (wrap relay)
      (declare (ignore relay))
      (handler-case
-         (multiple-value-bind (payload phone-pub) (cl-nostr.nip59:unwrap-giftwrap kp wrap)
+         ;; Guard 1: have we already handled this exact wrap?  Catches both the 3-relay fan-out and
+         ;; every backlog re-delivery after a relay reconnect.
+         (if (wrap-seen-p (ignore-errors (cl-nostr.event:event-id wrap)))
+             nil
+         (multiple-value-bind (payload phone-pub rumor-at) (cl-nostr.nip59:unwrap-giftwrap kp wrap)
            (multiple-value-bind (offer-sdp code) (parse-offer payload)
              (cond
+               ;; Guard 2: an offer older than *OFFER-MAX-AGE* names a PeerConnection that is long
+               ;; gone.  Answering it cannot succeed and can only disturb a live session.
+               ((and (stringp offer-sdp) (search "m=application" offer-sdp)
+                     (plusp rumor-at)
+                     (> (- (%unix-now) rumor-at) *offer-max-age*))
+                (format t "~&@@ stale offer from ~a... (~ds old) — ignored~%"
+                        (subseq phone-pub 0 8) (- (%unix-now) rumor-at))
+                (finish-output))
                ((and (stringp offer-sdp) (search "m=application" offer-sdp))   ; a data-channel offer
                 ;; a valid one-time code OR an allowlisted signer authorizes the connection
                 (let* ((cstatus (code-status code))
@@ -488,21 +618,37 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                      ;; keeps a device alive, disuse lets it expire
                      (enrol-device phone-pub)
                      (finish-output)
-                     (let* ((answer (process-offer offer-sdp))
+                     (let* ((answer (process-offer offer-sdp :pub phone-pub :at rumor-at))
+                            ;; NIL means the offer was ignored (older than the live session) — there
+                            ;; is nothing to reply with, and replying NIL would hand the phone a
+                            ;; malformed answer.
+                            (skip (null answer))
                             ;; RENEW: a client that authenticated with a valid code gets a fresh
                             ;; one back with the answer, so simply reconnecting before it expires
                             ;; keeps the credential alive and a dropped session never needs a new
                             ;; magic link.  Renewal rides the exchange that already proved who they
                             ;; are — no new message type, no new crypto.
-                            (payload (if (or (eq cstatus :ok) (string= via "device"))
-                                         (let ((ht (make-hash-table :test 'equal)))
-                                           (setf (gethash "sdp" ht) answer
-                                                 (gethash "code" ht)
-                                                 (glass-login:mint-token *box-secret* :ttl *link-ttl*))
-                                           (com.inuoe.jzon:stringify ht))
-                                         answer))
-                            (reply  (cl-nostr.nip59:build-giftwrap kp phone-pub payload)))
-                       (cl-nostr.pool:pool-publish pool reply)
+                            ;; ALWAYS an envelope, and it carries the OFFER'S ICE UFRAG back.  A
+                            ;; gift-wrapped answer lives on the relays forever, and the phone's
+                            ;; subscription has no since/limit — so on the next connection the relays
+                            ;; replay every old answer and the page applies whichever arrives first.
+                            ;; Its checks then run against a dead allocation and ICE fails with no
+                            ;; pair, while this box logs a perfectly good answer nobody used.  The
+                            ;; ufrag is minted per PeerConnection, so echoing it lets the phone tell
+                            ;; OUR answer from a ghost of one.  Old backlog answers have no ufrag
+                            ;; field at all, which is exactly how they get rejected.
+                            (payload (let ((ht (make-hash-table :test 'equal)))
+                                       (setf (gethash "sdp" ht) answer
+                                             (gethash "ufrag" ht)
+                                             (ignore-errors (sdp-ice-ufrag (parse-sdp offer-sdp))))
+                                       (when (or (eq cstatus :ok) (string= via "device"))
+                                         (setf (gethash "code" ht)
+                                               (glass-login:mint-token *box-secret* :ttl *link-ttl*)))
+                                       (com.inuoe.jzon:stringify ht)))
+                            (reply  (and (not skip)
+                                         (cl-nostr.nip59:build-giftwrap kp phone-pub payload
+                                                                        :after rumor-at))))
+                       (when reply (cl-nostr.pool:pool-publish pool reply))
                        (format t "@@ answer gift-wrapped -> ~a...~%" (subseq phone-pub 0 8))
                        (finish-output))))))
                ;; ---- command DMs ----
@@ -537,10 +683,14 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                          (finish-output))
                         (t
                          (cl-nostr.pool:pool-publish
-                          pool (cl-nostr.nip59:build-giftwrap kp phone-pub reply))
+                          ;; :AFTER — stamp the reply strictly later than the DM it answers.  We
+                          ;; often reply inside the same second, and the box's clock need not agree
+                          ;; with the phone's; either way the answer sorts above the question in the
+                          ;; recipient's client, which reads as the box talking to itself.
+                          pool (cl-nostr.nip59:build-giftwrap kp phone-pub reply :after rumor-at))
                          (format t "~&@@ ~(~a~) from ~a... (~a) -> replied~%"
                                  verb who (if admin "allowlist" "enrolled device"))
-                         (finish-output))))))))))
+                         (finish-output)))))))))))
        (error (e) (format t "~&@@ signal error: ~a~%" e) (finish-output)))))
   (format t "@@ subscribed; waiting for gift-wrapped offers~%")
   (finish-output)
