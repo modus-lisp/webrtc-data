@@ -646,7 +646,7 @@ fields (:cwnd, :peer-rwnd, :flight, :outstanding, :send-q, :rto) are instantaneo
 
 ;;; ---- driver: run the association over a DTLS-CONN --------------------------
 
-(defun webrtc-serve-datachannel (conn &key on-message on-ready (duration 30.0) log)
+(defun webrtc-serve-datachannel (conn &key on-message on-ready (duration 30.0) log alive-p)
   "Run the SCTP association + DCEP over the (already handshaked) DTLS-CONN for up to DURATION
 seconds (or until the peer ABORTs), pumping inbound datagrams from the mailbox.  ON-MESSAGE,
 if given, is called as (funcall on-message ASSOC STREAM-ID PAYLOAD) for each inbound message
@@ -662,8 +662,12 @@ even when no datagrams are arriving."
          (assoc (make-sctp-assoc :session session :on-message on-message :on-ready on-ready :log log))
          (deadline (+ (get-internal-real-time)
                       (round (* duration internal-time-units-per-second)))))
+    ;; ALIVE-P, when given, is consulted each pass: DURATION is a ceiling, not a promise that the
+    ;; peer is still there.  Returning NIL ends the session cleanly, so the caller's unwind-protect
+    ;; runs and releases the TURN allocation instead of holding it until the deadline.
     (loop while (and (< (get-internal-real-time) deadline)
-                     (not (eq (sctp-assoc-state assoc) :aborted)))
+                     (not (eq (sctp-assoc-state assoc) :aborted))
+                     (or (null alive-p) (funcall alive-p)))
           do (let ((dg (mailbox-pop mb 0.05)))
                (when dg
                  (dolist (sctp (seal:dtls-handle-datagram session dg))

@@ -18,7 +18,19 @@
   relay-ip relay-port                          ; TURN relayed transport address, if gathered
   turn                                         ; a TURN-ALLOC (allocation state), or NIL
   (remote-candidates '())                      ; the peer's candidates (from its offer), for our checks
-  (on-packet nil) (on-media nil) (peer nil) (stop nil) (check-thread nil) thread)
+  (on-packet nil) (on-media nil) (peer nil) (stop nil) (check-thread nil) thread
+  ;; When we last heard ANYTHING from the peer.  A phone that locks its screen, loses the network,
+  ;; or simply reconnects never tells us it is gone, so without this a session runs to its full
+  ;; duration holding a TURN allocation, an RFB connection and an encoder aimed at nobody.  Stamped
+  ;; on every inbound datagram — media, DTLS, and the peer's own STUN consent checks alike, which is
+  ;; why it lives at the socket rather than in any one consumer.
+  (last-rx nil))
+
+(defun ice-silent-secs (agent)
+  "Seconds since anything arrived from the peer, or NIL if nothing ever has."
+  (let ((tt (ice-agent-last-rx agent)))
+    (when tt (/ (float (- (get-internal-real-time) tt))
+                internal-time-units-per-second))))
 
 (defparameter *stun-servers*
   (let ((env (uiop:getenv "STUN_SERVER")))     ; "host:port" — overrides for a local/test STUN
@@ -399,6 +411,7 @@ PEER-HOST is a 4-octet vector.  Replies ride Send indications until a channel bi
                        (sb-bsd-sockets:socket-receive (ice-agent-socket agent) buf nil)
                      (declare (ignore b))
                      (when (and len (plusp len))
+                       (setf (ice-agent-last-rx agent) (get-internal-real-time))
                        (ice-dispatch agent buf len host port)))
                  (error () (unless (ice-agent-stop agent) (sleep 0.005)))))))
          :name "webrtc-data-ice"))

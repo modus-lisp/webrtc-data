@@ -13,7 +13,7 @@
            #:sdp-ice-ufrag #:sdp-ice-pwd #:sdp-fingerprint #:sdp-setup
            #:sdp-candidates #:sdp-sctp-port #:sdp-mid
            #:sdp-media #:sdp-media-type #:sdp-media-mid #:sdp-media-codec-pt
-           #:make-ice #:ice-answer #:ice-serve #:ice-start-checks #:ice-close
+           #:make-ice #:ice-answer #:ice-serve #:ice-start-checks #:ice-close #:ice-silent-secs
            #:ice-gather-srflx #:ice-gather-relay #:ice-agent-relay-ip #:ice-agent-relay-port
            #:ice-agent-srflx-ip #:ice-agent-srflx-port #:ice-agent-turn #:ice-agent-peer
            #:ice-agent-on-media #:ice-send-to-peer            ; SRTP media demux + send (webrtc-media)
