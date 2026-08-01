@@ -18,6 +18,8 @@
   (asdf:load-system "cl-nostr"))
 (load (merge-pathnames "login-token.lisp" (or *load-pathname* *default-pathname-defaults*)))
 (load (merge-pathnames "glass-capture.lisp" (or *load-pathname* *default-pathname-defaults*)))
+;; the video profiles + the control channel that switches between them mid-session
+(load (merge-pathnames "video-profiles.lisp" (or *load-pathname* *default-pathname-defaults*)))
 
 (in-package #:webrtc-data)
 
@@ -364,14 +366,19 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                    :name "stats"))
                 :on-message
                 (lambda (assoc sid payload)
-                  (declare (ignore assoc sid))
-                  (when (and glass (plusp (length payload)))
-                    (let ((bytes (as-u8vec payload)))
-                      ;; in video-primary mode drop FramebufferUpdateRequest (type 3, 10 bytes) so
-                      ;; glass sends no pixels over SCTP; everything else (input) passes through
-                      (if (and *video-primary* (= 10 (length bytes)) (= 3 (aref bytes 0)))
-                          nil
-                          (sb-bsd-sockets:socket-send glass bytes (length bytes))))))))
+                  ;; The phone's SECOND channel (stream 100) is control, not RFB: a quality-profile
+                  ;; switch, applied to the running sender and answered with what took effect.
+                  ;; Keeping it off the RFB stream is the point — that one is a byte protocol with
+                  ;; its own framing, and nothing here has to know how to tell the two apart.
+                  (cond
+                    ((control-sid-p sid) (handle-control-message assoc sid payload))
+                    ((and glass (plusp (length payload)))
+                     (let ((bytes (as-u8vec payload)))
+                       ;; in video-primary mode drop FramebufferUpdateRequest (type 3, 10 bytes) so
+                       ;; glass sends no pixels over SCTP; everything else (input) passes through
+                       (if (and *video-primary* (= 10 (length bytes)) (= 3 (aref bytes 0)))
+                           nil
+                           (sb-bsd-sockets:socket-send glass bytes (length bytes)))))))))
            (error (e)
              (incf *sessions-failed*)
              (setf *last-error* (let ((s (princ-to-string e)))

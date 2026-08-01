@@ -175,6 +175,12 @@
     const ch = pc.createDataChannel('rfb', { ordered: true });
     ch.binaryType = 'arraybuffer';
     ch.onopen = () => log('datachannel open');
+    // A SECOND channel for control (video quality), NEGOTIATED on a fixed stream id so both ends
+    // agree on it without a DCEP exchange and it can never be confused with the RFB stream — that
+    // one carries a byte protocol with its own framing, and sharing it would mean teaching both
+    // ends to tell RFB bytes from ours.  Nostr would also work and is the wrong tool: a relay
+    // round-trip is seconds, and a quality comparison you make by eye needs the switch to land now.
+    const ctrl = pc.createDataChannel('control', { ordered: true, negotiated: true, id: 100 });
     const rfb = new RFB(document.getElementById('screen'), ch, {});
     rfb.scaleViewport = true;
     rfb.focusOnClick = true;
@@ -238,6 +244,77 @@
         diag('speaker on');
       }
     });
+    // --- video quality: three profiles, switched on the running encoder ----------------------
+    // The box changes its encoder's knobs mid-stream, so a tap costs nothing: same session, same
+    // RTP stream, no reconnect.  The panel shows the video's OWN KB/s and fps beside the buttons,
+    // because that is the trade-off being made — "responsive" is not better, it is more bytes for
+    // a screen that keeps up while it moves.
+    //
+    // It must not eat gestures.  The touch layer listens on #screen, so anything parented to
+    // <body> is already out of its way; on top of that the panel itself is pointer-events:none and
+    // only the buttons take input, so a two-finger scroll or a hold that begins on the panel's
+    // background still reaches the desktop underneath.
+    const QPROFILES = ['responsive', 'balanced', 'sharp'];
+    let qCurrent = null, qPending = null;
+    const qPanel = document.createElement('div');
+    qPanel.style.cssText = 'position:fixed;left:14px;bottom:140px;z-index:22;width:212px;display:none;' +
+      'flex-direction:column;gap:7px;background:rgba(0,0,0,.55);padding:9px 11px;border-radius:11px;' +
+      'font:11px ui-monospace,monospace;color:#cdd6df;pointer-events:none';
+    const qHead = document.createElement('div');
+    qHead.style.cssText = 'display:flex;justify-content:space-between;align-items:baseline;gap:8px';
+    const qTitle = document.createElement('span'); qTitle.textContent = 'video';
+    const qRate = document.createElement('span');
+    qRate.style.cssText = 'color:#7CFC9B;font-variant-numeric:tabular-nums';
+    qRate.textContent = '– KB/s · – fps';
+    qHead.append(qTitle, qRate);
+    const qRow = document.createElement('div'); qRow.style.cssText = 'display:flex;gap:5px';
+    const qNote = document.createElement('div'); qNote.style.cssText = 'color:#8a949c;min-height:1.3em';
+    const qBtns = {};
+    const paintQ = () => {
+      for (const [name, b] of Object.entries(qBtns)) {
+        const on = name === qCurrent, wait = name === qPending;
+        b.style.color = on ? '#7CFC9B' : (wait ? '#cdd6df' : '#8a949c');
+        b.style.background = on ? 'rgba(124,252,155,.16)' : 'rgba(255,255,255,.06)';
+        b.style.borderColor = on ? '#7CFC9B' : (wait ? 'rgba(255,255,255,.45)' : 'rgba(255,255,255,.18)');
+      }
+    };
+    const sendProfile = name => {
+      if (ctrl.readyState !== 'open') { qNote.textContent = 'control channel ' + ctrl.readyState; return; }
+      qPending = name; paintQ(); qNote.textContent = 'switching to ' + name + '…';
+      ctrl.send(JSON.stringify({ profile: name }));
+      diag('profile -> ' + name);
+    };
+    for (const name of QPROFILES) {
+      const b = document.createElement('button');
+      b.textContent = name;
+      // pointer-events:auto only on the button itself; touch-action stops the browser waiting to
+      // see whether the tap was the start of a zoom
+      b.style.cssText = 'pointer-events:auto;touch-action:manipulation;flex:1;padding:7px 4px;' +
+        'border-radius:8px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);' +
+        'color:#8a949c;font:10px ui-monospace,monospace';
+      b.addEventListener('click', e => { e.stopPropagation(); sendProfile(name); });
+      qBtns[name] = b; qRow.appendChild(b);
+    }
+    qPanel.append(qHead, qRow, qNote); document.body.appendChild(qPanel);
+    // the box answers every message with the state it is ACTUALLY in, so the highlight follows the
+    // encoder rather than the tap
+    ctrl.addEventListener('message', e => {
+      let m = null; try { m = JSON.parse(e.data); } catch (_) { return; }
+      if (!m || !m.profile) return;
+      qCurrent = m.profile; qPending = null; paintQ();
+      qNote.textContent = `${m.target_kbs} KB/s cap · frame ≤${m.max_frame_kb} KB · settle ${m.cleanup_ms} ms`;
+      diag('profile = ' + m.profile + ' (' + m.target_kbs + 'KB/s cap)');
+    });
+    ctrl.addEventListener('open', () => { diag('control channel OPEN'); ctrl.send('{"get":1}'); });
+    ctrl.addEventListener('close', () => diag('control channel CLOSE'));
+    // ◈ toggles the panel, like ≡ toggles the debug overlay
+    const qBtn = mkToggle('◈', 194);
+    let qOn = false;
+    qBtn.addEventListener('click', () => {
+      qOn = !qOn; qPanel.style.display = qOn ? 'flex' : 'none'; paint(qBtn, qOn);
+      if (qOn && ctrl.readyState === 'open') ctrl.send('{"get":1}');
+    });
+
     const XK = { Enter:0xff0d, Backspace:0xff08, Tab:0xff09, Escape:0xff1b,
                  ArrowLeft:0xff51, ArrowUp:0xff52, ArrowRight:0xff53, ArrowDown:0xff54 };
     const tap = (keysym, code) => { rfb.sendKey(keysym, code, true); rfb.sendKey(keysym, code, false); };
@@ -538,6 +615,7 @@
 
     const hud = document.getElementById('hud');
     const diagEl = document.getElementById('diag');
+    diagEl.style.top = '90px';        // the hud carries a video line now — keep the log clear of it
     const diagLines = [], tStart = performance.now();
     const stamp = () => ((performance.now() - tStart) / 1000).toFixed(1).padStart(5, ' ');
     function diag(msg) {
@@ -617,6 +695,7 @@
 
     // getStats: which candidate pair won (host/srflx/relay), its rtt, and transport rx bytes
     let pathStr = 'path …', lastRx = 0, lastRxT = performance.now();
+    let vidKbs = 0, vidFps = 0, lastVid = null;      // the VP8 stream's own rate, for the quality panel
     async function pollPath() {
       try {
         const s = await pc.getStats(); let pair = null;
@@ -631,6 +710,21 @@
           if (pathStr.indexOf(path) < 0) diag('PATH ' + path + ' via ' + (rc ? rc.protocol + ' ' + (rc.address || '?') : '?'));
           pathStr = `path ${path} rtt ${rtt} rx ${(rx/1024).toFixed(0)}KB ${rate.toFixed(0)}KB/s`;
         } else pathStr = 'path (no pair)';
+        // the VIDEO's own rate and frame rate — dc-in above is the RFB channel, which in
+        // video-primary mode carries input only.  This is the number a quality profile moves.
+        let v = null; s.forEach(r => { if (r.type === 'inbound-rtp' && r.kind === 'video') v = r; });
+        if (v) {
+          const now = performance.now();
+          if (lastVid) {
+            const dt = (now - lastVid.t) / 1000;
+            if (dt > 0.2) {
+              vidKbs = ((v.bytesReceived || 0) - lastVid.b) / 1024 / dt;
+              vidFps = ((v.framesDecoded || 0) - lastVid.f) / dt;
+            }
+          }
+          lastVid = { t: now, b: v.bytesReceived || 0, f: v.framesDecoded || 0 };
+          qRate.textContent = `${vidKbs.toFixed(0)} KB/s · ${vidFps.toFixed(0)} fps`;
+        }
       } catch (_) { pathStr = 'path stats-err'; }
     }
 
@@ -645,6 +739,7 @@
         `pc <b>${pc.connectionState}</b> · ice <b>${pc.iceConnectionState}</b> · dc <b>${ch.readyState}</b>\n` +
         `${pathStr}\n` +
         `dc-in <b>${kbs.toFixed(0)}</b>KB/s ${mps.toFixed(0)}msg · buf ${(buf/1024).toFixed(0)}KB · fps <b>${fps.toFixed(0)}</b>\n` +
+        `vid <b>${vidKbs.toFixed(0)}</b>KB/s · <b>${vidFps.toFixed(0)}</b>fps · profile <b>${qCurrent || '?'}</b>\n` +
         `rfb ${rfb._rfbConnectionState || '?'} · ${rfb._fbName || '—'}`;
       console.log(`PERF ${(now/1000).toFixed(1)} ${fps.toFixed(1)} ${kbs.toFixed(1)} ${mps.toFixed(1)} ${(buf/1024).toFixed(1)}`);
     }, 1000);
