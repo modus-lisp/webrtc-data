@@ -86,13 +86,33 @@ SITE_VERSION=k25 sbcl --script publish.lisp
 # 4. verify all four hops; every line should say MATCH
 sbcl --script check-deploy.lisp <build-dir>/nsite-build/nsite-index.html
 
-# 5. aim the login links at whatever step 4 says is actually serving the new build
-#    (in the gateway's keepalive env), then RESTART the gateway — LOGIN_URL_BASE is
-#    read once at startup, so editing the script alone changes nothing
-export LOGIN_URL_BASE='https://<npub>.nsite.lol/k25.html'   # or the blob URL, below
+# 5. restart the gateway.  publish.lisp already wrote site-url.env with the path it
+#    published, and the keepalive sources that inside its loop — so this is all it takes
+kill <gateway-pid>          # the keepalive respawns it
 
 # 6. DM the box "link" and load the result
 ```
+
+### The login link must point at the path you just published
+
+Publishing **replaces** the manifest, so the previous `/<tag>.html` stops resolving the moment a new
+build lands — and a login link minted against it 404s, which from the phone is indistinguishable
+from the box being down. This has bitten twice.
+
+`publish.lisp` writes `site-url.env` beside the gateway with the path it just published, and
+`gw-keepalive.sh` sources it **inside its loop**, the same way it picks up `video-profile.env`. So a
+publish plus the next gateway restart is enough and nothing has to be remembered.
+
+Two ways to still get this wrong:
+
+- `LOGIN_URL_BASE` is read **once, at gateway start** (`defparameter` + `getenv`), so a running
+  gateway keeps handing out the old path until it restarts.
+- Editing the `export` at the top of `gw-keepalive.sh` is **not enough on its own.** That line runs
+  once, when the keepalive loop starts; the gateway respawns *inside* that loop and inherits the
+  environment the loop already has. The symptom is a script that reads `k27` while the live process
+  serves `k25`. Restart the keepalive, not just the gateway — or let `site-url.env` do it.
+
+`@@ [keepalive] link=…` is printed on every start, so the log says which path is being handed out.
 
 `check-deploy.lisp` (in this directory) walks build → Blossom → relays → gateway and prints what
 each hop holds, so the first mismatch names the broken hop. It is read-only and needs no secret:
