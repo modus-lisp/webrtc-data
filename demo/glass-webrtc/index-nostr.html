@@ -20,14 +20,38 @@
     #connstatus{position:fixed;inset:0;z-index:30;display:flex;align-items:center;justify-content:center;
       background:radial-gradient(130% 100% at 50% 38%,#141a21 0%,#0b0d11 100%);color:#e8eef2;
       font:15px/1.5 -apple-system,system-ui,sans-serif;transition:opacity .42s ease}
-    #connstatus .card{display:flex;flex-direction:column;align-items:center;gap:18px;text-align:center;padding:28px}
-    #connstatus .spinner{width:34px;height:34px;border-radius:50%;border:3px solid rgba(255,255,255,.15);
-      border-top-color:#7CFC9B;animation:spin .9s linear infinite}
-    #connstatus .msg{font-weight:500;letter-spacing:.01em;min-height:1.4em}
-    #connstatus .steps{display:flex;gap:10px;margin-top:4px}
-    #connstatus .steps i{width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,.16);
-      transition:background .3s ease}
-    #connstatus .steps i.on{background:#7CFC9B}
+    /* The connect sequence as a checklist: what is done, what is happening, what is still ahead.
+       A spinner alone says "wait"; this says WHERE we are, and — once a step is behind us — what it
+       actually found.  That second line is the part worth having: "3 relay candidates" or
+       "relay->srflx 147ms" is exactly what you would otherwise open the debug log to learn. */
+    #connstatus .card{display:flex;flex-direction:column;align-items:stretch;gap:14px;
+      text-align:left;padding:28px;min-width:264px;max-width:min(86vw,340px)}
+    #connstatus .steps{list-style:none;margin:0;padding:0;display:flex;flex-direction:column}
+    #connstatus .steps li{position:relative;display:grid;grid-template-columns:16px 1fr;
+      column-gap:12px;padding:6px 0;color:rgba(232,238,242,.34);transition:color .4s ease}
+    #connstatus .steps li .lbl{grid-column:2;grid-row:1;font-weight:500;letter-spacing:.01em}
+    /* the detail collapses to nothing until its step completes, so future steps stay quiet */
+    #connstatus .steps li .det{grid-column:2;grid-row:2;font-size:12.5px;font-variant-numeric:tabular-nums;
+      color:rgba(232,238,242,.44);max-height:0;opacity:0;overflow:hidden;
+      transition:max-height .4s ease,opacity .4s ease,margin .4s ease}
+    #connstatus .steps li.done{color:#e8eef2}
+    #connstatus .steps li.done .det{max-height:2.4em;opacity:1;margin-top:3px}
+    #connstatus .steps li.now{color:#e8eef2}
+    /* marker: hollow ring ahead, spinner now, filled behind */
+    #connstatus .steps li b{grid-column:1;grid-row:1;width:14px;height:14px;margin-top:3px;
+      box-sizing:border-box;border-radius:50%;border:2px solid rgba(255,255,255,.2);
+      transition:border-color .4s ease,background .4s ease}
+    #connstatus .steps li.done b{border-color:#7CFC9B;background:#7CFC9B}
+    #connstatus .steps li.now b{border-color:rgba(124,252,155,.28);border-top-color:#7CFC9B;
+      animation:spin .9s linear infinite}
+    /* the rail: makes the list read as a sequence rather than four unrelated rows */
+    #connstatus .steps li:not(:last-child)::before{content:'';position:absolute;left:7px;top:20px;
+      bottom:-4px;width:2px;background:rgba(255,255,255,.12);transition:background .4s ease}
+    #connstatus .steps li.done::before{background:rgba(124,252,155,.45)}
+    #connstatus .steps li.fail{color:#ffd0d0}
+    #connstatus .steps li.fail b{border-color:#f0645a;background:transparent;animation:none}
+    #connstatus .msg{font-weight:500;letter-spacing:.01em;min-height:1.4em;text-align:center}
+    #connstatus .msg:empty{min-height:0}
     @keyframes spin{to{transform:rotate(360deg)}}
   </style>
 </head>
@@ -35,7 +59,15 @@
   <div id="screen"></div>
   <div id="hud">connecting…</div>
   <div id="diag"></div>
-  <div id="connstatus"><div class="card"><div class="spinner"></div><div class="msg">Starting…</div><div class="steps"><i></i><i></i><i></i><i></i></div></div></div>
+  <div id="connstatus"><div class="card">
+    <ol class="steps">
+      <li><b></b><span class="lbl">Finding a route</span><span class="det"></span></li>
+      <li><b></b><span class="lbl">Reaching your desktop</span><span class="det"></span></li>
+      <li><b></b><span class="lbl">Connecting</span><span class="det"></span></li>
+      <li><b></b><span class="lbl">Loading the screen</span><span class="det"></span></li>
+    </ol>
+    <div class="msg"></div>
+  </div></div>
   <script type="module">
     import RFB from './novnc/core/rfb.js';
     import { generateSecretKey, getPublicKey, finalizeEvent, getEventHash } from 'https://esm.sh/nostr-tools@2.15.0/pure';
@@ -151,7 +183,7 @@
                 '<div style="max-width:22em;font-size:13px;line-height:1.5;opacity:.75;margin-top:2px">' +
                 'The connection did not establish (ICE ' + pc.iceConnectionState + ').<br>' +
                 'Tap ≡ for the log, or reload to try again.</div>');
-              const sp = connEl.querySelector('.spinner'); if (sp) sp.style.display = 'none';
+              failConn();
             }
           }, 12000);
           diag('video is the primary view');
@@ -593,17 +625,39 @@
     // if data is arriving at all; dc-in + fps show if it reaches the app and paints.
     let frames = 0, bytesIn = 0, msgsIn = 0;
     // clean (non-debug) connecting overlay: spinner + friendly phase text, fades out on the first frame
-    const STEPS = ['Finding a route', 'Reaching the box', 'Connecting', 'Loading the screen'];
     const connEl = document.getElementById('connstatus');
     const connMsg = connEl.querySelector('.msg');
-    const stepDots = connEl.querySelectorAll('.steps i');
-    let curStep = -1;
-    const setStep = (i, label) => {                 // advance to step i (never backwards), light dots 0..i
+    const stepEls = [...connEl.querySelectorAll('.steps li')];
+    if (stepEls[0]) stepEls[0].classList.add('now');   // the first step is live from page load
+    let curStep = 0;
+    // Advance to step I, never backwards.  Everything before it reads as done, it reads as current,
+    // everything after stays dimmed — so the list always answers "what is left?" as well as "where
+    // are we?".
+    const setStep = (i, label) => {
       if (i > curStep) curStep = i;
-      connMsg.textContent = label || STEPS[Math.max(0, curStep)] || '';
-      stepDots.forEach((d, k) => d.classList.toggle('on', k <= curStep));
+      stepEls.forEach((el, k) => {
+        el.classList.toggle('done', k < curStep);
+        el.classList.toggle('now', k === curStep);
+      });
+      if (label && stepEls[curStep]) stepEls[curStep].querySelector('.lbl').textContent = label;
+    };
+    // The second line on a completed step: the one fact worth keeping from that phase.  Setting it
+    // also marks the step done, because knowing the answer IS the completion.
+    const setDetail = (i, text) => {
+      const el = stepEls[i]; if (!el) return;
+      el.querySelector('.det').textContent = text;
+      if (i >= curStep) setStep(i + 1);
+      el.classList.add('done');
     };
     const setConnRaw = m => { connMsg.textContent = m; };   // unmapped text (e.g. an error) shown verbatim
+    // Stop the sequence where it stands.  The step we never finished keeps its label but stops
+    // spinning and turns red, so the list itself says WHICH stage failed — the steps behind it stay
+    // done, with their details, which is most of the diagnosis before anyone opens the log.
+    const failConn = () => {
+      const el = stepEls[curStep];
+      stepEls.forEach(e => e.classList.remove('now'));
+      if (el) el.classList.add('fail');
+    };
     let connHidden = false;
     const hideConn = () => { if (connHidden) return; connHidden = true; connEl.style.opacity = '0';
       setTimeout(() => { connEl.style.display = 'none'; }, 440); };
@@ -671,7 +725,7 @@
       diag('ice ' + pc.iceConnectionState);
       if (pc.iceConnectionState === 'failed' && !connHidden) {
         setConnRaw('Could not reach your desktop');
-        const sp = connEl.querySelector('.spinner'); if (sp) sp.style.display = 'none';
+        failConn();
       }
     });
     pc.addEventListener('connectionstatechange', () => diag('conn ' + pc.connectionState));
@@ -708,6 +762,7 @@
           const rate = ((rx - lastRx) / 1024 / ((now - lastRxT) / 1000)) || 0; lastRx = rx; lastRxT = now;
           const path = `${lc ? lc.candidateType : '?'}→${rc ? rc.candidateType : '?'}`;
           if (pathStr.indexOf(path) < 0) diag('PATH ' + path + ' via ' + (rc ? rc.protocol + ' ' + (rc.address || '?') : '?'));
+          if (!connHidden) setDetail(2, `${path.replace('→', ' → ')}${rtt !== '?' ? '  ·  ' + rtt : ''}`);
           pathStr = `path ${path} rtt ${rtt} rx ${(rx/1024).toFixed(0)}KB ${rate.toFixed(0)}KB/s`;
         } else pathStr = 'path (no pair)';
         // the VIDEO's own rate and frame rate — dc-in above is the RFB channel, which in
@@ -884,7 +939,7 @@
           '<div style="max-width:22em;font-size:13px;line-height:1.5;opacity:.75;margin-top:2px">' +
           (when ? 'It was valid until ' + when.toLocaleString() + '.<br>' : '') +
           'DM <b>link</b> to the box for a new one.</div>');
-        const sp = connEl.querySelector('.spinner'); if (sp) sp.style.display = 'none';
+        failConn();
         diag('no usable credential' + (when ? ' (expired ' + when.toISOString() + ')' : ''));
       };
       if (!code && !hasDevice() && !window.nostr) { showNoCredential(); return; }
@@ -892,8 +947,21 @@
       try { id = await makeIdentity(); } catch (e) { setStatus(e.message); return; }
       const pool = new SimplePool();
 
-      // subscribe for the gift-wrapped ANSWER first, so we can't miss it
-      let answered = false;
+      // subscribe for the gift-wrapped ANSWER first, so we can't miss it.
+      //
+      // REPLAY: this filter has no since/limit, so relays hand us every gift wrap ever addressed to
+      // this device key — including answers from previous sessions, which decrypt perfectly and look
+      // exactly like a fresh one.  Applying a ghost points our ICE checks at an allocation that
+      // expired hours ago: "ice failed / no pair", with a healthy-looking answer in the log.  (NIP-59
+      // randomises the wrap's created_at up to two days into the past, so a `since` cannot fix this.)
+      //
+      // So we correlate instead: the box echoes back the ice-ufrag of the offer it is answering, and
+      // that is minted per PeerConnection.  Ours or it is not our answer.  Old answers predate the
+      // field entirely, which is how the backlog rejects itself.
+      // Set once our offer exists (below).  Until then it is null and every answer is rejected —
+      // which is correct: an answer to an offer we have not made yet is by definition a ghost, and
+      // the backlog arrives the instant we subscribe, well before setLocalDescription.
+      let answered = false, myUfrag = null;
       pool.subscribeMany(relays, [{ kinds: [1059], '#p': [id.pub] }], {
         onevent: async (ev) => {
           if (answered) return;
@@ -903,14 +971,23 @@
             // authenticated connection, so store the new one before using the SDP
             try {
               const env = JSON.parse(answer);
-              if (env && env.sdp) { if (env.code) { storeCode(env.code); diag('credential renewed'); } answer = env.sdp; }
-            } catch (_) { /* plain SDP */ }
+              if (env && env.sdp) {
+                if (!myUfrag || env.ufrag !== myUfrag) {
+                  diag(`ignored a replayed answer (ufrag ${env.ufrag || 'none'}, want ${myUfrag || 'pending'})`);
+                  return;
+                }
+                if (env.code) { storeCode(env.code); diag('credential renewed'); }
+                answer = env.sdp;
+              }
+            } catch (_) { /* not JSON — a bare SDP, which only the pre-envelope box ever sent */ }
             if (answer && answer.includes('m=application')) {
               answered = true;
               const ac = (answer.match(/a=candidate[^\r\n]*/g) || []);
               diag(`answer ${answer.length}B, ${ac.length} cand (${ac.filter(c=>c.includes('srflx')).length} srflx)`);
               clearTimeout(window.__answerWatchdog);
               await pc.setRemoteDescription({ type: 'answer', sdp: answer });
+              const ms = window.__offerAt ? Math.round(performance.now() - window.__offerAt) : null;
+              setDetail(1, ms != null ? `answered in ${(ms / 1000).toFixed(1)}s` : 'answered');
               setStatus('answer received — establishing WebRTC…');
             }
           } catch (_) { /* not for us / not from the box */ }
@@ -929,6 +1006,8 @@
       try { pc.addTransceiver('video', { direction: 'recvonly' }); diag('video recvonly requested'); } catch (_) {}
       setStatus('gathering ICE candidates…');
       await pc.setLocalDescription(await pc.createOffer());
+      // now we can recognise our own answer — see the replay note on the subscription above
+      myUfrag = ((pc.localDescription.sdp || '').match(/a=ice-ufrag:(\S+)/) || [])[1] || null;
       // Non-trickle, but a blocked/slow STUN must NOT hang gathering (seen: 49s on cellular).
       // Cap the wait and send whatever we have — host is instant; srflx if it arrives in time.
       await new Promise(res => {
@@ -942,6 +1021,8 @@
       const nSrflx = cands.filter(c => c.includes('srflx')).length;
       const nRelay = cands.filter(c => c.includes('relay')).length;
       diag(`offer ${cands.length} cand: ${cands.length - nSrflx - nRelay} host ${nSrflx} srflx ${nRelay} relay`);
+      setDetail(0, `${cands.length} routes · ${nRelay} relay`);
+      window.__offerAt = performance.now();
       const payload = JSON.stringify(code ? { sdp: pc.localDescription.sdp, code } : { sdp: pc.localDescription.sdp });
       setStatus(id.mode === 'code' ? 'sending one-time-code offer…' : 'gift-wrapping offer to the box…');
       const wrap = await id.wrapOffer(payload);
