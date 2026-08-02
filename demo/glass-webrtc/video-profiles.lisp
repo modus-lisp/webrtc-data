@@ -72,6 +72,28 @@
     (63 . 70127) (72 . 59669) (84 . 50012) (96 . 40340) (108 . 31783) (118 . 26147) (127 . 22116))
   "Keyframe bytes at 1280x800 by quantizer index, measured.")
 
+;;; What an inter frame costs BEFORE it codes anything, at 1280x800: 64 bytes of frame header plus
+;;; one skip bit for each of 4000 macroblocks.  Same measured-at-this-resolution status as
+;;; *KEYFRAME-COST* above, and it is the number that decides how fluid a rung can possibly be —
+;;; :TARGET-FPS below is derived from it, and the sender recomputes it from the real frame size and
+;;; clamps the rate to what it permits.
+(defparameter *inter-overhead-bytes* 564
+  "Bytes an inter frame pays per frame at 1280x800 whatever it codes.")
+
+(defparameter *max-target-fps* 12.0
+  "The most frames per second we ask for at any rung.  Above this the encoder is the constraint,
+not the link — a 1280x800 inter frame is ~37 ms to encode and its motion search another ~23 — and
+a target the pipeline cannot meet is only a smaller frame budget for no extra pictures.")
+
+(defun target-fps-for (bps)
+  "The cadence a link of BPS bytes/s can hold at 1280x800.  A frame's budget is a second of the
+link divided by this, so asking for more than the skip flags leave room for does not buy motion:
+at 40 kbps, ten frames a second would be 500-byte frames that are 96% flags.  The floor is one
+third of a frame's budget going on overhead, which is where these numbers come from — 1.5 fps at
+20 kbps, 3 at 40, 6 at 80, 12 at 160 — and below 160 kbps this, not the bitrate, is what caps how
+fluid a scroll can look at this resolution."
+  (min *max-target-fps* (/ bps (* 3.0 *inter-overhead-bytes*))))
+
 (defun keyframe-qi-for (budget-bytes)
   "The FINEST quantizer whose keyframe fits BUDGET-BYTES — the sharpest first picture this rung can
 afford.  Falls back to 127 when nothing fits, because a slow first picture is still a picture."
@@ -99,6 +121,11 @@ afford.  Falls back to 127 when nothing fits, because a slow first picture is st
           ;; which at 5 kbps is 51 s in flight — the cap has to come from the rate or it is not a
           ;; cap at all.  Floored at 4 KB so per-frame skip-flag overhead stays under a sixth.
           :max-frame-kb (max 4.0 (/ (* bps 1.5) 1024.0))
+          ;; THE CADENCE, and it is what makes a rung buy MOTION rather than only sharpness.  A
+          ;; live frame's budget is a second of the link divided by this; sized in link-seconds
+          ;; instead, a frame is the same number of SECONDS at every rung, so the whole of a rate
+          ;; increase went into making one frame per two seconds prettier.
+          :target-fps (target-fps-for bps)
           ;; how long the screen must be quiet before we spend the link sharpening it.  Refinement
           ;; is expensive; down the ladder it must not start while the last change is still flying.
           :cleanup-ms (min 8000 (max 400 (round 32000 kbps)))
@@ -141,8 +168,10 @@ re-reads it at the top of every pass — plus the backlog quantizer, which lives
       (setf webrtc-media.vp8::*backlog-qi* (getf p :backlog-qi)
             webrtc-media:*video-profile* (list* :name (format nil "~a kbps" kbps) p)
             *video-kbps* kbps)
-      (format *error-output* "~&[rung] ~a kbps (~a) — ~,2f KB/s, qi ~a/~a, keyframe qi ~a, frame<=~,1f KB, settle ~a ms, resync ~a s, backlog qi ~a~%"
-              kbps why (getf p :target-kbs) (getf p :qi) (getf p :max-qi) (getf p :key-qi)
+      (format *error-output* "~&[rung] ~a kbps (~a) — ~,2f KB/s, ~,1f fps (~a B/frame), qi ~a/~a, keyframe qi ~a, frame<=~,1f KB, settle ~a ms, resync ~a s, backlog qi ~a~%"
+              kbps why (getf p :target-kbs) (getf p :target-fps)
+              (round (* (getf p :target-kbs) 1024) (getf p :target-fps))
+              (getf p :qi) (getf p :max-qi) (getf p :key-qi)
               (getf p :max-frame-kb) (getf p :cleanup-ms) (round (getf p :key-secs))
               (getf p :backlog-qi))
       (finish-output *error-output*)
@@ -155,9 +184,11 @@ re-reads it at the top of every pass — plus the backlog quantizer, which lives
     ;; ~,0f would emit "55." — a trailing point with no digits, which is not JSON and takes the
     ;; phone's whole status handler down with it.  Every number here is rounded to an integer or
     ;; given explicit decimals.
-    (format nil "{\"kbps\":~a,\"rung\":~a,\"profile\":\"~a kbps\",\"target_kbs\":~,2f,\"max_frame_kb\":~,1f,\"cleanup_ms\":~a,\"qi\":~a,\"max_qi\":~a,\"key_qi\":~a,\"key_secs\":~a,\"backlog_qi\":~a,\"rungs\":[~{~a~^,~}]}"
+    (format nil "{\"kbps\":~a,\"rung\":~a,\"profile\":\"~a kbps\",\"target_kbs\":~,2f,\"target_fps\":~,1f,\"frame_budget\":~a,\"max_frame_kb\":~,1f,\"cleanup_ms\":~a,\"qi\":~a,\"max_qi\":~a,\"key_qi\":~a,\"key_secs\":~a,\"backlog_qi\":~a,\"rungs\":[~{~a~^,~}]}"
             kbps (or (rung-index kbps) 0) kbps
-            (getf p :target-kbs) (getf p :max-frame-kb) (getf p :cleanup-ms)
+            (getf p :target-kbs) (getf p :target-fps)
+            (round (* (getf p :target-kbs) 1024) (getf p :target-fps))
+            (getf p :max-frame-kb) (getf p :cleanup-ms)
             (getf p :qi) (getf p :max-qi) (getf p :key-qi) (round (getf p :key-secs))
             (getf p :backlog-qi) *video-rungs*)))
 
