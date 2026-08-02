@@ -34,11 +34,12 @@ index-nostr.html ──extract──▶ entry.mjs ──esbuild──▶ bundle.
 ## Build
 
 ```sh
-cd <build-dir> && python3 mkbundle.py
+export NSITE_BUILD=/path/to/nsite-build   # node_modules + generated artefacts
+python3 mkbundle.py
 ```
 
-`mkbundle.py` does the whole extract → rewrite → bundle → splice, and holds the absolute path to
-`index-nostr.html`. Do not run esbuild by hand: the script also rewrites
+`mkbundle.py` does the whole extract → rewrite → bundle → splice, taking `index-nostr.html` from
+beside itself (`$NSITE_SRC` overrides). Do not run esbuild by hand: the script also rewrites
 `https://esm.sh/nostr-tools@2.15.0/` to the locally-installed package, and works around the build
 dir's dangling `node_modules/.bin/esbuild` symlink by finding a real binary under `~/.npm/_npx/`.
 
@@ -78,13 +79,15 @@ visible trace — the phone just keeps loading the old page. Do all six:
 $EDITOR index-nostr.html
 
 # 2. build — self-check must read "leftover esm.sh: 0 | import-from-url: 0"
-cd <build-dir> && python3 mkbundle.py
+export NSITE_BUILD=/path/to/nsite-build
+python3 mkbundle.py
 
 # 3. publish under a NEW tag — watch for at least one "accepted=T"
-SITE_VERSION=k25 sbcl --script publish.lisp
+#    (needs the site key: $SITE_SEC or ~/.glass/site-key — see Secrets)
+SITE_VERSION=k30 sbcl --script publish.lisp
 
 # 4. verify all four hops; every line should say MATCH
-sbcl --script check-deploy.lisp <build-dir>/nsite-build/nsite-index.html
+sbcl --script check-deploy.lisp "$NSITE_BUILD/nsite-index.html"
 
 # 5. restart the gateway.  publish.lisp already wrote site-url.env with the path it
 #    published, and the keepalive sources that inside its loop — so this is all it takes
@@ -161,18 +164,35 @@ Fall back to the blob URL and move on. `nsite.gs` did not resolve when tried as 
 gateway; if another public nsite gateway is available it is worth a try, since the manifest is
 already correct and public.
 
+## Secrets
+
+Nothing in this repo contains a key. Two secrets matter, and both are resolved at runtime:
+
+| secret | where it lives | used by |
+|---|---|---|
+| site key (64 hex) | `$SITE_SEC`, else `~/.glass/site-key` (mode 600) | `publish.lisp` |
+| TURN user/pass, box nsec | `gw-keepalive.sh` on the box (gitignored) | the gateway |
+
+`publish.lisp` **refuses to run** if it cannot resolve the site key — it does not fall back to
+anything. That key is the site's whole identity: whoever holds it can replace every page served at
+that npub. It is deliberately single-copy; back it up somewhere you trust, because losing it means
+the npub in every link you have handed out can never be updated again.
+
 ## Where the build dir is
 
-```
-/tmp/claude-1001/-home-claude-cl-consensus/<session-uuid>/scratchpad/
-  mkbundle.py                 build script (holds the absolute path to index-nostr.html)
-  publish.lisp                publisher (holds the site's 64-hex secret + the absolute build path)
-  nsite-build/                entry.mjs, bundle.js, nsite-index.html
-  node_modules/               nostr-tools, noVNC
+`mkbundle.py` and `publish.lisp` live **in this directory**, in the repo, and bake in no paths:
+
+```sh
+export NSITE_BUILD=/path/to/nsite-build     # holds node_modules + generated artefacts
+python3 mkbundle.py                          # SRC defaults to index-nostr.html beside the script
+SITE_VERSION=k30 sbcl --script publish.lisp  # reads NSITE_BUILD too, or takes a path as argv
 ```
 
-The session UUID changes per session, so these paths are not stable — check `mkbundle.py`'s `SRC`
-and `BUILD` constants before trusting them.
+Only the build directory is outside the repo, because it carries a few hundred MB of
+`node_modules` plus generated output. It needs `nostr-tools` installed (`npm install
+nostr-tools@2.15.0`); a `/tmp` cleanup has eaten it before, and the symptom is
+`Could not resolve "nostr-tools/pure"` with the **output hash unchanged** — so the publish that
+follows would ship the previous build without a word.
 
 ## The publisher was silently dropping events (fixed)
 
@@ -205,8 +225,5 @@ primal and the gateway still served the old build — see "If the gateway will n
 
 ## Recommendation
 
-Move `mkbundle.py`, `publish.lisp` and `node_modules/` into this directory (or a sibling
-`client/`), and make the standalone pages import the shared gesture layer instead of copying it.
-The build dir is in `/tmp` under a session-scoped path — a scratchpad cleanup takes the build
-script, the publisher, **and the site key** with it. `index-nostr.html` is in the repo and would
-survive; nothing else in the pipeline would.
+Make the standalone pages (`index.html`, `index-ws.html`) import the shared gesture layer instead
+of keeping hand-copied versions of it.
