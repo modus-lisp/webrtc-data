@@ -370,7 +370,14 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                             :qi *video-qi* :fps *video-fps*
                             :max-qi *video-max-qi* :target-kbs *video-target-kbs*
                             :max-frame-kb *video-max-frame-kb* :cleanup-ms *video-cleanup-ms*
-                            :source (when cap (lambda () (capture-take cap)))
+                            ;; RESOLUTION FOLLOWS DAMAGE.  The sender publishes the divisor it
+                            ;; wants (WEBRTC-MEDIA:VIDEO-SCALE, decided from the damage its own
+                            ;; encoder measured) and the capture box-filters the desktop down to
+                            ;; it.  A source that ignored this would simply never change size,
+                            ;; which is the behaviour this had before.
+                            :source (when cap
+                                      (lambda ()
+                                        (capture-take cap :scale (webrtc-media:video-scale))))
                             :on-stats (lambda (v)
                                         (write-stats
                                          (list :video v
@@ -383,9 +390,10 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                                                :qi-base *video-qi* :target-kbs *video-target-kbs*)))
                             :log (lambda (m)
                                    (let ((cs (and cap (capture-stats cap))))
-                                     (format *error-output* "~&[video] ~a~@[ | glass wait ~,0fms conv ~,0fms upd ~a px ~a copies ~a rc ~a~]~%"
+                                     (format *error-output* "~&[video] ~a~@[ | glass wait ~,0fms conv ~,0fms upd ~a px ~a copies ~a rc ~a scale 1/~a (~a downscales)~]~%"
                                              m (and cs (getf cs :wait-ms)) (and cs (getf cs :convert-ms))
-                                             (and cs (getf cs :updates)) (and cs (getf cs :px)) (and cs (getf cs :copies)) (and cs (getf cs :reconnects))))))))
+                                             (and cs (getf cs :updates)) (and cs (getf cs :px)) (and cs (getf cs :copies)) (and cs (getf cs :reconnects))
+                                             (and cs (getf cs :scale)) (and cs (getf cs :scaled))))))))
                    (format *error-output* "~&[gw-nostr] video started — VP8 pt=~a qi=~a fps=~a maxqi=~a target=~aKB/s frame<=~aKB cleanup=~ams backlog-qi=~a/~ax~%"
                            *video-pt* *video-qi* *video-fps* *video-max-qi* *video-target-kbs*
                            *video-max-frame-kb* *video-cleanup-ms*

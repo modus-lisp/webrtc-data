@@ -13,6 +13,11 @@
   host port (n-reconnect 0)                    ; for the supervisor
   (t-wait 0d0) (t-conv 0d0) (n-upd 0) (px 0) (n-copy 0)   ; capture-side timing
   mb-cols mb-rows dirty-mbs                    ; per-macroblock dirty flags, straight from RFB
+  ;; ---- the scaled mirror (see CAPTURE-TAKE) ----
+  ;; The planes above are always the desktop at ITS OWN size; these are a box-filtered copy of them
+  ;; at 1/SCALE, rebuilt only where the full-res planes were reported dirty.  NIL until a caller
+  ;; first asks for a scale other than 1.
+  (scale 1) s-y s-u s-v (n-scaled 0)
   (dirty nil) (lock (bt:make-lock)) (stop nil) thread)   ; dirty only after a real update
 
 (defun %rd (stream n)
@@ -200,8 +205,11 @@ active desktop), and on generic arithmetic it was costing ~14% of wall-clock."
   "Capture-side timing since the last call: how long glass kept us waiting for an update, and how
 long converting its rectangles to YUV took.  Resets the counters."
   (prog1 (list :updates (cap-n-upd c) :wait-ms (cap-t-wait c) :convert-ms (cap-t-conv c)
-               :px (cap-px c) :copies (cap-n-copy c) :reconnects (cap-n-reconnect c))
-    (setf (cap-n-upd c) 0 (cap-t-wait c) 0d0 (cap-t-conv c) 0d0 (cap-px c) 0 (cap-n-copy c) 0)))
+               :px (cap-px c) :copies (cap-n-copy c) :reconnects (cap-n-reconnect c)
+               ;; which resolution the encoder is being handed, and how many times we downscaled
+               :scale (cap-scale c) :scaled (cap-n-scaled c))
+    (setf (cap-n-upd c) 0 (cap-t-wait c) 0d0 (cap-t-conv c) 0d0 (cap-px c) 0 (cap-n-copy c) 0
+          (cap-n-scaled c) 0)))
 
 (defun %capture-reconnect (c)
   "Re-handshake with glass on a fresh socket and force a full refresh.  The framebuffer planes are
@@ -248,14 +256,201 @@ losing this thread freezes the screen with no way back.  Returns the CAPTURE."
   (setf (cap-stop c) t)
   (ignore-errors (close (cap-socket c))))
 
-(defun capture-take (c)
+;;; ---- the scaled mirror -------------------------------------------------------------------------
+;;;
+;;; VP8's frame size is a property of the FRAME, so a picture is entirely one resolution — there is
+;;; no way to code a quarter-size region inside a full-size frame.  What the sender can do is decide
+;;; per frame, and it decides on DAMAGE: local damage stays full size and codes a handful of
+;;; macroblocks (dropping resolution there would throw away detail the viewer already holds, and
+;;; charge a keyframe for the privilege), while damage that is genuinely global has no detail left
+;;; to protect and is four to sixteen times cheaper one or two rungs down.
+;;;
+;;; So this file offers the desktop at 1/1, 1/2 or 1/4, and the choice is the caller's.
+;;;
+;;; TWO THINGS MAKE IT WORTH DOING AND BOTH ARE MACROBLOCK COUNTS, NOT BITRATES.  A keyframe is
+;;; ~5.5 bytes per macroblock at the coarsest quantizer VP8 has, so a 1280x800 one is 22 KB however
+;;; slow the link is; quartering the macroblocks quarters that.  And every inter frame spends a skip
+;;; bit per macroblock whether it codes anything or not.  A third thing falls out for free: VP8's
+;;; motion vectors reach +-255 pixels, so a scroll that displaces 400 px between two delivered
+;;; frames has NO vector at full size and a 100 px one at quarter size — inside the search range,
+;;; where it costs a mode bit instead of a whole new picture.
+;;;
+;;; BOX-AVERAGE, NOT POINT-SAMPLE.  Dropping every other pixel of a text rendering aliases the
+;;; stems into and out of existence; averaging the block leaves grey where the glyph was, which
+;;; both reads better and — because it is smooth — costs the encoder less.
+;;;
+;;; DAMAGE MAPS EXACTLY, WHICH IS WHY THE BLOCK SIZE IS A MACROBLOCK.  A full-res macroblock is
+;;; 16 px, so at scale S it becomes a 16/S px square at (16/S)*(mbx,mby) — integer aligned for
+;;; S in {1,2,4} — and its scaled MACROBLOCK is (floor mbx S), (floor mby S).  Rescaling exactly the
+;;; macroblocks RFB reported dirty therefore leaves the rest of the mirror alone, and the dirty set
+;;; the caller gets back is the same damage stated in the smaller grid.
+
+(defparameter *capture-scales* '(1 2 4)
+  "The resolution divisors CAPTURE-TAKE will produce.  Integers only, and only powers of two: a
+macroblock (16 px luma, 8 px chroma) has to divide into whole scaled pixels or damage stops
+mapping onto macroblock boundaries and the encoder is told the wrong thing changed.")
+
+(defun scaled-dims (w h scale)
+  "The (values sw sh cw ch) a SCALE-divided mirror of a W x H desktop has.  Rounded DOWN to an even
+number of pixels so 4:2:0 chroma stays a whole sample."
+  (if (= scale 1)
+      (values w h (ceiling w 2) (ceiling h 2))
+      (let ((sw (logandc2 (floor w scale) 1)) (sh (logandc2 (floor h scale) 1)))
+        (values sw sh (ceiling sw 2) (ceiling sh 2)))))
+
+(defun %box-2 (src sw dst dw sx sy n)
+  "Box-average by 2, with no clamping: the caller has established the block lies wholly inside both
+planes.  This is the hot path — a scroll rescales the whole screen on every capture — and the
+bounds test hoisted out of the inner loop is most of its cost."
+  (declare (type (simple-array (unsigned-byte 8) (*)) src dst)
+           (type fixnum sw dw sx sy n) (optimize (speed 3) (safety 0)))
+  (let ((dx0 (ash sx -1)) (dy0 (ash sy -1)))
+    (declare (type fixnum dx0 dy0))
+    (dotimes (r n)
+      (let ((r0 (* sw (+ sy (ash r 1)))) (r1 (* sw (+ sy (ash r 1) 1)))
+            (d (+ (* dw (+ dy0 r)) dx0)))
+        (declare (type fixnum r0 r1 d))
+        (dotimes (col n)
+          (let ((a (+ sx (ash col 1))))
+            (declare (type fixnum a))
+            (setf (aref dst (+ d col))
+                  (ash (+ (aref src (+ r0 a)) (aref src (+ r0 a 1))
+                          (aref src (+ r1 a)) (aref src (+ r1 a 1)))
+                       -2))))))))
+
+(defun %box-4 (src sw dst dw sx sy n)
+  "Box-average by 4, unclamped.  See %BOX-2."
+  (declare (type (simple-array (unsigned-byte 8) (*)) src dst)
+           (type fixnum sw dw sx sy n) (optimize (speed 3) (safety 0)))
+  (let ((dx0 (ash sx -2)) (dy0 (ash sy -2)))
+    (declare (type fixnum dx0 dy0))
+    (dotimes (r n)
+      (let ((d (+ (* dw (+ dy0 r)) dx0)) (y0 (+ sy (ash r 2))))
+        (declare (type fixnum d y0))
+        (dotimes (col n)
+          (let ((a (+ sx (ash col 2))) (sum 0))
+            (declare (type fixnum a sum))
+            (dotimes (ky 4)
+              (let ((ro (+ (* sw (+ y0 ky)) a)))
+                (declare (type fixnum ro))
+                (incf sum (+ (aref src ro) (aref src (+ ro 1))
+                             (aref src (+ ro 2)) (aref src (+ ro 3))))))
+            (setf (aref dst (+ d col)) (ash sum -4))))))))
+
+(defun %box-down (src sw sh dst dw dh sx sy n scale)
+  "Box-average the (N*SCALE) square of SRC at (SX,SY) into the N square of DST at (SX/SCALE,SY/SCALE).
+Source reads are clamped to the plane, destination writes outside it are dropped, so a desktop whose
+size is not a multiple of the scale loses its last column rather than corrupting memory."
+  (declare (type (simple-array (unsigned-byte 8) (*)) src dst)
+           (type fixnum sw sh dw dh sx sy n scale)
+           (optimize (speed 3) (safety 0)))
+  ;; wholly inside both planes — the overwhelmingly common case, and the only one worth typing
+  (when (and (<= (+ sx (* n scale)) sw) (<= (+ sy (* n scale)) sh)
+             (<= (+ (floor sx scale) n) dw) (<= (+ (floor sy scale) n) dh))
+    (case scale
+      (2 (return-from %box-down (%box-2 src sw dst dw sx sy n)))
+      (4 (return-from %box-down (%box-4 src sw dst dw sx sy n)))))
+  (let ((dx0 (floor sx scale)) (dy0 (floor sy scale)) (area (* scale scale)))
+    (declare (type fixnum dx0 dy0 area))
+    (dotimes (r n)
+      (let ((dy (+ dy0 r)))
+        (when (< dy dh)
+          (let ((drow (* dy dw)))
+            (dotimes (col n)
+              (let ((dx (+ dx0 col)))
+                (when (< dx dw)
+                  (let ((sum 0))
+                    (declare (type fixnum sum))
+                    (dotimes (ky scale)
+                      (let ((py (min (1- sh) (+ sy (* r scale) ky))))
+                        (declare (type fixnum py))
+                        (let ((srow (* py sw)))
+                          (dotimes (kx scale)
+                            (incf sum (aref src (+ srow (min (1- sw)
+                                                             (the fixnum
+                                                                  (+ sx (* col scale) kx))))))))))
+                    (setf (aref dst (+ drow dx)) (the (unsigned-byte 8) (floor sum area)))))))))))))
+
+(defun %ensure-scaled (c scale)
+  "Allocate (or reallocate) the scaled mirror for SCALE.  Returns T if it had to be built from
+scratch, in which case every macroblock has to be rescaled rather than only the dirty ones."
+  (multiple-value-bind (sw sh cw ch) (scaled-dims (cap-width c) (cap-height c) scale)
+    (let ((ny (* sw sh)) (nc (* cw ch)))
+      (if (and (cap-s-y c) (= scale (cap-scale c))
+               (= ny (length (the (simple-array (unsigned-byte 8) (*)) (cap-s-y c))))
+               (= nc (length (the (simple-array (unsigned-byte 8) (*)) (cap-s-u c)))))
+          nil
+          (progn
+            (setf (cap-scale c) scale
+                  (cap-s-y c) (make-array ny :element-type '(unsigned-byte 8) :initial-element 16)
+                  (cap-s-u c) (make-array nc :element-type '(unsigned-byte 8) :initial-element 128)
+                  (cap-s-v c) (make-array nc :element-type '(unsigned-byte 8) :initial-element 128))
+            t)))))
+
+(defun %rescale-mbs (c scale bits)
+  "Rebuild the scaled mirror over every macroblock flagged in BITS (a full-res dirty set)."
+  (%ensure-scaled c scale)                    ; %BOX-DOWN runs at (safety 0); never hand it a NIL
+  (multiple-value-bind (sw sh cw ch) (scaled-dims (cap-width c) (cap-height c) scale)
+    (let ((mc (cap-mb-cols c)) (mr (cap-mb-rows c))
+          (fw (cap-width c)) (fh (cap-height c))
+          (fcw (cap-cw c)) (fch (cap-ch c))
+          (ln (floor 16 scale)) (cn (floor 8 scale)))
+      (dotimes (my mr)
+        (dotimes (mx mc)
+          (when (= 1 (aref bits (+ (* my mc) mx)))
+            (%box-down (cap-y c) fw fh (cap-s-y c) sw sh (* 16 mx) (* 16 my) ln scale)
+            (%box-down (cap-u c) fcw fch (cap-s-u c) cw ch (* 8 mx) (* 8 my) cn scale)
+            (%box-down (cap-v c) fcw fch (cap-s-v c) cw ch (* 8 mx) (* 8 my) cn scale))))
+      (incf (cap-n-scaled c))
+      (values sw sh))))
+
+(defun %scale-dirty (c scale bits)
+  "BITS, a full-res macroblock damage set, restated on the scaled macroblock grid: a scaled
+macroblock is dirty when ANY of the SCALE x SCALE full-res macroblocks inside it is."
+  (multiple-value-bind (sw sh) (scaled-dims (cap-width c) (cap-height c) scale)
+    (let* ((mc (cap-mb-cols c)) (mr (cap-mb-rows c))
+           (smc (ceiling sw 16)) (smr (ceiling sh 16))
+           (out (make-array (* smc smr) :element-type 'bit :initial-element 0)))
+      (dotimes (my mr out)
+        (dotimes (mx mc)
+          (when (= 1 (aref bits (+ (* my mc) mx)))
+            ;; (16/SCALE)*mx is where this macroblock's pixels land, so its scaled macroblock is
+            ;; that divided by 16 — i.e. (floor mx SCALE).  Clamped because the scaled plane is
+            ;; rounded down and the last full-res macroblock may fall off the edge.
+            (let ((sx (min (1- smc) (floor mx scale))) (sy (min (1- smr) (floor my scale))))
+              (setf (aref out (+ (* sy smc) sx)) 1))))))))
+
+(defun capture-take (c &key (scale 1))
   "If the desktop changed since the last call, return (values Y U V w h dirty-mbs); else NIL.
 DIRTY-MBS flags exactly the macroblocks glass reported as updated, so the encoder can go straight
-to them instead of scanning the screen."
+to them instead of scanning the screen.
+
+SCALE, one of *CAPTURE-SCALES*, asks for the desktop box-filtered down by that factor — see the
+commentary above.  A CHANGE of scale always produces a frame, dirty or not, and that frame reports
+the whole screen as damaged: the caller has asked for a picture it does not have at all, and VP8
+will have to send a keyframe for it regardless."
   (bt:with-lock-held ((cap-lock c))
-    (when (cap-dirty c)
-      (setf (cap-dirty c) nil)
-      (let ((d (cap-dirty-mbs c)))
-        (setf (cap-dirty-mbs c) (make-array (length d) :element-type 'bit :initial-element 0))
-        (values (copy-seq (cap-y c)) (copy-seq (cap-u c)) (copy-seq (cap-v c))
-                (cap-width c) (cap-height c) d)))))
+    (let ((scale (if (member scale *capture-scales*) scale 1)))
+      (if (= scale 1)
+          ;; the unscaled path is exactly what it always was, allocation and all
+          (when (or (cap-dirty c) (/= 1 (cap-scale c)))
+            (let ((fresh (/= 1 (cap-scale c))))
+              (setf (cap-dirty c) nil (cap-scale c) 1
+                    (cap-s-y c) nil (cap-s-u c) nil (cap-s-v c) nil)
+              (let ((d (cap-dirty-mbs c)))
+                (setf (cap-dirty-mbs c)
+                      (make-array (length d) :element-type 'bit :initial-element 0))
+                (when fresh (fill d 1))
+                (values (copy-seq (cap-y c)) (copy-seq (cap-u c)) (copy-seq (cap-v c))
+                        (cap-width c) (cap-height c) d))))
+          (let ((fresh (%ensure-scaled c scale)))
+            (when (or (cap-dirty c) fresh)
+              (setf (cap-dirty c) nil)
+              (let ((d (cap-dirty-mbs c)))
+                (setf (cap-dirty-mbs c)
+                      (make-array (length d) :element-type 'bit :initial-element 0))
+                ;; a mirror that has just been allocated holds nothing, so everything is dirty
+                (when fresh (fill d 1))
+                (multiple-value-bind (sw sh) (%rescale-mbs c scale d)
+                  (values (copy-seq (cap-s-y c)) (copy-seq (cap-s-u c)) (copy-seq (cap-s-v c))
+                          sw sh (%scale-dirty c scale d))))))))))
