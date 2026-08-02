@@ -330,6 +330,37 @@
     qPanel.append(qHead, qRow, qNote); document.body.appendChild(qPanel);
     // the box answers every message with the state it is ACTUALLY in, so the highlight follows the
     // encoder rather than the tap
+    // COMING BACK FROM THE BACKGROUND.  iOS suspends a backgrounded tab: the <video> element is
+    // paused and the decoder misses every frame that arrives while we are away.  Returning therefore
+    // needs two separate things, and doing only one leaves the same symptom —
+    //
+    //   * play() again.  A paused element keeps showing its last frame, which looks exactly like a
+    //     dead connection even though the transport never dropped and bytes are still arriving
+    //     (this is why the debug view shows data moving while the picture is frozen);
+    //   * ask for a keyframe.  Even once playing, the decoder holds a reference the encoder has long
+    //     since predicted past, so every inter frame it receives is unusable.  Left alone it repairs
+    //     itself only at the next periodic resync, which after the first 30s of a session is up to
+    //     30 seconds away.
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState !== 'visible') return;
+      // If the session did not survive being away, resuming the element cannot help — reconnect.
+      const dead = pc.connectionState === 'failed' || pc.connectionState === 'closed' ||
+                   pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'closed';
+      if (dead) {
+        diag('returned to foreground — session is ' + pc.connectionState + '/' + pc.iceConnectionState);
+        scheduleReconnect('dead on resume');
+        return;
+      }
+      const vp = vidEl.play && vidEl.play(); if (vp && vp.catch) vp.catch(() => {});
+      if (videoPrimary) syncVideo();
+      if (ctrl.readyState === 'open') {
+        ctrl.send(JSON.stringify({ request: 'keyframe' }));
+        diag('returned to foreground — play() + keyframe requested');
+      } else {
+        diag('returned to foreground — control channel ' + ctrl.readyState);
+      }
+    });
+
     ctrl.addEventListener('message', e => {
       let m = null; try { m = JSON.parse(e.data); } catch (_) { return; }
       if (!m || !m.profile) return;
@@ -619,6 +650,51 @@
       }, opt);
     })();
 
+    // --- automatic reconnect ------------------------------------------------------------------
+    // Both credentials outlive the page: the device key is in localStorage for ~24h (the box renews
+    // its enrolment on every admitted connection) and the one-time code is re-issued with every
+    // answer.  So a reload IS a clean reconnect — it needs no fresh link and no user action.
+    //
+    // A reload rather than a new RTCPeerConnection because `pc` is created once at module scope and
+    // half the page closes over it; rebuilding it in place would mean re-attaching every handler,
+    // which is a much larger change than the problem warrants.
+    //
+    // Bounded, because a box that is genuinely down must not become a reload loop: exponential
+    // backoff, capped, and the counter lives in sessionStorage so it survives the very reload it is
+    // counting.  A first frame means we are healthy, so the count resets there.
+    // Computed on CALL, not here: `hp` and `params` are declared further down, so building the key
+    // at module-eval time is a const TDZ ReferenceError — which kills the whole script and shows a
+    // blank page.  Everything below runs after the module has finished evaluating.
+    const reconnKey = () => 'glass-reconn:' + boxArg;
+    const reconnAttempts = () => { try { return +(sessionStorage.getItem(reconnKey()) || 0) || 0; }
+                                   catch (_) { return 0; } };
+    const setReconnAttempts = n => { try { sessionStorage.setItem(reconnKey(), String(n)); } catch (_) {} };
+    const clearReconnAttempts = () => { try { sessionStorage.removeItem(reconnKey()); } catch (_) {} };
+    let reconnecting = false;
+    function scheduleReconnect(why) {
+      if (reconnecting) return;
+      if (!(codeAlive(loadCode()) || hasDevice())) {          // nothing to reconnect WITH
+        diag('not reconnecting: no usable credential (' + why + ')');
+        if (window.__showNoCredential) window.__showNoCredential();
+        return;
+      }
+      const n = reconnAttempts();
+      if (n >= 6) {
+        setConnRaw('Could not reconnect');
+        failConn();
+        diag('giving up after ' + n + ' reconnect attempts (' + why + ')');
+        return;
+      }
+      reconnecting = true;
+      setReconnAttempts(n + 1);
+      const delay = Math.min(30000, 1000 * Math.pow(2, n));
+      connEl.style.display = ''; connEl.style.opacity = '';    // bring the overlay back
+      connHidden = false;
+      setConnRaw('Reconnecting…' + (n ? ' (attempt ' + (n + 1) + ')' : ''));
+      diag('reconnect in ' + delay + 'ms — ' + why + ' (attempt ' + (n + 1) + ')');
+      setTimeout(() => location.reload(), delay);
+    }
+
     // --- diagnostics: on-screen lifecycle log + selected ICE path + transport bytes ----------
     // Mobile has no console, so surface the whole connection lifecycle on the page.  The key
     // tells for "connects but blank": the ICE PATH (host/srflx/relay) + transport rx bytes show
@@ -664,7 +740,7 @@
     let gotFirstFrame = false;
     const origFBU = rfb._framebufferUpdate.bind(rfb);
     rfb._framebufferUpdate = function () { const done = origFBU();
-      if (done) { frames++; if (!gotFirstFrame) { gotFirstFrame = true; hideConn(); } } return done; };
+      if (done) { frames++; if (!gotFirstFrame) { gotFirstFrame = true; hideConn(); clearReconnAttempts(); } } return done; };
     ch.addEventListener('message', e => { bytesIn += (e.data.byteLength ?? e.data.length ?? 0); msgsIn++; });
 
     const hud = document.getElementById('hud');
@@ -723,9 +799,9 @@
     window.addEventListener('unhandledrejection', e => diag('REJECT ' + ((e.reason && e.reason.message) || e.reason)));
     pc.addEventListener('iceconnectionstatechange', () => {
       diag('ice ' + pc.iceConnectionState);
-      if (pc.iceConnectionState === 'failed' && !connHidden) {
-        setConnRaw('Could not reach your desktop');
-        failConn();
+      if (pc.iceConnectionState === 'failed') {
+        if (!connHidden) { setConnRaw('Could not reach your desktop'); failConn(); }
+        scheduleReconnect('ice failed');          // bounded; gives up loudly after 6 tries
       }
     });
     pc.addEventListener('connectionstatechange', () => diag('conn ' + pc.connectionState));
@@ -819,7 +895,30 @@
     const params = new URLSearchParams(location.search);
     const hraw = location.hash.replace(/^#/, '');
     const hp = new URLSearchParams(hraw.includes('=') ? hraw : ('box=' + hraw));   // bare npub or box=/code=
-    const boxArg = hp.get('box') || params.get('box') ||
+    // WHICH BOX, remembered.  The magic link carries #box=…&code=…, but the code is short-lived and
+    // the box npub never changes — so keeping the box lets a BARE url (…/k28.html, no fragment) find
+    // the credentials already in localStorage.  That is what makes a new build reachable without
+    // pulling a fresh link every time we publish.
+    const BOX_KEY = 'glass-box';
+    const storeBox = b => { try { localStorage.setItem(BOX_KEY, b); } catch (_) {} };
+    const loadBox = () => {
+      try {
+        const b = localStorage.getItem(BOX_KEY);
+        if (b) return b;
+        // Nothing stored yet, but an earlier build may already hold this box's credentials under
+        // glass-device:<box> / glass-code:<box>.  Recovering the box from those means an install
+        // that predates this change gets bare-url access without needing a link first.
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i) || '';
+          const m = k.match(/^glass-(?:device|code):(.+)$/);
+          if (m && m[1] !== 'default') return m[1];
+        }
+      } catch (_) {}
+      return '';
+    };
+    const urlBox = hp.get('box') || params.get('box') || '';
+    if (urlBox) storeBox(urlBox);                                // arrived with a link: remember it
+    const boxArg = urlBox || loadBox() ||
       '75427ab8309aad26beea8142edf427674e4544604ae4dc5045108ad21fc8a0db';   // dev fallback
     // ---- credential handling --------------------------------------------------------------
     // The token is  nonce.exp.mac  with exp a unix time, so the browser can judge its own
@@ -830,7 +929,7 @@
     const codeExp = c => { const p = String(c || '').split('.'); const e = parseInt(p[1], 10);
                            return (p.length === 3 && isFinite(e)) ? e * 1000 : 0; };
     const codeAlive = (c, marginMs = 0) => { const e = codeExp(c); return e > 0 && (e - marginMs) > Date.now(); };
-    const CODE_KEY = 'glass-code:' + (hp.get('box') || params.get('box') || 'default');
+    const CODE_KEY = 'glass-code:' + boxArg;      // the resolved box, so a bare url finds the same slot
     const storeCode = c => { try { if (codeAlive(c)) localStorage.setItem(CODE_KEY, c); } catch (_) {} };
     const loadCode = () => { try { const c = localStorage.getItem(CODE_KEY); return codeAlive(c) ? c : ''; } catch (_) { return ''; } };
     const urlCode = hp.get('code') || params.get('code') || '';
@@ -869,7 +968,7 @@
     // fresh magic link over the same gift-wrapped DM channel — no user, no NIP-07 signer.
     const hex = u8 => [...u8].map(b => b.toString(16).padStart(2, '0')).join('');
     const unhex = h => new Uint8Array(h.match(/../g).map(x => parseInt(x, 16)));
-    const DEV_KEY = 'glass-device:' + (hp.get('box') || params.get('box') || 'default');
+    const DEV_KEY = 'glass-device:' + boxArg;     // same slot whether the box came from the url or storage
     const hasDevice = () => { try { const h = localStorage.getItem(DEV_KEY); return !!h && h.length === 64; }
                               catch (_) { return false; } };
     const deviceSecret = () => {
@@ -907,10 +1006,17 @@
 
     // Choose an identity from the URL: a code -> this device's key; else -> NIP-07.
     async function makeIdentity() {
-      if (code) {
+      // A code OR an already-enrolled device key.  The box admits three ways in — code, allowlist,
+      // device — and honours an enrolled device for ~24h, renewing it on every admitted connection.
+      // The page used to insist on a code, so it locked itself out as soon as the stored one aged
+      // past its ~30 minute TTL, even though the box would still have taken us for another day.
+      //
+      // hasDevice(), not deviceSecret(): the latter MINTS a key when none exists, and a brand-new
+      // key is by definition not enrolled — we would sign a well-formed offer the box then refuses.
+      if (code || hasDevice()) {
         const sk = deviceSecret();
         return {
-          pub: getPublicKey(sk), mode: 'code',
+          pub: getPublicKey(sk), mode: code ? 'code' : 'device',
           wrapOffer: (payload) => wrapEvent({ kind: 14, content: payload, tags: [['p', boxPub]] }, sk, boxPub),
           unwrap: (ev) => { try { const r = unwrapEvent(ev, sk); return (r && r.pubkey === boxPub) ? r.content : null; }
                             catch { return null; } },
@@ -918,7 +1024,7 @@
       }
       const signer = window.nostr;
       if (!signer || !signer.nip44)
-        throw new Error('No login code in the link, and no NIP-07 signer found — open the one-time link from your DM, or use a Nostr signer.');
+        throw new Error('No login code, no enrolled device, and no NIP-07 signer — open the one-time link from your DM, or use a Nostr signer.');
       const pub = await signer.getPublicKey();
       return { pub, mode: 'nip07',
                wrapOffer: (payload) => giftWrap07(signer, pub, payload),
