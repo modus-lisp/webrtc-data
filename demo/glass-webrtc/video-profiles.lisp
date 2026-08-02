@@ -190,6 +190,16 @@ so the phone's stepper shows what the box actually did rather than what was aske
       (when want
         (unless (apply-video-rung want)
           (format *error-output* "~&[rung] ignoring off-ladder rate ~a kbps~%" want))))
+    ;; "keyframe": the viewer knows its decoder is stranded and we do not.  We parse no RTCP, so
+    ;; there is no PLI to hear — this channel is the ONLY way a viewer can ask, which is exactly why
+    ;; the blind periodic resync above cannot be removed outright, only made affordable.  iOS
+    ;; suspends a backgrounded tab, so the phone misses every frame while it is away and comes back
+    ;; holding a reference the encoder has long since predicted past.
+    (let ((req (%json-string-value json "request")))
+      (when (equal req "keyframe")
+        (setf webrtc-media:*force-keyframe* t)
+        (format *error-output* "~&[video] keyframe requested by the viewer~%")
+        (finish-output *error-output*)))
     (ignore-errors (sctp-send-string assoc sid (video-profile-status)))))
 
 ;; Adopt the environment at load time: the sender then starts on exactly the rung the keepalive
