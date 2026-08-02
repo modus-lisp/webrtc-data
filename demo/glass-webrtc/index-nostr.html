@@ -276,58 +276,76 @@
         diag('speaker on');
       }
     });
-    // --- video quality: three profiles, switched on the running encoder ----------------------
+    // --- video bandwidth: a seven-rung ladder in kbps, moved on the running encoder -----------
     // The box changes its encoder's knobs mid-stream, so a tap costs nothing: same session, same
-    // RTP stream, no reconnect.  The panel shows the video's OWN KB/s and fps beside the buttons,
-    // because that is the trade-off being made — "responsive" is not better, it is more bytes for
-    // a screen that keeps up while it moves.
+    // RTP stream, no reconnect.  The panel shows the video's OWN KB/s and fps beside the ladder,
+    // because that is the number a rung actually moves — and it is the only honest check that the
+    // box did what the tap asked for.
+    //
+    // RUNGS ARE KILOBITS/S, which is how a constrained link is described; the box works in
+    // kiloBYTES/s internally and answers with both, so the detail line can show what the rate
+    // turned into.  Seven across would be 30px a button, so they are laid out FOUR THEN THREE —
+    // still one tap to any rung, which a stepper would not be.
     //
     // It must not eat gestures.  The touch layer listens on #screen, so anything parented to
     // <body> is already out of its way; on top of that the panel itself is pointer-events:none and
     // only the buttons take input, so a two-finger scroll or a hold that begins on the panel's
     // background still reaches the desktop underneath.
-    const QPROFILES = ['responsive', 'balanced', 'sharp'];
+    let QRUNGS = [5, 10, 20, 40, 80, 160, 320];
     let qCurrent = null, qPending = null;
     const qPanel = document.createElement('div');
-    qPanel.style.cssText = 'position:fixed;left:14px;bottom:140px;z-index:22;width:212px;display:none;' +
-      'flex-direction:column;gap:7px;background:rgba(0,0,0,.55);padding:9px 11px;border-radius:11px;' +
+    qPanel.style.cssText = 'position:fixed;left:14px;bottom:140px;z-index:22;width:232px;display:none;' +
+      'flex-direction:column;gap:6px;background:rgba(0,0,0,.55);padding:9px 11px;border-radius:11px;' +
       'font:11px ui-monospace,monospace;color:#cdd6df;pointer-events:none';
     const qHead = document.createElement('div');
     qHead.style.cssText = 'display:flex;justify-content:space-between;align-items:baseline;gap:8px';
-    const qTitle = document.createElement('span'); qTitle.textContent = 'video';
+    const qTitle = document.createElement('span'); qTitle.textContent = 'video kbps';
     const qRate = document.createElement('span');
     qRate.style.cssText = 'color:#7CFC9B;font-variant-numeric:tabular-nums';
     qRate.textContent = '– KB/s · – fps';
     qHead.append(qTitle, qRate);
-    const qRow = document.createElement('div'); qRow.style.cssText = 'display:flex;gap:5px';
-    const qNote = document.createElement('div'); qNote.style.cssText = 'color:#8a949c;min-height:1.3em';
-    const qBtns = {};
+    const qGrid = document.createElement('div');
+    qGrid.style.cssText = 'display:flex;flex-direction:column;gap:4px';
+    const qNote = document.createElement('div'); qNote.style.cssText = 'color:#8a949c;min-height:2.6em';
+    const qBtns = new Map();
     const paintQ = () => {
-      for (const [name, b] of Object.entries(qBtns)) {
-        const on = name === qCurrent, wait = name === qPending;
+      for (const [kbps, b] of qBtns) {
+        const on = kbps === qCurrent, wait = kbps === qPending;
         b.style.color = on ? '#7CFC9B' : (wait ? '#cdd6df' : '#8a949c');
         b.style.background = on ? 'rgba(124,252,155,.16)' : 'rgba(255,255,255,.06)';
         b.style.borderColor = on ? '#7CFC9B' : (wait ? 'rgba(255,255,255,.45)' : 'rgba(255,255,255,.18)');
       }
     };
-    const sendProfile = name => {
+    const sendRung = kbps => {
       if (ctrl.readyState !== 'open') { qNote.textContent = 'control channel ' + ctrl.readyState; return; }
-      qPending = name; paintQ(); qNote.textContent = 'switching to ' + name + '…';
-      ctrl.send(JSON.stringify({ profile: name }));
-      diag('profile -> ' + name);
+      qPending = kbps; paintQ(); qNote.textContent = 'moving to ' + kbps + ' kbps…';
+      ctrl.send(JSON.stringify({ kbps }));
+      diag('rung -> ' + kbps + ' kbps');
     };
-    for (const name of QPROFILES) {
-      const b = document.createElement('button');
-      b.textContent = name;
-      // pointer-events:auto only on the button itself; touch-action stops the browser waiting to
-      // see whether the tap was the start of a zoom
-      b.style.cssText = 'pointer-events:auto;touch-action:manipulation;flex:1;padding:7px 4px;' +
-        'border-radius:8px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);' +
-        'color:#8a949c;font:10px ui-monospace,monospace';
-      b.addEventListener('click', e => { e.stopPropagation(); sendProfile(name); });
-      qBtns[name] = b; qRow.appendChild(b);
-    }
-    qPanel.append(qHead, qRow, qNote); document.body.appendChild(qPanel);
+    // Rebuilt from whatever ladder the box reports, so adding a rung on the box needs no new build
+    // of this page — the row split follows the count rather than assuming seven.
+    const buildRungs = () => {
+      qGrid.textContent = ''; qBtns.clear();
+      const perRow = Math.ceil(QRUNGS.length / 2);
+      for (let i = 0; i < QRUNGS.length; i += perRow) {
+        const row = document.createElement('div'); row.style.cssText = 'display:flex;gap:4px';
+        for (const kbps of QRUNGS.slice(i, i + perRow)) {
+          const b = document.createElement('button');
+          b.textContent = kbps;
+          // pointer-events:auto only on the button itself; touch-action stops the browser waiting
+          // to see whether the tap was the start of a zoom
+          b.style.cssText = 'pointer-events:auto;touch-action:manipulation;flex:1;padding:7px 2px;' +
+            'border-radius:7px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);' +
+            'color:#8a949c;font:11px ui-monospace,monospace';
+          b.addEventListener('click', e => { e.stopPropagation(); sendRung(kbps); });
+          qBtns.set(kbps, b); row.appendChild(b);
+        }
+        qGrid.appendChild(row);
+      }
+      paintQ();
+    };
+    buildRungs();
+    qPanel.append(qHead, qGrid, qNote); document.body.appendChild(qPanel);
     // the box answers every message with the state it is ACTUALLY in, so the highlight follows the
     // encoder rather than the tap
     // COMING BACK FROM THE BACKGROUND.  iOS suspends a backgrounded tab: the <video> element is
@@ -363,10 +381,16 @@
 
     ctrl.addEventListener('message', e => {
       let m = null; try { m = JSON.parse(e.data); } catch (_) { return; }
-      if (!m || !m.profile) return;
-      qCurrent = m.profile; qPending = null; paintQ();
-      qNote.textContent = `${m.target_kbs} KB/s cap · frame ≤${m.max_frame_kb} KB · settle ${m.cleanup_ms} ms`;
-      diag('profile = ' + m.profile + ' (' + m.target_kbs + 'KB/s cap)');
+      if (!m || m.kbps == null) return;
+      if (Array.isArray(m.rungs) && m.rungs.join() !== QRUNGS.join()) { QRUNGS = m.rungs; buildRungs(); }
+      qCurrent = m.kbps; qPending = null; paintQ();
+      // The derived settings, because on this ladder they are the whole story: the keyframe
+      // quantizer sets how long the FIRST picture takes, and the resync interval is what used to
+      // saturate the link.  Two lines so the note does not reflow the panel as rungs change.
+      qNote.innerHTML =
+        `${m.target_kbs} KB/s · frame ≤${m.max_frame_kb} KB · settle ${m.cleanup_ms} ms<br>` +
+        `qi ${m.qi}/${m.max_qi} · key qi ${m.key_qi} · resync ${m.key_secs} s`;
+      diag(`rung = ${m.kbps} kbps (${m.target_kbs} KB/s, key qi ${m.key_qi}, resync ${m.key_secs}s)`);
     });
     ctrl.addEventListener('open', () => { diag('control channel OPEN'); ctrl.send('{"get":1}'); });
     ctrl.addEventListener('close', () => diag('control channel CLOSE'));
@@ -826,6 +850,7 @@
     // getStats: which candidate pair won (host/srflx/relay), its rtt, and transport rx bytes
     let pathStr = 'path …', lastRx = 0, lastRxT = performance.now();
     let vidKbs = 0, vidFps = 0, lastVid = null;      // the VP8 stream's own rate, for the quality panel
+    let lastKeyAsk = 0;                              // rate-limits the "I still have no picture" ask
     async function pollPath() {
       try {
         const s = await pc.getStats(); let pair = null;
@@ -853,8 +878,23 @@
               vidFps = ((v.framesDecoded || 0) - lastVid.f) / dt;
             }
           }
+          // A DECIMAL, because the bottom of the ladder is 0.61 KB/s and "0 KB/s" beside a working
+          // stream reads as a dead one.  kbps too — that is the unit the rung is named in.
+          const prevB = lastVid ? lastVid.b : 0;
           lastVid = { t: now, b: v.bytesReceived || 0, f: v.framesDecoded || 0 };
-          qRate.textContent = `${vidKbs.toFixed(0)} KB/s · ${vidFps.toFixed(0)} fps`;
+          qRate.textContent = `${vidKbs.toFixed(1)} KB/s · ${(vidKbs * 8.192).toFixed(0)} kbps · ${vidFps.toFixed(0)} fps`;
+          // THE RECOVERY PATH.  The box parses no RTCP, so it cannot hear a PLI — if our decoder
+          // never got a keyframe there is nothing to tell it except this channel, and its own blind
+          // resync is minutes away at the low rungs by design.  Ask, but only when nothing is
+          // already on its way: a keyframe takes 35 s to arrive at 5 kbps, and re-asking while it
+          // is still in flight would restart it forever.
+          if (videoPrimary && ctrl.readyState === 'open' && !(v.framesDecoded > 0) &&
+              (v.bytesReceived || 0) === prevB && now - tStart > 6000 &&
+              now - lastKeyAsk > 20000) {
+            lastKeyAsk = now;
+            ctrl.send(JSON.stringify({ request: 'keyframe' }));
+            diag('no frame decoded and nothing arriving — keyframe requested');
+          }
         }
       } catch (_) { pathStr = 'path stats-err'; }
     }
@@ -870,7 +910,7 @@
         `pc <b>${pc.connectionState}</b> · ice <b>${pc.iceConnectionState}</b> · dc <b>${ch.readyState}</b>\n` +
         `${pathStr}\n` +
         `dc-in <b>${kbs.toFixed(0)}</b>KB/s ${mps.toFixed(0)}msg · buf ${(buf/1024).toFixed(0)}KB · fps <b>${fps.toFixed(0)}</b>\n` +
-        `vid <b>${vidKbs.toFixed(0)}</b>KB/s · <b>${vidFps.toFixed(0)}</b>fps · profile <b>${qCurrent || '?'}</b>\n` +
+        `vid <b>${vidKbs.toFixed(1)}</b>KB/s · <b>${vidFps.toFixed(0)}</b>fps · rung <b>${qCurrent != null ? qCurrent + 'kbps' : '?'}</b>\n` +
         `rfb ${rfb._rfbConnectionState || '?'} · ${rfb._fbName || '—'}`;
       console.log(`PERF ${(now/1000).toFixed(1)} ${fps.toFixed(1)} ${kbs.toFixed(1)} ${mps.toFixed(1)} ${(buf/1024).toFixed(1)}`);
     }, 1000);

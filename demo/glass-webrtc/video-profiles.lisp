@@ -141,9 +141,10 @@ re-reads it at the top of every pass — plus the backlog quantizer, which lives
       (setf webrtc-media.vp8::*backlog-qi* (getf p :backlog-qi)
             webrtc-media:*video-profile* (list* :name (format nil "~a kbps" kbps) p)
             *video-kbps* kbps)
-      (format *error-output* "~&[rung] ~a kbps (~a) — ~,2f KB/s, qi ~a/~a, keyframe qi ~a, frame<=~,1f KB, settle ~a ms, resync ~,0f s, backlog qi ~a~%"
+      (format *error-output* "~&[rung] ~a kbps (~a) — ~,2f KB/s, qi ~a/~a, keyframe qi ~a, frame<=~,1f KB, settle ~a ms, resync ~a s, backlog qi ~a~%"
               kbps why (getf p :target-kbs) (getf p :qi) (getf p :max-qi) (getf p :key-qi)
-              (getf p :max-frame-kb) (getf p :cleanup-ms) (getf p :key-secs) (getf p :backlog-qi))
+              (getf p :max-frame-kb) (getf p :cleanup-ms) (round (getf p :key-secs))
+              (getf p :backlog-qi))
       (finish-output *error-output*)
       p)))
 
