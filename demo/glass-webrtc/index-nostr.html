@@ -126,26 +126,106 @@
     vidEl.style.cssText = 'position:fixed;right:14px;bottom:78px;z-index:22;width:128px;height:128px;' +
       'border-radius:10px;background:#000;object-fit:contain;display:none;pointer-events:none;box-shadow:0 0 0 1px rgba(255,255,255,.25)';
     document.body.appendChild(vidEl);
+    // PRESENTED frames, which are not decoded frames, and the difference is the whole diagnosis of
+    // "the screen is blank until I pinch".  getStats' framesDecoded says the decoder consumed the
+    // RTP; requestVideoFrameCallback fires when a frame has actually been handed to the compositor.
+    // Blank WITH this counter climbing is a LAYOUT fault — the pixels exist and are going somewhere
+    // nobody can see.  Blank WITH it stopped is a PLAYBACK fault — the element is paused and is
+    // holding its last picture.  They have the same symptom and opposite fixes, so both are counted
+    // rather than guessed, and the count is on the hud so the next report arrives with the answer.
+    let vidPresented = 0, vidPresentAt = 0;
+    if (vidEl.requestVideoFrameCallback) {
+      const onPresent = () => { vidPresented++; vidPresentAt = performance.now();
+                                vidEl.requestVideoFrameCallback(onPresent); };
+      vidEl.requestVideoFrameCallback(onPresent);
+    }
+    // A REJECTED play() IS A MESSAGE, AND THIS USED TO THROW IT AWAY.  autoplay+muted+playsInline
+    // satisfies every current policy, but a track swap, a lost media session or an iOS resume can
+    // still leave the element paused — and a paused <video> keeps showing its last frame, which is
+    // indistinguishable from a dead link.  `.catch(() => {})` discarded the one line that would
+    // have said which of the two it was.
+    let playFails = 0, lastPlayTry = 0;
+    const tryPlay = (why, force) => {
+      if (!vidEl.play) return;
+      const t = performance.now();
+      // A 'pause' handler that calls play() is a loop if play() keeps failing; the explicit
+      // callers (a user gesture, a resume) are exempt because those are exactly the moments a
+      // policy that refused us before will accept us now.
+      if (!force && t - lastPlayTry < 400) return;
+      lastPlayTry = t;
+      const p = vidEl.play();
+      if (p && p.catch) p.catch(err => { playFails++;
+        diag(`play() rejected (${why}): ${(err && err.name) || err}`); });
+    };
+    // Every state that means "there is something to play now", because each is a moment at which a
+    // refusal earlier may no longer stand.
+    for (const ev of ['loadedmetadata', 'loadeddata', 'canplay', 'pause', 'stalled', 'suspend'])
+      vidEl.addEventListener(ev, () => { if (vidEl.paused) tryPlay(ev); });
+    // A TOUCH IS A USER GESTURE and a user gesture is the one thing an autoplay policy cannot
+    // refuse.  CAPTURE on window, because the trackpad's handlers are capture+stopPropagation on
+    // #screen and a bubbling listener would never see the event; PASSIVE, so this can never
+    // preventDefault and cannot change what the gesture layer does with the touch it is watching.
+    window.addEventListener('touchstart', () => { if (vidEl.paused) tryPlay('touch', true); },
+                            { capture: true, passive: true });
     // VIDEO-PRIMARY: the desktop arrives as VP8 video instead of over the VNC data channel.
     // noVNC's canvas stays (invisible) because the touch layer maps coordinates through it and
     // input still rides the data channel — we just don't look at its pixels.
     const videoPrimary = new URLSearchParams(location.search).get('video') !== '0';
-    // The video mirrors the canvas's ON-SCREEN rect, so it inherits the pan/zoom transform the
-    // touch layer applies to the canvas without us transforming it twice.  Coalesced into one
-    // rAF per change: polling this on a timer while pinching thrashed the compositor and hung
-    // the page on iOS.
-    let syncPending = false;
+    // THE VIDEO'S BOX IS THE CANVAS'S *UNTRANSFORMED* RECT AND THE ZOOM IS A TRANSFORM ON TOP OF
+    // IT.  That is the invariant, and breaking it is what produced a blank screen a pinch cured.
+    //
+    // The trackpad zooms by transforming the canvas and gives the video the IDENTICAL transform
+    // (see SYNCVID), so the canvas's getBoundingClientRect() ALREADY CONTAINS the zoom.  Writing
+    // that rect into the video's left/top/width/height while the video still carries the transform
+    // applies the zoom TWICE: at zoom 2 with any pan the picture lands wholly outside the viewport,
+    // with frames still arriving, still decoding and still being presented — into a layer nobody
+    // can see.  Any two-finger touch then runs the trackpad's own APPLYT -> SYNCVID, which rewrites
+    // box and transform together, and the screen "comes back the moment I pinch".  Nothing in that
+    // path calls play(), which is what rules the playback explanation out: a pinch cannot resume a
+    // paused element, so what a pinch repairs is geometry.
+    //
+    // So read the transform the trackpad is holding (it publishes it), undo it to recover the
+    // untransformed rect, and restate BOTH halves together.  Coalesced into one rAF per change:
+    // polling this on a timer while pinching thrashed the compositor and hung the page on iOS.
+    let syncPending = false, syncTries = 0;
     const syncVideoNow = () => {
       syncPending = false;
       if (!videoPrimary) return;
-      const c = document.querySelector('#screen canvas'); if (!c) return;
-      const r = c.getBoundingClientRect();
-      if (!r.width || !r.height) return;
-      vidEl.style.left = r.left + 'px'; vidEl.style.top = r.top + 'px';
-      vidEl.style.width = r.width + 'px'; vidEl.style.height = r.height + 'px';
+      const c = document.querySelector('#screen canvas');
+      const r = c && c.getBoundingClientRect();
+      if (!r || !r.width || !r.height) {
+        // NOT A NO-OP, AND THE OLD ONE WAS.  noVNC creates and sizes this canvas from its own
+        // handshake, so at track time it may not exist yet — and simply returning left the video at
+        // the 1x1 box it is initialised with, invisible, with nothing scheduled to look again.  The
+        // same blank screen by a different road, cured by the same pinch.  Come back for it.
+        if (syncTries++ < 40) setTimeout(syncVideo, 250);
+        return;
+      }
+      syncTries = 0;
+      const x = (window.__vidXform && window.__vidXform()) || null;
+      if (x && x.zoom > 1.001) {          // transform-origin 0 0: rect = untransformed + t, scaled
+        vidEl.style.left = (r.left - x.tx) + 'px'; vidEl.style.top = (r.top - x.ty) + 'px';
+        vidEl.style.width = (r.width / x.zoom) + 'px'; vidEl.style.height = (r.height / x.zoom) + 'px';
+        vidEl.style.transformOrigin = '0 0';
+        vidEl.style.transform = `translate(${x.tx}px,${x.ty}px) scale(${x.zoom})`;
+      } else {
+        vidEl.style.transform = '';
+        vidEl.style.left = r.left + 'px'; vidEl.style.top = r.top + 'px';
+        vidEl.style.width = r.width + 'px'; vidEl.style.height = r.height + 'px';
+      }
     };
     const syncVideo = () => { if (!syncPending) { syncPending = true; requestAnimationFrame(syncVideoNow); } };
     window.__syncVideo = syncVideo;                 // the touch layer calls this after pan/zoom
+    // THE COMPOSITOR NUDGE, and it is deliberately not a transform.  iOS Safari will occasionally
+    // keep a video layer whose box was set imperatively out of the next composite; a property
+    // change on the element forces it back in.  Opacity is the one to poke because it is
+    // ORTHOGONAL TO EVERYTHING ELSE HERE — transform carries the zoom and left/top/width/height
+    // carry the box, so touching either of those to force a repaint would risk the very invariant
+    // above.  Reading offsetHeight in between is what makes it two styles rather than one.
+    const nudgeLayer = () => {
+      vidEl.style.opacity = '0.999'; void vidEl.offsetHeight;
+      requestAnimationFrame(() => { vidEl.style.opacity = ''; });
+    };
     window.addEventListener('resize', syncVideo);
     window.addEventListener('orientationchange', syncVideo);
     pc.addEventListener('track', (e) => {
@@ -168,7 +248,11 @@
           // Dismiss on a REAL first frame.  requestVideoFrameCallback fires per presented frame,
           // so it is the only honest signal here — 'playing' and 'unmute' both fire on negotiation,
           // before any pixels exist.
-          const firstFrame = () => { syncVideo(); hideConn(); diag('first video frame'); };
+          const firstFrame = () => { syncVideo(); hideConn();
+            // the element's own state at the moment pixels first exist — paused/readyState/size are
+            // the three that separate "not playing" from "playing into the wrong box" later on
+            diag(`first video frame — ${vidEl.videoWidth}x${vidEl.videoHeight} rs${vidEl.readyState}` +
+                 `${vidEl.paused ? ' PAUSED' : ''}`); };
           if (vidEl.requestVideoFrameCallback) vidEl.requestVideoFrameCallback(firstFrame);
           else vidEl.addEventListener('loadeddata', firstFrame, { once: true });
           // A timed failsafe must NOT hide the overlay: a blank screen with no explanation is worse
@@ -190,7 +274,7 @@
         } else {
           vidEl.style.display = '';
         }
-        const vp = vidEl.play && vidEl.play(); if (vp && vp.catch) vp.catch(() => {});
+        tryPlay('track', true);
         // unmute fires on negotiation, not on pixels — do not claim frames from it
         e.track.addEventListener('unmute', () => { diag('video track unmuted (negotiated)'); if (videoPrimary) syncVideo(); });
         return;
@@ -369,7 +453,7 @@
         scheduleReconnect('dead on resume');
         return;
       }
-      const vp = vidEl.play && vidEl.play(); if (vp && vp.catch) vp.catch(() => {});
+      tryPlay('resume', true);
       if (videoPrimary) syncVideo();
       if (ctrl.readyState === 'open') {
         ctrl.send(JSON.stringify({ request: 'keyframe' }));
@@ -487,6 +571,11 @@
       // re-positioning it from the canvas's (already transformed) rect: transforms are composited,
       // so both surfaces move together on the same frame instead of the video lagging a layout
       // behind.  The plain box is only written while unzoomed, where it is stable.
+      // The trackpad OWNS the pan/zoom, so it publishes it: the module-level SYNCVIDEONOW needs it
+      // to restate the video's box and its transform TOGETHER.  Without this it can only see the
+      // canvas's already-zoomed rect, and writing that underneath an unchanged transform is what
+      // put the picture off-screen on a resize or a resume taken while zoomed.
+      window.__vidXform = () => ({ zoom, tx, ty });
       const syncVid = (c) => {
         const v = window.__vidEl; if (!v || !window.__videoPrimary) return;
         if (zoom <= 1.001) {
@@ -851,6 +940,7 @@
     let pathStr = 'path …', lastRx = 0, lastRxT = performance.now();
     let vidKbs = 0, vidFps = 0, lastVid = null;      // the VP8 stream's own rate, for the quality panel
     let lastKeyAsk = 0;                              // rate-limits the "I still have no picture" ask
+    let lastHeal = 0;                                // ... and the repaint watchdog's intervention
     async function pollPath() {
       try {
         const s = await pc.getStats(); let pair = null;
@@ -882,7 +972,43 @@
           // stream reads as a dead one.  kbps too — that is the unit the rung is named in.
           const prevB = lastVid ? lastVid.b : 0;
           lastVid = { t: now, b: v.bytesReceived || 0, f: v.framesDecoded || 0 };
-          qRate.textContent = `${vidKbs.toFixed(1)} KB/s · ${(vidKbs * 8.192).toFixed(0)} kbps · ${vidFps.toFixed(0)} fps`;
+          qRate.textContent = `${vidKbs.toFixed(1)} KB/s · ${(vidKbs * 8.192).toFixed(0)} kbps · ` +
+                              `${vidFps.toFixed(0)} fps · ${vidPresented} shown`;
+          // ---- THE REPAINT WATCHDOG ---------------------------------------------------------
+          // The user should not have to pinch.  Bytes arriving is already measured above; what
+          // this adds is whether those bytes reach the GLASS, and it distinguishes the two ways
+          // they can fail to, because the corrective action is different for each:
+          //
+          //   * PLAYBACK.  The element is paused — nothing is being presented however much
+          //     arrives.  Only play() helps, and only a policy can refuse it.
+          //   * LAYOUT.  Frames are being presented, into a box that is 1x1 (never synced, because
+          //     noVNC's canvas was not ready when we first looked) or wholly outside the viewport
+          //     (the double-applied zoom above).  play() cannot help; restating the geometry can.
+          //
+          // Both are checked only while bytes are actually moving, so a genuinely dead link is
+          // reported as dead rather than nudged forever, and at most one intervention every 3 s.
+          const moving = vidKbs > 0.05;
+          const vr = vidEl.getBoundingClientRect();
+          const offscreen = vr.width < 2 || vr.height < 2 || vr.right <= 0 || vr.bottom <= 0 ||
+                            vr.left >= innerWidth || vr.top >= innerHeight;
+          const dark = vidPresentAt && (now - vidPresentAt > 4000);
+          if (videoPrimary && moving && now - lastHeal > 3000) {
+            if (vidEl.paused) {
+              lastHeal = now;
+              diag(`PAUSED with ${vidKbs.toFixed(1)} KB/s arriving — play()`);
+              tryPlay('watchdog', true);
+            } else if (dark) {
+              lastHeal = now;
+              diag(`no frame presented for ${((now - vidPresentAt) / 1000).toFixed(1)}s ` +
+                   `(rs${vidEl.readyState} ${vidEl.videoWidth}x${vidEl.videoHeight}) — play() + resync`);
+              tryPlay('stalled', true); syncVideo(); nudgeLayer();
+            } else if (offscreen && vidPresented > 0) {
+              lastHeal = now;
+              diag(`presenting into an unseeable box ${Math.round(vr.width)}x${Math.round(vr.height)}` +
+                   ` @ ${Math.round(vr.left)},${Math.round(vr.top)} — resync`);
+              syncVideo(); nudgeLayer();
+            }
+          }
           // THE RECOVERY PATH.  The box parses no RTCP, so it cannot hear a PLI — if our decoder
           // never got a keyframe there is nothing to tell it except this channel, and its own blind
           // resync is minutes away at the low rungs by design.  Ask, but only when nothing is
@@ -910,7 +1036,11 @@
         `pc <b>${pc.connectionState}</b> · ice <b>${pc.iceConnectionState}</b> · dc <b>${ch.readyState}</b>\n` +
         `${pathStr}\n` +
         `dc-in <b>${kbs.toFixed(0)}</b>KB/s ${mps.toFixed(0)}msg · buf ${(buf/1024).toFixed(0)}KB · fps <b>${fps.toFixed(0)}</b>\n` +
-        `vid <b>${vidKbs.toFixed(1)}</b>KB/s · <b>${vidFps.toFixed(0)}</b>fps · rung <b>${qCurrent != null ? qCurrent + 'kbps' : '?'}</b>\n` +
+        // PRESENTED frames beside decoded ones, because that pair is the diagnosis: both climbing
+        // and a blank screen means the layer is in the wrong place; "shown" frozen means playback.
+        `vid <b>${vidKbs.toFixed(1)}</b>KB/s · <b>${vidFps.toFixed(0)}</b>fps · shown <b>${vidPresented}</b>` +
+        `${vidEl.paused ? ' <b>PAUSED</b>' : ''}${playFails ? ' play✗' + playFails : ''}` +
+        ` · rung <b>${qCurrent != null ? qCurrent + 'kbps' : '?'}</b>\n` +
         `rfb ${rfb._rfbConnectionState || '?'} · ${rfb._fbName || '—'}`;
       console.log(`PERF ${(now/1000).toFixed(1)} ${fps.toFixed(1)} ${kbs.toFixed(1)} ${mps.toFixed(1)} ${(buf/1024).toFixed(1)}`);
     }, 1000);
