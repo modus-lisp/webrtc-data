@@ -154,8 +154,30 @@ afford.  Falls back to 127 when nothing fits, because a slow first picture is st
           :target-kbs target-kbs
           :qi qi
           :key-qi key-qi
-          ;; how coarse we are willing to get under load, and the coverage-beats-sharpness lever
+          ;; how coarse the SETTLED picture is willing to get, and the coverage-beats-sharpness
+          ;; lever.  This is where the refinement arc STOPS, so it belongs near QI and it is
+          ;; right for it to be fine at a fast rung.
           :max-qi (min 127 (+ qi 44))
+          ;; ... AND HOW COARSE ONE FRAME MAY GO WHILE THE SCREEN IS MOVING, which is a
+          ;; different question and used to be answered by the same number.  A frame that must
+          ;; cover the whole screen inside one frame-time's worth of bytes can only do it by
+          ;; being coarse, so this reaches the coarsest quantizer the format has at EVERY rung —
+          ;; there is no rate at which a cheaper motion frame is the wrong trade, because the
+          ;; refinement pass sharpens it back the moment the screen stops.
+          ;;
+          ;; With one number doing both jobs, every rung from 160 kbps up was capped at MAX-QI
+          ;; 52 during motion: no quantizer in [8, 52] fits a full-screen scroll into the 5 KB
+          ;; frame budget at 480 kbps, so the sender's overrun path fired on every frame and
+          ;; spent up to the LATENCY ceiling instead — 22 KB per frame, 2.4 frames a second,
+          ;; sharp and several seconds stale.  The coarse-and-fluid behaviour only appeared at
+          ;; 5-48 kbps, which is where MAX-QI happened to reach 100-127 on its own.
+          :motion-qi 127
+          ;; the coverage floor under a frame that is FAR over budget (see *BACKLOG-QI*).  A
+          ;; floor, not a ceiling: it raises a live frame's quantizer, it cannot cap it, so it
+          ;; was never the clamp above and separating the two knobs does not change what it
+          ;; does.  It now sits below where a motion frame actually lands and is inert at the
+          ;; upper rungs, which is the correct outcome — the quantizer fit reaches the coarsest
+          ;; the format has on its own, and a second lever pushing the same way is not needed.
           :backlog-qi (min 127 (+ qi 40))
           ;; A FRAME MAY NOT EXCEED ~1.5 s OF THE LINK'S BUDGET.  This used to be a fixed 32-128 KB,
           ;; which at 5 kbps is 51 s in flight — the cap has to come from the rate or it is not a
@@ -220,10 +242,10 @@ re-reads it at the top of every pass — plus the backlog quantizer, which lives
       ;; The rung's OWN unit first — kbps/8 kilobytes per second, which is what the ladder is named
       ;; in and what a person asked for — then the kibibyte figure the encoder is actually handed.
       ;; Printing only the second made a rung called 600 KB/s log itself as 585.94 and read as a bug.
-      (format *error-output* "~&[rung] ~a kbps = ~,1f KB/s (~a) — ~,2f KiB/s to the encoder, ~,1f fps (~a B/frame), qi ~a/~a, keyframe qi ~a, frame<=~,1f KiB, settle ~a ms, resync ~a s, backlog qi ~a~%"
+      (format *error-output* "~&[rung] ~a kbps = ~,1f KB/s (~a) — ~,2f KiB/s to the encoder, ~,1f fps (~a B/frame), qi ~a/~a (motion ~a), keyframe qi ~a, frame<=~,1f KiB, settle ~a ms, resync ~a s, backlog qi ~a~%"
               kbps (/ kbps 8.0) why (getf p :target-kbs) (getf p :target-fps)
               (round (* (getf p :target-kbs) 1024) (getf p :target-fps))
-              (getf p :qi) (getf p :max-qi) (getf p :key-qi)
+              (getf p :qi) (getf p :max-qi) (getf p :motion-qi) (getf p :key-qi)
               (getf p :max-frame-kb) (getf p :cleanup-ms) (round (getf p :key-secs))
               (getf p :backlog-qi))
       (finish-output *error-output*)
@@ -236,12 +258,13 @@ re-reads it at the top of every pass — plus the backlog quantizer, which lives
     ;; ~,0f would emit "55." — a trailing point with no digits, which is not JSON and takes the
     ;; phone's whole status handler down with it.  Every number here is rounded to an integer or
     ;; given explicit decimals.
-    (format nil "{\"kbps\":~a,\"rung\":~a,\"profile\":\"~a kbps\",\"target_kbs\":~,2f,\"target_fps\":~,1f,\"frame_budget\":~a,\"max_frame_kb\":~,1f,\"cleanup_ms\":~a,\"qi\":~a,\"max_qi\":~a,\"key_qi\":~a,\"key_secs\":~a,\"backlog_qi\":~a,\"rungs\":[~{~a~^,~}]}"
+    (format nil "{\"kbps\":~a,\"rung\":~a,\"profile\":\"~a kbps\",\"target_kbs\":~,2f,\"target_fps\":~,1f,\"frame_budget\":~a,\"max_frame_kb\":~,1f,\"cleanup_ms\":~a,\"qi\":~a,\"max_qi\":~a,\"motion_qi\":~a,\"key_qi\":~a,\"key_secs\":~a,\"backlog_qi\":~a,\"rungs\":[~{~a~^,~}]}"
             kbps (or (rung-index kbps) 0) kbps
             (getf p :target-kbs) (getf p :target-fps)
             (round (* (getf p :target-kbs) 1024) (getf p :target-fps))
             (getf p :max-frame-kb) (getf p :cleanup-ms)
-            (getf p :qi) (getf p :max-qi) (getf p :key-qi) (round (getf p :key-secs))
+            (getf p :qi) (getf p :max-qi) (getf p :motion-qi) (getf p :key-qi)
+            (round (getf p :key-secs))
             (getf p :backlog-qi) *video-rungs*)))
 
 (defun %json-string-value (json key)
