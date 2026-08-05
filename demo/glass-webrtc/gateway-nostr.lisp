@@ -523,6 +523,13 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                              ;; can have that the picture is about to change, and it is already in
                              ;; our hands.
                              (setf webrtc-media:*video-input-at* (get-internal-real-time))
+                             ;; ... and WHERE, when the event says so.  These bytes are on their
+                             ;; way to the desktop either way; this only reads them, and only for
+                             ;; the last PointerEvent in the buffer, so the sender can know where
+                             ;; the user's attention is without anything extra crossing the link.
+                             ;; What reads it is WEBRTC-MEDIA:*CURSOR-PRIORITY*, which is off by
+                             ;; default — see its docstring for what happened when it was on.
+                             (webrtc-media:note-rfb-input bytes)
                              (sb-bsd-sockets:socket-send glass bytes (length bytes))))))))))
            (error (e)
              (incf *sessions-failed*)
