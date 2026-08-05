@@ -14,7 +14,8 @@
 #+sbcl (setf (sb-ext:bytes-consed-between-gcs) (* 256 1024 1024))   ; fewer GCs on the send path
 (handler-bind ((warning #'muffle-warning))
   (asdf:load-system "webrtc-data")
-  (asdf:load-system "webrtc-media/rtc")     ; SRTP audio (beeping tone + level) over the same transport
+  (asdf:load-system "webrtc-media/rtc")     ; SRTP audio (G.711 both ways) over the same transport
+  (asdf:load-system "glass/audio")          ; the SESSION's mixer — we are one listener on it
   (asdf:load-system "cl-nostr"))
 (load (merge-pathnames "login-token.lisp" (or *load-pathname* *default-pathname-defaults*)))
 (load (merge-pathnames "glass-capture.lisp" (or *load-pathname* *default-pathname-defaults*)))
@@ -336,20 +337,78 @@ ALIVE-P sees the agent stopped and unwinds, which is what releases the TURN allo
        (let ((quiet (ice-silent-secs agent)))
          (or (null quiet) (< quiet *peer-silence-limit*)))))
 
+;; ---- the desktop's sound -----------------------------------------------------
+;; The mix belongs to the SESSION, not to this transport.  glass owns it (:glass/audio) and this
+;; file is one listener: we subscribe for a private 8 kHz cursor and hand the sink to the SRTP
+;; sender as its source.  A second listener — another peer, a VNC client, a recorder — subscribes
+;; too and hears exactly the same mix, which is the whole reason the mixer is not in here.
+;;
+;; AUDIO_MP3, if set, is registered once as a looping source, so a peer that dials in has
+;; something to hear.  Unset = the mix is silence, and the stream still runs (its timing is what
+;; the packets carry, not the sound).
+
+(defparameter *audio-mp3* (uiop:getenv "AUDIO_MP3"))
+(defparameter *audio-gain*
+  (or (ignore-errors (let ((e (uiop:getenv "AUDIO_GAIN"))) (and e (float (read-from-string e) 1d0))))
+      0.6d0))
+(defvar *mixer* nil)
+(defvar *mixer-init-lock* (bt:make-lock "mixer-init"))
+
+(defun %mp3-loop-source (path gain)
+  "The whole file, decoded once to the mix's rate and looped.  Decoded up front rather than
+streamed because it has to loop: the point is that a peer dialing in at any moment hears
+something, not that the file plays exactly once at box startup."
+  (let* ((pcm (reed:decode-mp3-file path))
+         (mono (reed:downmix (reed:pcm-samples pcm) (reed:pcm-channels pcm)))
+         (rs (reed:make-resampler (reed:pcm-sample-rate pcm) glass:*mixer-rate*))
+         (body (reed:resample rs mono))
+         (tail (reed:resample rs (reed:make-pcm16 0) :final t))
+         (all (concatenate '(simple-array (signed-byte 16) (*)) body tail)))
+    (unless (= gain 1d0) (reed:apply-gain all gain))
+    (values (reed:make-buffer-source all :frame-samples 960 :loop t)
+            (/ (length all) (float glass:*mixer-rate* 1d0)))))
+
+(defun ensure-mixer ()
+  "The box's one mixer, started on first use.  Idempotent — two sessions arriving together get
+the same mix, not one each."
+  (bt:with-lock-held (*mixer-init-lock*)
+    (or *mixer*
+        (let ((m (glass:make-mixer)))
+          (when *audio-mp3*
+            (handler-case
+                (multiple-value-bind (src secs) (%mp3-loop-source *audio-mp3* *audio-gain*)
+                  (glass:mixer-add-source m src :name "music")
+                  (format *error-output* "~&[audio] mix source: ~a (~,1f s, looping, gain ~,2f)~%"
+                          *audio-mp3* secs *audio-gain*))
+              (error (e) (format *error-output* "~&[audio] AUDIO_MP3 ~a not usable: ~a~%" *audio-mp3* e))))
+          (glass:mixer-start m)
+          (setf *mixer* m)))))
+
+;; Warm it here rather than on the first offer: decoding the file takes a second or two, and a
+;; peer that has just connected should not spend that listening to silence.
+(ensure-mixer)
+(format *error-output* "~&[audio] ~a~%" (glass:mixer-report *mixer*))
+
 (defun run-session (conn agent &key pub)
   "Drive DTLS, run the data channel, and bridge it to glass once the channel opens.
 Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
-  (let ((glass nil) (audio-stop nil) (video-stop nil) (cap nil))
+  (let ((glass nil) (audio-stop nil) (video-stop nil) (cap nil) (sink nil))
     (unwind-protect
          (handler-case
              (progn
                (webrtc-dtls-run conn)
                ;; audio rides the same transport: derive SRTP keys from the DTLS session, then
-               ;; beep a tone at the browser + report the level of whatever it sends back.
+               ;; send this peer's private cursor on the session mix + report what it sends back.
+               (setf sink (ignore-errors
+                           (glass:mixer-subscribe (ensure-mixer)
+                                                  :name (if pub (subseq pub 0 8) "peer")
+                                                  :rate 8000 :frame-samples 160)))
+               (when sink (glass:mixer-play *mixer* (glass:audio-tone 880 0.12) :name "connect"))
                (multiple-value-bind (astop ctx)
                    (ignore-errors
                      (webrtc-media:start-audio
                       agent (dtls-conn-session conn)
+                      :source (and sink (glass:sink-source sink))
                       :on-rx-level (let ((n 0))
                                      (lambda (lvl)
                                        (when (zerop (mod (incf n) 50))   ; ~1x/s
@@ -357,7 +416,12 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                                          (finish-output *error-output*))))
                       :log (lambda (m) (format *error-output* "~&[audio] ~a~%" m))))
                  (setf audio-stop astop)
-                 (format *error-output* "~&[gw-nostr] audio started — beeping tone -> browser~%")
+                 (format *error-output* "~&[gw-nostr] audio started — ~a -> browser~%"
+                         (if sink
+                             (format nil "session mix @8k (~{~a~^+~})"
+                                     (or (mapcar #'glass:src-name (glass:mixer-sources *mixer*))
+                                         '("silence")))
+                             "NO SINK (silence)"))
                  ;; video: our from-scratch VP8 keyframes, over the same SRTP keys (own SSRC)
                  (when (and ctx *video-pt*)
                    (when *video-primary*
@@ -448,7 +512,18 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                        ;; glass sends no pixels over SCTP; everything else (input) passes through
                        (if (and *video-primary* (= 10 (length bytes)) (= 3 (aref bytes 0)))
                            nil
-                           (sb-bsd-sockets:socket-send glass bytes (length bytes)))))))))
+                           (progn
+                             ;; AND TELL THE VIDEO SENDER, which is otherwise looking at a screen
+                             ;; that has not changed yet.  Its idle passes — sharpening what was
+                             ;; sent coarse, draining what did not fit — start once the desktop has
+                             ;; been quiet a moment, and a desktop is perfectly quiet for the whole
+                             ;; round trip between a click arriving here and the repaint coming
+                             ;; back.  That is exactly the window in which starting one puts it in
+                             ;; front of the answer.  A keystroke is the earliest warning the box
+                             ;; can have that the picture is about to change, and it is already in
+                             ;; our hands.
+                             (setf webrtc-media:*video-input-at* (get-internal-real-time))
+                             (sb-bsd-sockets:socket-send glass bytes (length bytes))))))))))
            (error (e)
              (incf *sessions-failed*)
              (setf *last-error* (let ((s (princ-to-string e)))
@@ -461,6 +536,11 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
       (when cap (ignore-errors (capture-stop cap)))
       (when video-stop (ignore-errors (funcall video-stop)))
       (when audio-stop (ignore-errors (funcall audio-stop)))
+      ;; drop this peer's cursor on the mix (the mix itself keeps running — it is the box's,
+      ;; not this session's, and the next dial-in joins it where it is)
+      (when sink
+        (format *error-output* "~&[audio] ~a~%" (glass:mixer-report *mixer*))
+        (ignore-errors (glass:mixer-unsubscribe *mixer* sink)))
       (when glass (ignore-errors (sb-bsd-sockets:socket-close glass)))
       (ignore-errors (ice-close agent)))))   ; release the TURN allocation + ICE socket
 
