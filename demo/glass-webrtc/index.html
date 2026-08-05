@@ -56,15 +56,37 @@
     const XK = { Enter:0xff0d, Backspace:0xff08, Tab:0xff09, Escape:0xff1b,
                  ArrowLeft:0xff51, ArrowUp:0xff52, ArrowRight:0xff53, ArrowDown:0xff54 };
     const tap = (keysym, code) => { rfb.sendKey(keysym, code, true); rfb.sendKey(keysym, code, false); };
-    const sendChar = ch => { const cp = ch.codePointAt(0); tap(cp < 0x100 ? cp : 0x01000000 + cp, null); };
+    const sendChar = ch => {
+      const cp = ch.codePointAt(0);
+      if (cp === 10 || cp === 13) return tap(XK.Enter, 'Enter');   // a pasted line ending
+      if (cp === 9) return tap(XK.Tab, 'Tab');
+      tap(cp < 0x100 ? cp : 0x01000000 + cp, null);
+    };
+    const sendText = t => { for (const ch of t) sendChar(ch); };
     kbin.addEventListener('keydown', e => {          // special keys (fire keydown even on iOS)
       if (e.key in XK) { e.preventDefault(); tap(XK[e.key], e.code); }
     });
+    // A paste is the only sane way to enter a URL on a phone, and it does NOT arrive as
+    // insertText: iOS sends beforeinput with inputType insertFromPaste and e.data null,
+    // the text being in dataTransfer.  Autocorrect and dictation are the same shape
+    // (insertReplacementText / insertCompositionText).  Handling only insertText meant
+    // all three sent NOTHING AT ALL — the field stayed empty with no sign of why.
+    // The paste event fires first; preventing it there stops the beforeinput, so the
+    // text is never sent twice.
+    kbin.addEventListener('paste', e => {
+      const t = e.clipboardData && e.clipboardData.getData('text/plain');
+      if (t) { sendText(t); e.preventDefault(); }
+    });
+    const INSERTS = /^insert(Text|FromPaste|FromDrop|FromYank|ReplacementText|CompositionText)$/;
     kbin.addEventListener('beforeinput', e => {      // typed characters (iOS soft keyboard)
-      if (e.inputType === 'insertText' && e.data) { for (const ch of e.data) sendChar(ch); e.preventDefault(); }
-      else if (e.inputType === 'deleteContentBackward') { tap(XK.Backspace, 'Backspace'); e.preventDefault(); }
-      else if (e.inputType && e.inputType.startsWith('insertLine') || e.inputType === 'insertParagraph') {
-        tap(XK.Enter, 'Enter'); e.preventDefault();
+      const it = e.inputType || '';
+      if (it === 'insertParagraph' || it.startsWith('insertLine')) { tap(XK.Enter, 'Enter'); e.preventDefault(); }
+      else if (it.startsWith('deleteContent')) { tap(XK.Backspace, 'Backspace'); e.preventDefault(); }
+      else if (INSERTS.test(it)) {
+        const t = e.data != null ? e.data
+                : (e.dataTransfer ? e.dataTransfer.getData('text/plain') : '');
+        if (t) sendText(t);
+        e.preventDefault();
       }
       kbin.value = '';
     });
