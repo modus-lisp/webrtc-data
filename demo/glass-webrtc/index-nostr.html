@@ -487,19 +487,91 @@
     });
 
     const XK = { Enter:0xff0d, Backspace:0xff08, Tab:0xff09, Escape:0xff1b,
-                 ArrowLeft:0xff51, ArrowUp:0xff52, ArrowRight:0xff53, ArrowDown:0xff54 };
+                 ArrowLeft:0xff51, ArrowUp:0xff52, ArrowRight:0xff53, ArrowDown:0xff54,
+                 Shift:0xffe1, Insert:0xff63 };
     const tap = (keysym, code) => { rfb.sendKey(keysym, code, true); rfb.sendKey(keysym, code, false); };
     const sendChar = ch => { const cp = ch.codePointAt(0); tap(cp < 0x100 ? cp : 0x01000000 + cp, null); };
+    // A paste is not a keystroke, and on a phone both arrive through this one hidden input.
+    // PASTE_MAX caps either route: a phone's clipboard can hold a whole document, and typing one
+    // is a key event per character down the data channel — a megabyte would be a million of them.
+    const PASTE_MAX = 4096;
+    const clampPaste = t => (t.length > PASTE_MAX ? t.slice(0, PASTE_MAX) : t);
+    // Type a string, one keysym at a time.  A newline becomes Enter rather than the character
+    // U+000A, or a shell gets a literal control byte where it wanted a line.
+    const sendText = t => {
+      for (const ch of t) {
+        if (ch === '\n' || ch === '\r') tap(XK.Enter, 'Enter'); else sendChar(ch);
+      }
+    };
     kbin.addEventListener('keydown', e => {          // special keys (fire keydown even on iOS)
       if (e.key in XK) { e.preventDefault(); tap(XK[e.key], e.code); }
     });
     kbin.addEventListener('beforeinput', e => {      // typed characters (iOS soft keyboard)
-      if (e.inputType === 'insertText' && e.data) { for (const ch of e.data) sendChar(ch); e.preventDefault(); }
-      else if (e.inputType === 'deleteContentBackward') { tap(XK.Backspace, 'Backspace'); e.preventDefault(); }
-      else if (e.inputType && e.inputType.startsWith('insertLine') || e.inputType === 'insertParagraph') {
+      const it = e.inputType;
+      if (it === 'insertText' && e.data) { sendText(e.data); e.preventDefault(); }
+      // A long-press -> Paste (and a drag-and-drop) arrives as insertFromPaste / insertFromDrop,
+      // NOT insertText — so it used to match no branch and the text was thrown away by the
+      // kbin.value reset at the bottom, which is why pasting on iOS silently did nothing.  This
+      // is also the route that needs no clipboard permission: by the time the event fires, iOS
+      // has already decided to hand us the text.  Safari puts it in .data; the spec allows
+      // .dataTransfer instead, so read both.
+      else if (it === 'insertFromPaste' || it === 'insertFromDrop') {
+        const raw = e.data || (e.dataTransfer && e.dataTransfer.getData('text/plain')) || '';
+        const t = clampPaste(raw);
+        if (t) sendText(t);
+        e.preventDefault();
+        diag('paste: typed ' + t.length + ' chars' +
+             (t.length < raw.length ? ' (capped from ' + raw.length + ')' : ''));
+      }
+      else if (it === 'deleteContentBackward') { tap(XK.Backspace, 'Backspace'); e.preventDefault(); }
+      else if (it && it.startsWith('insertLine') || it === 'insertParagraph') {
         tap(XK.Enter, 'Enter'); e.preventDefault();
       }
       kbin.value = '';
+    });
+
+    // --- 📋 paste: hand over the whole string, don't type it ---------------------------------
+    // The box now keeps a SESSION clipboard beside its framebuffer, so there are two ways to get
+    // text into it and the button takes the cheap one: ClientCutText carries the whole string in
+    // ONE message, and Shift+Insert then asks the desktop to paste it wherever focus is — four key
+    // messages regardless of length, against one per character.  Typing stays the fallback, and is
+    // the whole of the long-press route above, which needs no permission at all.
+    const pasteBtn = mkToggle('📋', 254);
+    const sendPaste = text => {
+      const t = clampPaste(text);
+      const capped = t.length < text.length ? ' (capped from ' + text.length + ')' : '';
+      if (typeof rfb.clipboardPasteFrom === 'function') {
+        try {
+          rfb.clipboardPasteFrom(t);                    // -> ClientCutText: the session's selection
+          rfb.sendKey(XK.Shift, 'ShiftLeft', true);     // -> Shift+Insert: paste it at the focus
+          tap(XK.Insert, 'Insert');
+          rfb.sendKey(XK.Shift, 'ShiftLeft', false);
+          diag('paste: ' + t.length + ' chars as cut text + Shift+Insert' + capped);
+          return;
+        } catch (err) { diag('paste: cut text failed (' + (err.name || err) + ') — typing it'); }
+      }
+      sendText(t);
+      diag('paste: typed ' + t.length + ' chars' + capped);
+    };
+    pasteBtn.addEventListener('click', async () => {
+      let text = null;
+      try {
+        if (!navigator.clipboard || !navigator.clipboard.readText) throw new Error('unsupported');
+        text = await navigator.clipboard.readText();   // inside the gesture — Safari requires that,
+                                                       // and shows its own confirmation, which is
+                                                       // the user's to make and cannot be skipped
+      } catch (err) {
+        // Denied, dismissed, or no async clipboard at all.  Not something to swallow: fall back to
+        // the route that never needed permission — focus the hidden field so a long-press offers
+        // Paste — and say which, because a button that does nothing visible reads as a broken one.
+        diag('paste: clipboard read refused (' + (err.name || err) +
+             ') — long-press the keyboard field and choose Paste');
+        kbin.focus();
+        return;
+      }
+      if (!text) { diag('paste: clipboard is empty'); return; }
+      paint(pasteBtn, true); setTimeout(() => paint(pasteBtn, false), 600);
+      sendPaste(text);
     });
 
     // Keep the desktop above the soft keyboard: when it opens the visual viewport shrinks, so pin
