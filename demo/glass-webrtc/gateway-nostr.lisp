@@ -16,6 +16,7 @@
   (asdf:load-system "webrtc-data")
   (asdf:load-system "webrtc-media/rtc")     ; SRTP audio (G.711 both ways) over the same transport
   (asdf:load-system "glass/audio-stream")   ; the DESKTOP's mix, over a socket — we listen on it
+  (asdf:load-system "glass/mic-stream")     ; ...and the phone's microphone, back the other way
   (asdf:load-system "cl-nostr"))
 (load (merge-pathnames "login-token.lisp" (or *load-pathname* *default-pathname-defaults*)))
 (load (merge-pathnames "glass-capture.lisp" (or *load-pathname* *default-pathname-defaults*)))
@@ -353,6 +354,16 @@ ALIVE-P sees the agent stopped and unwinds, which is what releases the TURN allo
 (defparameter *audio-port*
   (or (ignore-errors (parse-integer (uiop:getenv "GLASS_AUDIO_PORT"))) 5913)
   "Where the glass desktop serves its mix.  Beside the VNC port by convention (5903 -> 5913).")
+(defparameter *mic-port*
+  (or (ignore-errors (parse-integer (uiop:getenv "GLASS_MIC_PORT"))) 5914)
+  "Where the glass desktop takes a peer's MICROPHONE — the other direction, one port past the mix.
+
+The phone's audio has been decoded on the receive path since webrtc-media grew :ON-RX-PCM, and
+until now it was measured for a level meter and dropped on the floor.  It goes to the desktop for
+the same reason the mix comes FROM the desktop: what would listen to it — the ear, an application,
+anything — lives in the image the desktop's applications live in, and a microphone consumed in
+here could only ever be heard by this gateway.")
+
 (defparameter *audio-gain*
   (or (ignore-errors (let ((e (uiop:getenv "AUDIO_GAIN"))) (and e (float (read-from-string e) 1d0))))
       1.0d0)
@@ -373,7 +384,7 @@ make."
 (defun run-session (conn agent &key pub)
   "Drive DTLS, run the data channel, and bridge it to glass once the channel opens.
 Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
-  (let ((glass nil) (audio-stop nil) (video-stop nil) (cap nil) (tap nil))
+  (let ((glass nil) (audio-stop nil) (video-stop nil) (cap nil) (tap nil) (mic nil))
     (unwind-protect
          (handler-case
              (progn
@@ -388,11 +399,26 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                            :name (if pub (subseq pub 0 8) "peer")
                            :rate 8000 :frame-samples 160 :prime 2 :gain *audio-gain*
                            :log (lambda (m) (format *error-output* "~&[audio] ~a~%" m)))))
+               ;; ...and the microphone the other way.  MIC-SEND is called from ON-RX-PCM, which
+               ;; runs on the thread that decrypts every inbound packet — audio AND video — so it
+               ;; may not block for anything: it copies into a bounded ring and returns, a writer
+               ;; thread owns the socket, and a desktop that is down, restarting, or simply not
+               ;; reading costs dropped frames and nothing else.  Made even when the desktop has
+               ;; no ear: the microphone arriving is not this file's business to have an opinion
+               ;; about, and a port with nobody behind it is exactly the silence case above.
+               (setf mic (ignore-errors
+                          (glass:make-mic-sender
+                           :host *glass-host* :port *mic-port*
+                           :name (if pub (subseq pub 0 8) "peer")
+                           :rate 8000 :frame-samples 160
+                           :log (lambda (m) (format *error-output* "~&[mic] ~a~%" m)))))
                (multiple-value-bind (astop ctx)
                    (ignore-errors
                      (webrtc-media:start-audio
                       agent (dtls-conn-session conn)
                       :source (and tap (%connect-tone-then tap))
+                      ;; the samples first — the meter is derived from the same frame anyway
+                      :on-rx-pcm (and mic (glass:mic-feed mic))
                       :on-rx-level (let ((n 0))
                                      (lambda (lvl)
                                        (when (zerop (mod (incf n) 50))   ; ~1x/s
@@ -400,10 +426,11 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                                          (finish-output *error-output*))))
                       :log (lambda (m) (format *error-output* "~&[audio] ~a~%" m))))
                  (setf audio-stop astop)
-                 (format *error-output* "~&[gw-nostr] audio started — ~a -> browser~%"
+                 (format *error-output* "~&[gw-nostr] audio started — ~a -> browser, browser mic -> ~a~%"
                          (if tap
                              (format nil "desktop mix from ~a:~d @8k" *glass-host* *audio-port*)
-                             "NO TAP (silence)"))
+                             "NO TAP (silence)")
+                         (if mic (format nil "~a:~d" *glass-host* *mic-port*) "NOWHERE (dropped)"))
                  ;; video: our from-scratch VP8 keyframes, over the same SRTP keys (own SSRC)
                  (when (and ctx *video-pt*)
                    (when *video-primary*
@@ -531,6 +558,11 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
       (when tap
         (format *error-output* "~&[audio] ~a~%" (glass:tap-report tap))
         (ignore-errors (glass:tap-stop tap)))
+      ;; and this peer's microphone: closing the connection is what tells the desktop the
+      ;; microphone is gone, which is what sends its ear back to whatever it was listening to
+      (when mic
+        (format *error-output* "~&[mic] ~a~%" (glass:mic-sender-report mic))
+        (ignore-errors (glass:mic-sender-stop mic)))
       (when glass (ignore-errors (sb-bsd-sockets:socket-close glass)))
       (ignore-errors (ice-close agent)))))   ; release the TURN allocation + ICE socket
 
