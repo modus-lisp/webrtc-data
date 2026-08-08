@@ -53,6 +53,48 @@
     #connstatus .msg{font-weight:500;letter-spacing:.01em;min-height:1.4em;text-align:center}
     #connstatus .msg:empty{min-height:0}
     @keyframes spin{to{transform:rotate(360deg)}}
+    /* --- the button row: three states, told apart by SHAPE rather than by shade ---------------
+       A tint is not a state.  Shaded-on against shaded-off is a difference you have to have seen
+       before to read, which is why 🎙 and 🔈 sat there looking switched on while the microphone
+       was off and the sound was muted.  So:
+         ON        green glyph, nothing over it
+         OFF       a hard diagonal strike, the mark a road sign uses — and the ONLY thing that
+                   ever draws one, so a strike always means "off, tap me"
+         DISABLED  faded, desaturated, and pointer-events:none, so it cannot be mistaken for
+                   something worth tapping
+       Anything that is an action rather than a toggle (📋) stays plain: it has no "off". */
+    .gbtn{position:fixed;z-index:20;width:52px;height:52px;border-radius:26px;border:0;padding:0;
+      background:rgba(0,0,0,.6);color:#cdd6df;font-size:22px;line-height:1;
+      touch-action:manipulation;-webkit-tap-highlight-color:transparent;
+      transition:color .12s ease,background .12s ease,opacity .12s ease}
+    .gbtn[data-state="on"]{color:#7CFC9B}
+    .gbtn[data-state="disabled"]{color:rgba(255,255,255,.34);background:rgba(0,0,0,.3);
+      opacity:.42;filter:grayscale(1);pointer-events:none}
+    /* the strike is drawn TWICE — a wide dark stroke under a white one — for the same reason the
+       trackpad cursor is: the desktop shows through these buttons, and a single-colour line
+       disappears against half the things that can be behind it */
+    .gbtn::before,.gbtn::after{content:'';position:absolute;left:50%;top:50%;width:42px;
+      transform:translate(-50%,-50%) rotate(45deg);border-radius:3px;opacity:0;
+      transition:opacity .12s ease;pointer-events:none}
+    .gbtn::before{height:7px;background:rgba(0,0,0,.92)}
+    .gbtn::after{height:3px;background:#fff}
+    .gbtn[data-state="off"]::before,.gbtn[data-state="off"]::after{opacity:1}
+    /* --- latching modifier keys --------------------------------------------------------------
+       ARMED is outlined: held for the next key, then it lets go by itself.
+       LOCKED is filled AND breathing, because a modifier that quietly stays down is the trap
+       this row exists to avoid — you should be able to see one from across the screen. */
+    #mods{position:fixed;right:14px;bottom:var(--mods-bottom,78px);z-index:20;display:flex;gap:6px;
+      transition:bottom .18s ease}
+    .gmod{min-width:47px;height:38px;border-radius:10px;padding:0 7px;
+      background:rgba(0,0,0,.6);border:1px solid rgba(255,255,255,.16);color:#cdd6df;
+      font:600 13px/1 -apple-system,system-ui,sans-serif;letter-spacing:.02em;
+      touch-action:manipulation;-webkit-tap-highlight-color:transparent;
+      transition:background .12s ease,color .12s ease,border-color .12s ease}
+    .gmod[data-mod="armed"]{color:#7CFC9B;border-color:#7CFC9B;background:rgba(124,252,155,.18)}
+    .gmod[data-mod="locked"]{color:#08130c;border-color:#7CFC9B;background:#7CFC9B;
+      animation:modlock 1.5s ease-in-out infinite}
+    @keyframes modlock{0%,100%{box-shadow:0 0 0 0 rgba(124,252,155,.6)}
+                       50%{box-shadow:0 0 0 5px rgba(124,252,155,0)}}
   </style>
 </head>
 <body>
@@ -106,7 +148,9 @@
       return { row, set: p => { fill.style.width = Math.max(0, Math.min(100, p * 140)) + '%'; } };
     };
     const audioPanel = document.createElement('div');
-    audioPanel.style.cssText = 'position:fixed;left:14px;bottom:78px;z-index:22;width:190px;display:none;' +
+    // bottom:140 rather than 78 — the modifier row now occupies the strip directly above the
+    // button row, and on a portrait phone a left panel 190px wide reaches into it
+    audioPanel.style.cssText = 'position:fixed;left:14px;bottom:140px;z-index:22;width:190px;display:none;' +
       'flex-direction:column;gap:6px;background:rgba(0,0,0,.55);padding:9px 11px;border-radius:11px';
     const txM = mkMeter('mic', '#7CFC9B'), rxM = mkMeter('box', '#8fbaff');
     audioPanel.append(txM.row, rxM.row); document.body.appendChild(audioPanel);
@@ -123,7 +167,7 @@
     // the box's VP8 video (our from-scratch encoder) shows in a corner panel
     const vidEl = document.createElement('video');
     vidEl.autoplay = true; vidEl.playsInline = true; vidEl.muted = true;
-    vidEl.style.cssText = 'position:fixed;right:14px;bottom:78px;z-index:22;width:128px;height:128px;' +
+    vidEl.style.cssText = 'position:fixed;right:14px;bottom:140px;z-index:22;width:128px;height:128px;' +
       'border-radius:10px;background:#000;object-fit:contain;display:none;pointer-events:none;box-shadow:0 0 0 1px rgba(255,255,255,.25)';
     document.body.appendChild(vidEl);
     // PRESENTED frames, which are not decoded frames, and the difference is the whole diagnosis of
@@ -313,49 +357,62 @@
     kbin.setAttribute('autocomplete', 'off');   kbin.setAttribute('spellcheck', 'false');
     kbin.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;border:0;padding:0;';
     document.body.appendChild(kbin);
-    const kbBtn = document.createElement('button');
-    kbBtn.textContent = '⌨';
-    kbBtn.style.cssText = 'position:fixed;bottom:14px;right:14px;z-index:20;width:52px;height:52px;' +
-      'border-radius:26px;border:0;background:rgba(0,0,0,.6);color:#7CFC9B;font-size:24px';
-    kbBtn.addEventListener('click', () => kbin.focus());
-    document.body.appendChild(kbBtn);
-    // --- mic / speaker toggles, both MUTED on load -------------------------------------------
-    const mkToggle = (glyph, right) => {
+    // Every button in the bottom row is built the same way and wears the same three states —
+    // see the .gbtn rules in <style>.  SETBTN is the only thing that writes one, so "what state
+    // is this in" and "what does it look like" cannot drift apart.
+    //   'on'       green
+    //   'off'      struck through — available, currently not doing its thing
+    //   'idle'     plain — for the buttons that are ACTIONS and have no off (📋)
+    //   'disabled' faded and untouchable — the session cannot carry it right now
+    const mkToggle = (glyph, right, label) => {
       const b = document.createElement('button');
       b.textContent = glyph;
-      b.dataset.on = '0';
-      b.style.cssText = 'position:fixed;bottom:14px;right:' + right + 'px;z-index:20;width:52px;' +
-        'height:52px;border-radius:26px;border:0;background:rgba(0,0,0,.6);color:#8a949c;font-size:22px';
+      b.className = 'gbtn';
+      b.dataset.state = 'off';
+      if (label) b.setAttribute('aria-label', label);
+      b.style.bottom = '14px'; b.style.right = right + 'px';
       document.body.appendChild(b);
       return b;
     };
-    const paint = (b, on) => { b.dataset.on = on ? '1' : '0';
-      b.style.color = on ? '#7CFC9B' : '#8a949c';
-      b.style.background = on ? 'rgba(0,0,0,.6)' : 'rgba(0,0,0,.35)'; };
-    const micBtn = mkToggle('🎙', 74), spkBtn = mkToggle('🔈', 134);
+    const setBtn = (b, state) => { b.dataset.state = state; b.disabled = state === 'disabled'; };
+    const isOn = b => b.dataset.state === 'on';
+    const kbBtn = mkToggle('⌨', 14, 'keyboard');
+    kbBtn.addEventListener('click', () => kbin.focus());
+    // the ⌨ is on exactly while the hidden field holds focus, which is exactly while the soft
+    // keyboard is up — so the strike is the honest answer to "will typing go anywhere?"
+    kbin.addEventListener('focus', () => setBtn(kbBtn, 'on'));
+    kbin.addEventListener('blur', () => setBtn(kbBtn, 'off'));
+    // --- mic / speaker toggles, both MUTED on load — and now they SAY so ----------------------
+    const micBtn = mkToggle('🎙', 74, 'microphone'), spkBtn = mkToggle('🔈', 134, 'desktop sound');
+    // No getUserMedia at all (an insecure origin, an old WebView) is a genuine "you can't",
+    // which is a different thing from "off", and used to look identical to it.
+    if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) setBtn(micBtn, 'disabled');
     micBtn.addEventListener('click', async () => {
-      const on = micBtn.dataset.on === '1';
+      const on = isOn(micBtn);
       if (on) {                                              // -> mute: drop the track entirely
         if (window.__micStream) { window.__micStream.getTracks().forEach(t => t.stop()); window.__micStream = null; }
         if (window.__micSender) { try { await window.__micSender.replaceTrack(null); } catch (_) {} }
-        paint(micBtn, false); diag('mic muted');
+        setBtn(micBtn, 'off'); diag('mic muted');
       } else {                                               // -> unmute: NOW ask for permission
         try {
           const ms = await navigator.mediaDevices.getUserMedia(
             { audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
           window.__micStream = ms;
           if (window.__micSender) await window.__micSender.replaceTrack(ms.getAudioTracks()[0]);
-          paint(micBtn, true); showAudio(); meterStream(ms, txM.set); diag('mic live');
+          setBtn(micBtn, 'on'); showAudio(); meterStream(ms, txM.set); diag('mic live');
         } catch (err) { diag('mic denied (' + (err.name || err) + ')'); }
       }
     });
     spkBtn.addEventListener('click', () => {
-      const on = spkBtn.dataset.on === '1';
+      const on = isOn(spkBtn);
       const au = window.__boxAudio;
-      if (on) { if (au) au.muted = true; paint(spkBtn, false); diag('speaker muted'); }
+      if (on) { if (au) au.muted = true; setBtn(spkBtn, 'off'); diag('speaker muted'); }
       else {
-        if (au) { au.muted = false; const p = au.play && au.play(); if (p && p.catch) p.catch(() => {}); }
-        paint(spkBtn, true); showAudio();
+        // Nothing has arrived to unmute yet: say so rather than lighting the button green over
+        // silence.  The button stays struck through, which is the truth.
+        if (!au) { diag('speaker: no audio from the box yet'); return; }
+        au.muted = false; const p = au.play && au.play(); if (p && p.catch) p.catch(() => {});
+        setBtn(spkBtn, 'on'); showAudio();
         if (window.__boxStream && !window.__rxMetered) { window.__rxMetered = true; meterStream(window.__boxStream, rxM.set); }
         diag('speaker on');
       }
@@ -378,7 +435,7 @@
     let QRUNGS = [5, 10, 20, 40, 80, 160, 320];
     let qCurrent = null, qPending = null;
     const qPanel = document.createElement('div');
-    qPanel.style.cssText = 'position:fixed;left:14px;bottom:140px;z-index:22;width:232px;display:none;' +
+    qPanel.style.cssText = 'position:fixed;left:14px;bottom:210px;z-index:22;width:232px;display:none;' +
       'flex-direction:column;gap:6px;background:rgba(0,0,0,.55);padding:9px 11px;border-radius:11px;' +
       'font:11px ui-monospace,monospace;color:#cdd6df;pointer-events:none';
     const qHead = document.createElement('div');
@@ -476,21 +533,105 @@
         `qi ${m.qi}/${m.max_qi} · key qi ${m.key_qi} · resync ${m.key_secs} s`;
       diag(`rung = ${m.kbps} kbps (${m.target_kbs} KB/s, key qi ${m.key_qi}, resync ${m.key_secs}s)`);
     });
-    ctrl.addEventListener('open', () => { diag('control channel OPEN'); ctrl.send('{"get":1}'); });
-    ctrl.addEventListener('close', () => diag('control channel CLOSE'));
+    ctrl.addEventListener('open', () => { diag('control channel OPEN'); setBtn(qBtn, qOn ? 'on' : 'off');
+                                          ctrl.send('{"get":1}'); });
+    // The ladder is the box's to move, so with the control channel shut there is nothing this
+    // button can do — faded, not struck, because the difference matters.
+    ctrl.addEventListener('close', () => { diag('control channel CLOSE');
+      qOn = false; qPanel.style.display = 'none'; setBtn(qBtn, 'disabled'); });
     // ◈ toggles the panel, like ≡ toggles the debug overlay
-    const qBtn = mkToggle('◈', 194);
+    const qBtn = mkToggle('◈', 194, 'video quality');
+    setBtn(qBtn, 'disabled');                       // until the control channel is actually open
     let qOn = false;
     qBtn.addEventListener('click', () => {
-      qOn = !qOn; qPanel.style.display = qOn ? 'flex' : 'none'; paint(qBtn, qOn);
+      qOn = !qOn; qPanel.style.display = qOn ? 'flex' : 'none'; setBtn(qBtn, qOn ? 'on' : 'off');
       if (qOn && ctrl.readyState === 'open') ctrl.send('{"get":1}');
     });
 
     const XK = { Enter:0xff0d, Backspace:0xff08, Tab:0xff09, Escape:0xff1b,
                  ArrowLeft:0xff51, ArrowUp:0xff52, ArrowRight:0xff53, ArrowDown:0xff54,
-                 Shift:0xffe1, Insert:0xff63 };
+                 Shift:0xffe1, Insert:0xff63,
+                 // the latching modifiers.  Meta is Super_L (0xffeb) rather than Meta_L (0xffe7):
+                 // Super is what a Linux desktop actually binds, and what a ⌘ on a phone means.
+                 Control:0xffe3, Alt:0xffe9, Meta:0xffeb };
     const tap = (keysym, code) => { rfb.sendKey(keysym, code, true); rfb.sendKey(keysym, code, false); };
     const sendChar = ch => { const cp = ch.codePointAt(0); tap(cp < 0x100 ? cp : 0x01000000 + cp, null); };
+
+    // --- latching modifier keys ----------------------------------------------------------------
+    // A phone has no Ctrl.  On a terminal that means no ^C and no ^D — you can start something and
+    // then have no way to stop it — and everywhere else it means no shortcut at all.
+    //
+    // The mobile-terminal convention is a LATCH, and it has two depths on purpose:
+    //   TAP          arms the modifier for the NEXT key, then it lets go by itself.  This is the
+    //                one you want almost always: Ctrl, c, done.
+    //   DOUBLE-TAP   locks it down until tapped again, for the runs where it has to stay (Ctrl-W
+    //                Ctrl-W, arrowing about with Shift held).
+    // The two are drawn differently — outlined vs filled-and-breathing — because a lock that looks
+    // like an arm is a modifier you leave on by accident and then blame the keyboard for.
+    //
+    // THE ROW MUST NOT TAKE FOCUS.  iOS closes the soft keyboard the instant the hidden input
+    // blurs, so a press that moved focus would dismiss the very keyboard it is modifying; every
+    // press therefore preventDefaults.  Tapping a modifier while the keyboard is DOWN focuses the
+    // field instead, so Ctrl doubles as "open the keyboard with Ctrl already armed".
+    const MODS = [
+      { id: 'ctrl',  label: 'Ctrl',  sym: XK.Control, code: 'ControlLeft' },
+      { id: 'alt',   label: 'Alt',   sym: XK.Alt,     code: 'AltLeft' },
+      { id: 'shift', label: 'Shift', sym: XK.Shift,   code: 'ShiftLeft' },
+      { id: 'meta',  label: '⌘',     sym: XK.Meta,    code: 'MetaLeft' },
+    ];
+    const MOD_OFF = 0, MOD_ARMED = 1, MOD_LOCKED = 2, MOD_DBL_MS = 450;
+    const modRow = document.createElement('div');
+    modRow.id = 'mods';
+    const paintMods = () => { for (const m of MODS)
+      m.btn.dataset.mod = ['off', 'armed', 'locked'][m.state]; };
+    for (const m of MODS) {
+      m.state = MOD_OFF; m.last = 0;
+      const b = document.createElement('button');
+      b.className = 'gmod'; b.textContent = m.label; b.dataset.mod = 'off';
+      b.setAttribute('aria-label', m.label + ' (tap to arm, double-tap to lock)');
+      const toggle = () => {
+        const t = performance.now();
+        if (m.state === MOD_ARMED && t - m.last < MOD_DBL_MS) m.state = MOD_LOCKED;  // second tap
+        else m.state = m.state ? MOD_OFF : MOD_ARMED;                                // arm / clear
+        m.last = t; paintMods();
+        diag('mod ' + m.id + ' ' + ['off', 'armed', 'locked'][m.state]);
+        // the keyboard is what a modifier modifies: if it is not up, bring it up.  focus() inside
+        // the gesture handler is the same route the ⌨ button takes, which iOS does honour.
+        if (document.activeElement !== kbin) kbin.focus();
+      };
+      // Two entry points, one action.  touchend is the real one on a phone — preventDefault there
+      // both keeps focus where it is and suppresses the synthetic click; the click listener is for
+      // a mouse, and steps aside if a touch has just been through.
+      let lastTouch = 0;
+      b.addEventListener('mousedown', e => e.preventDefault());   // desktop: never blur the field
+      b.addEventListener('touchend', e => { e.preventDefault(); e.stopPropagation();
+                                            lastTouch = performance.now(); toggle(); },
+                         { passive: false });
+      b.addEventListener('click', e => { e.preventDefault(); e.stopPropagation();
+        if (performance.now() - lastTouch < 700) return;          // already handled as a touch
+        toggle(); });
+      m.btn = b; modRow.appendChild(b);
+    }
+    document.body.appendChild(modRow);
+    // Hold everything latched, emit the key, let go again — the same down / tap / up shape the
+    // Shift+Insert paste below uses, generalised over the row.  Armed modifiers then drop; locked
+    // ones stay down for the next key too.  Release is in a `finally` so a throw mid-key cannot
+    // leave Ctrl held on the desktop with nothing on this end still showing it.
+    const withMods = emit => {
+      const held = MODS.filter(m => m.state !== MOD_OFF);
+      if (!held.length) { emit(); return; }
+      for (const m of held) rfb.sendKey(m.sym, m.code, true);
+      try { emit(); }
+      finally {
+        for (let i = held.length - 1; i >= 0; i--) rfb.sendKey(held[i].sym, held[i].code, false);
+        let changed = false;
+        for (const m of held) if (m.state === MOD_ARMED) { m.state = MOD_OFF; changed = true; }
+        if (changed) paintMods();
+      }
+    };
+    // BOTH key routes go through these, and nothing else does: `tap`/`sendChar` stay bare so the
+    // paste below can spell out its own Shift+Insert without the row joining in.
+    const tapMod = (keysym, code) => withMods(() => tap(keysym, code));
     // A paste is not a keystroke, and on a phone both arrive through this one hidden input.
     // PASTE_MAX caps either route: a phone's clipboard can hold a whole document, and typing one
     // is a key event per character down the data channel — a megabyte would be a million of them.
@@ -503,12 +644,28 @@
         if (ch === '\n' || ch === '\r') tap(XK.Enter, 'Enter'); else sendChar(ch);
       }
     };
+    // What the user TYPED, as opposed to what was pasted: the latched modifiers apply, and they
+    // apply to the FIRST character only.  iOS usually delivers one character per event, but
+    // autocorrect and dictation deliver whole words at once — and "Ctrl armed, a word arrives"
+    // means Ctrl-<first letter>, not a word with Ctrl held down through all of it.
+    const sendTyped = t => {
+      let first = true;
+      for (const ch of t) {
+        const emit = () => { if (ch === '\n' || ch === '\r') tap(XK.Enter, 'Enter'); else sendChar(ch); };
+        if (first) { withMods(emit); first = false; } else emit();
+      }
+    };
+    // A REAL modifier keydown is not a key to forward.  e.key for Shift/Control/Alt/Meta is the
+    // modifier's own name, which now collides with XK — forwarding it would send a press-and-
+    // release of Control every time a hardware Ctrl went DOWN, which is the opposite of holding it.
+    const HWMOD = { Shift: 1, Control: 1, Alt: 1, Meta: 1 };
     kbin.addEventListener('keydown', e => {          // special keys (fire keydown even on iOS)
-      if (e.key in XK) { e.preventDefault(); tap(XK[e.key], e.code); }
+      if (HWMOD[e.key]) return;
+      if (e.key in XK) { e.preventDefault(); tapMod(XK[e.key], e.code); }
     });
     kbin.addEventListener('beforeinput', e => {      // typed characters (iOS soft keyboard)
       const it = e.inputType;
-      if (it === 'insertText' && e.data) { sendText(e.data); e.preventDefault(); }
+      if (it === 'insertText' && e.data) { sendTyped(e.data); e.preventDefault(); }
       // A long-press -> Paste (and a drag-and-drop) arrives as insertFromPaste / insertFromDrop,
       // NOT insertText — so it used to match no branch and the text was thrown away by the
       // kbin.value reset at the bottom, which is why pasting on iOS silently did nothing.  This
@@ -523,9 +680,9 @@
         diag('paste: typed ' + t.length + ' chars' +
              (t.length < raw.length ? ' (capped from ' + raw.length + ')' : ''));
       }
-      else if (it === 'deleteContentBackward') { tap(XK.Backspace, 'Backspace'); e.preventDefault(); }
+      else if (it === 'deleteContentBackward') { tapMod(XK.Backspace, 'Backspace'); e.preventDefault(); }
       else if (it && it.startsWith('insertLine') || it === 'insertParagraph') {
-        tap(XK.Enter, 'Enter'); e.preventDefault();
+        tapMod(XK.Enter, 'Enter'); e.preventDefault();
       }
       kbin.value = '';
     });
@@ -536,7 +693,11 @@
     // ONE message, and Shift+Insert then asks the desktop to paste it wherever focus is — four key
     // messages regardless of length, against one per character.  Typing stays the fallback, and is
     // the whole of the long-press route above, which needs no permission at all.
-    const pasteBtn = mkToggle('📋', 254);
+    // 📋 is an ACTION, not a toggle: there is no "paste is off", so it never wears a strike.  It
+    // sits plain, flashes green when a paste goes through, and fades out entirely while there is
+    // no channel to paste down.
+    const pasteBtn = mkToggle('📋', 254, 'paste');
+    setBtn(pasteBtn, 'disabled');                   // until the RFB channel is actually open
     const sendPaste = text => {
       const t = clampPaste(text);
       const capped = t.length < text.length ? ' (capped from ' + text.length + ')' : '';
@@ -570,7 +731,7 @@
         return;
       }
       if (!text) { diag('paste: clipboard is empty'); return; }
-      paint(pasteBtn, true); setTimeout(() => paint(pasteBtn, false), 600);
+      setBtn(pasteBtn, 'on'); setTimeout(() => setBtn(pasteBtn, 'idle'), 600);
       sendPaste(text);
     });
 
@@ -581,11 +742,17 @@
     if (vv) {
       const screenEl = document.getElementById('screen');
       const fitViewport = () => {
-        const up = (window.innerHeight - vv.height) > 120;       // keyboard (not just a rotation)
+        const lift = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+        const up = lift > 120;                                   // keyboard (not just a rotation)
         screenEl.style.height = up ? vv.height + 'px' : '100vh';
+        // iOS pins position:fixed to the LAYOUT viewport, so the modifier row would slide UNDER
+        // the keyboard exactly when it is wanted.  Lift it to sit ON TOP of the keyboard instead,
+        // where an accessory row belongs; at rest it drops back above the button row.
+        document.documentElement.style.setProperty('--mods-bottom', (up ? lift + 10 : 78) + 'px');
       };
       vv.addEventListener('resize', fitViewport);
       vv.addEventListener('scroll', fitViewport);
+      fitViewport();
     }
 
     // --- virtual trackpad (touch only): relative cursor motion, so your fingertip never hides the
@@ -965,14 +1132,16 @@
     // debug toggle: bottom-left button to show/hide the whole diagnostics overlay (hud + log + copy)
     const dbgBtn = document.createElement('button');
     dbgBtn.textContent = '≡';
-    dbgBtn.style.cssText = 'position:fixed;bottom:14px;left:14px;z-index:31;width:52px;height:52px;' +
-      'border-radius:26px;border:0;background:rgba(0,0,0,.6);color:#7CFC9B;font-size:26px';
+    dbgBtn.className = 'gbtn';                      // same three states as the rest of the row
+    dbgBtn.dataset.state = 'off';
+    dbgBtn.setAttribute('aria-label', 'diagnostics');
+    dbgBtn.style.cssText += 'bottom:14px;left:14px;z-index:31;font-size:26px';
     document.body.appendChild(dbgBtn);
     let dbgOn = false;                              // debug overlay hidden by default; ≡ toggles it
     const applyDbg = () => {
       const d = dbgOn ? '' : 'none';
       hud.style.display = d; diagEl.style.display = d; copyBtn.style.display = d;
-      dbgBtn.style.opacity = dbgOn ? '1' : '0.5';
+      setBtn(dbgBtn, dbgOn ? 'on' : 'off');
       // debug view and the clean connecting overlay are mutually exclusive: showing debug hides the
       // overlay; hiding debug brings the overlay back if we're still connecting (before first frame).
       if (dbgOn) connEl.style.display = 'none';
@@ -992,8 +1161,12 @@
     pc.addEventListener('connectionstatechange', () => diag('conn ' + pc.connectionState));
     pc.addEventListener('icegatheringstatechange', () => diag('gather ' + pc.iceGatheringState));
     pc.addEventListener('icecandidateerror', e => diag(`cand-err ${e.errorCode} ${e.url || ''} ${(e.errorText || '').slice(0,40)}`));
-    ch.addEventListener('open', () => { diag('datachannel OPEN'); setStep(3); });
-    ch.addEventListener('close', () => diag('datachannel CLOSE'));
+    ch.addEventListener('open', () => { diag('datachannel OPEN'); setStep(3);
+                                        setBtn(pasteBtn, 'idle'); });
+    // The session is gone, so none of these can do anything — and "cannot" has to look different
+    // from "off", or the row goes on inviting taps that will not land.
+    ch.addEventListener('close', () => { diag('datachannel CLOSE');
+      for (const b of [pasteBtn, micBtn, spkBtn, qBtn]) setBtn(b, 'disabled'); });
     ch.addEventListener('error', e => diag('datachannel ERROR ' + ((e.error && e.error.message) || '')));
     rfb.addEventListener('connect', () => diag('RFB connect'));
     rfb.addEventListener('disconnect', e => diag('RFB disconnect ' + ((e.detail && e.detail.clean) ? 'clean' : 'UNCLEAN')));
