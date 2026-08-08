@@ -58,26 +58,33 @@
        before to read, which is why 🎙 and 🔈 sat there looking switched on while the microphone
        was off and the sound was muted.  So:
          ON        green glyph, nothing over it
-         OFF       a hard diagonal strike, the mark a road sign uses — and the ONLY thing that
-                   ever draws one, so a strike always means "off, tap me"
-         DISABLED  faded, desaturated, and pointer-events:none, so it cannot be mistaken for
-                   something worth tapping
+         OFF       a dulled glyph AND a diagonal strike across it — the strike is the ONLY thing
+                   that ever draws one, so a strike always means "off, tap me".  Two half-signals
+                   read as clearly as one loud one, and neither of them has to shout.
+         DISABLED  faded well past OFF, desaturated, and pointer-events:none, so it cannot be
+                   mistaken for something worth tapping
        Anything that is an action rather than a toggle (📋) stays plain: it has no "off". */
     .gbtn{position:fixed;z-index:20;width:52px;height:52px;border-radius:26px;border:0;padding:0;
       background:rgba(0,0,0,.6);color:#cdd6df;font-size:22px;line-height:1;
       touch-action:manipulation;-webkit-tap-highlight-color:transparent;
       transition:color .12s ease,background .12s ease,opacity .12s ease}
     .gbtn[data-state="on"]{color:#7CFC9B}
+    /* OFF dulls the glyph as well as striking it.  The glyph lives in its own .gg span for exactly
+       one reason: opacity on the button would drag the strike down with it, and the strike is the
+       one part that has to hold up against whatever the desktop puts behind it. */
+    .gbtn .gg{transition:opacity .12s ease}
+    .gbtn[data-state="off"] .gg{opacity:.72}
     .gbtn[data-state="disabled"]{color:rgba(255,255,255,.34);background:rgba(0,0,0,.3);
       opacity:.42;filter:grayscale(1);pointer-events:none}
-    /* the strike is drawn TWICE — a wide dark stroke under a white one — for the same reason the
+    /* the strike is drawn TWICE — a dark stroke under a white one — for the same reason the
        trackpad cursor is: the desktop shows through these buttons, and a single-colour line
-       disappears against half the things that can be behind it */
-    .gbtn::before,.gbtn::after{content:'';position:absolute;left:50%;top:50%;width:42px;
-      transform:translate(-50%,-50%) rotate(45deg);border-radius:3px;opacity:0;
+       disappears against half the things that can be behind it.  It is INSET rather than corner to
+       corner, and thin: it only has to cross the glyph, not underline the whole button. */
+    .gbtn::before,.gbtn::after{content:'';position:absolute;left:50%;top:50%;width:32px;
+      transform:translate(-50%,-50%) rotate(45deg);opacity:0;
       transition:opacity .12s ease;pointer-events:none}
-    .gbtn::before{height:7px;background:rgba(0,0,0,.92)}
-    .gbtn::after{height:3px;background:#fff}
+    .gbtn::before{height:5px;border-radius:2.5px;background:rgba(0,0,0,.92)}
+    .gbtn::after{height:2px;border-radius:1px;background:#fff}
     .gbtn[data-state="off"]::before,.gbtn[data-state="off"]::after{opacity:1}
     /* --- latching modifier keys --------------------------------------------------------------
        ARMED is outlined: held for the next key, then it lets go by itself.
@@ -361,12 +368,16 @@
     // see the .gbtn rules in <style>.  SETBTN is the only thing that writes one, so "what state
     // is this in" and "what does it look like" cannot drift apart.
     //   'on'       green
-    //   'off'      struck through — available, currently not doing its thing
+    //   'off'      dulled and struck through — available, currently not doing its thing
     //   'idle'     plain — for the buttons that are ACTIONS and have no off (📋)
     //   'disabled' faded and untouchable — the session cannot carry it right now
+    // the glyph goes in its own span so 'off' can dull the glyph without dulling the strike over it
+    const gGlyph = glyph => {
+      const s = document.createElement('span'); s.className = 'gg'; s.textContent = glyph; return s;
+    };
     const mkToggle = (glyph, right, label) => {
       const b = document.createElement('button');
-      b.textContent = glyph;
+      b.appendChild(gGlyph(glyph));
       b.className = 'gbtn';
       b.dataset.state = 'off';
       if (label) b.setAttribute('aria-label', label);
@@ -1131,7 +1142,7 @@
     });
     // debug toggle: bottom-left button to show/hide the whole diagnostics overlay (hud + log + copy)
     const dbgBtn = document.createElement('button');
-    dbgBtn.textContent = '≡';
+    dbgBtn.appendChild(gGlyph('≡'));
     dbgBtn.className = 'gbtn';                      // same three states as the rest of the row
     dbgBtn.dataset.state = 'off';
     dbgBtn.setAttribute('aria-label', 'diagnostics');
