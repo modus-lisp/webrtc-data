@@ -579,6 +579,18 @@
       onResume();
     });
 
+    // iOS Safari — the daily driver, and the one browser none of this was tested on — can restore a
+    // page from the back/forward cache without a visibilitychange: the tab comes back, JS unfreezes,
+    // and the handler above never runs.  That is exactly the "I came back and it was dead" case, so
+    // pageshow gets the same treatment.  Only the persisted restore matters (a fresh load runs the
+    // whole connect sequence anyway), and ONRESUME is cheap and self-limiting when nothing was
+    // wrong — a short gap just polls — so the two events overlapping costs nothing.
+    window.addEventListener('pageshow', e => {
+      if (!e.persisted) return;
+      diag('restored from bfcache — probing the link');
+      onResume();
+    });
+
     let lastRungLine = '';
     ctrl.addEventListener('message', e => {
       // ANY message here is the pong to checkLink()'s '{"get":1}' — the box answers every control
