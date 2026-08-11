@@ -57,8 +57,14 @@ business making that request, and the failure appears as a blank screen with not
 ## Publish
 
 ```sh
-SITE_VERSION=<tag> sbcl --script publish.lisp
+SITE_VERSION=<tag> sbcl --script publish.lisp "$NSITE_BUILD/nsite-index.html"
 ```
+
+**Pass the file path.** `$NSITE_BUILD` means two different things to the two scripts and this is the
+trap: `mkbundle.py` reads it as the build **directory**, `publish.lisp` reads it as the **artefact
+path** (`*path*` is argv, then `$NSITE_BUILD` verbatim, then `nsite-build/nsite-index.html` beside
+the script). So `NSITE_BUILD=/path/to/nsite-build sbcl --script publish.lisp` hands `read-bytes` a
+directory and dies. Give the file as argv — that is the only form that is right for both scripts.
 
 It uploads the HTML to the Blossom servers (one success is enough — `nostr.download` often times
 out), then publishes the nsite manifest mapping `/<tag>.html`, `/index.html` and `/` to that blob,
@@ -84,17 +90,28 @@ python3 mkbundle.py
 
 # 3. publish under a NEW tag — watch for at least one "accepted=T"
 #    (needs the site key: $SITE_SEC or ~/.glass/site-key — see Secrets)
-SITE_VERSION=k30 sbcl --script publish.lisp
+#    NOTE the argv: publish.lisp wants the FILE, not the build dir.  See Publish.
+SITE_VERSION=k30 sbcl --script publish.lisp "$NSITE_BUILD/nsite-index.html"
 
 # 4. verify all four hops; every line should say MATCH
 sbcl --script check-deploy.lisp "$NSITE_BUILD/nsite-index.html"
 
-# 5. restart the gateway.  publish.lisp already wrote site-url.env with the path it
-#    published, and the keepalive sources that inside its loop — so this is all it takes
+# 5. publish.lisp has just OVERWRITTEN site-url.env with an nsite.LOL url.  While nsite.lol is
+#    serving a stale manifest (see "Delivering the page"), re-point that line at nsite.run —
+#    otherwise the next gateway start hands out a link that 404s.
+$EDITOR site-url.env
+
+# 6. restart the gateway.  The keepalive sources site-url.env inside its loop, so this is all
+#    it takes — but LOGIN_URL_BASE is read once at gateway start, so it does take this.
 kill <gateway-pid>          # the keepalive respawns it
 
-# 6. DM the box "link" and load the result
+# 7. DM the box "link" and load the result
 ```
+
+Steps 5 and 6 are only needed for the *login link*. A device that has connected before keeps the
+box npub in `localStorage`, so handing it the bare `https://<npub>.nsite.run/<tag>.html` (no
+`#box=…&code=…` fragment) is enough on its own — which is the way to ship a build without
+touching a running gateway.
 
 ### The login link must point at the path you just published
 
@@ -131,8 +148,22 @@ each hop holds, so the first mismatch names the broken hop. It is read-only and 
 
 | URL | current? | notes |
 |---|---|---|
-| `https://<site-npub>.nsite.lol/<tag>.html` | **only if the gateway has caught up** | the nice URL; stable origin, so an enrolled device key persists |
+| `https://<site-npub>.nsite.run/<tag>.html` | **yes — use this one** | resolves the current manifest; stable origin, so an enrolled device key persists |
+| `https://<site-npub>.nsite.lol/<tag>.html` | **no** | still answering from a manifest it cached days ago |
 | `https://cdn.hzrd149.com/<blob-sha256>` | **always** | the blob itself, straight from Blossom |
+
+**Verify on nsite.run, not nsite.lol.** nsite.lol has been serving a stale manifest for several
+builds running: `/<newtag>.html` 404s there while `/index.html` returns the *previous* build with a
+200, which is the worse of the two failures because it looks like a success. Re-measured each
+deploy since k32; still true at k34:
+
+```
+nsite.lol /k33.html  -> 404      nsite.run /k33.html  -> 200, current bytes
+nsite.lol /index.html-> 200, OLD build
+```
+
+`publish.lisp` writes the nsite.lol host into `site-url.env` regardless, so that file needs
+re-pointing after every publish until nsite.lol catches up (step 5 above).
 
 The blob URL works because the published page is entirely self-contained — that is exactly what the
 build's `import-from-url 0` check guarantees — and because `#box=…&code=…` is a client-side

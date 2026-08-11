@@ -7,7 +7,7 @@
 ;;;;   build     the local nsite-index.html                       (sha256 = the blob id)
 ;;;;   Blossom   the blob is fetchable by that hash
 ;;;;   relays    a manifest naming that hash exists, on the relays the site itself advertises
-;;;;   gateway   https://<npub>.nsite.lol/<path> actually serves it
+;;;;   gateway   https://<npub>.nsite.{run,lol}/<path> actually serves it -- BOTH, they disagree
 ;;;;
 ;;;;   sbcl --script check-deploy.lisp [/path/to/nsite-index.html]
 ;;;;
@@ -115,11 +115,16 @@
   ;; The hop that has actually broken in practice: the relays hold the new manifest and the gateway
   ;; keeps serving an older one for hours, well past its advertised max-age.  Nothing in this repo
   ;; can fix that — see "If the gateway will not pick it up" in DEPLOY.md.
+  ;; BOTH gateways, because checking only one has twice produced the wrong verdict: nsite.lol has
+  ;; been stale for several builds running while nsite.run resolves the current manifest, so a
+  ;; single-host check reported a broken deploy that was in fact fine everywhere it was being read
+  ;; from.  Whichever host the link points at is the one whose line matters.
   (format t "~%[gateway]~%")
-  (dolist (path '("/index.html" "/"))
-    (multiple-value-bind (status got) (%http-head (format nil "https://~a.nsite.lol~a" *site-npub* path))
-      (format t "   ~a~30thttp ~a  ~a~a~%" path status (%short got)
-              (cond ((null want) "")
-                    ((equal got want) "  MATCH — the gateway is current")
-                    (t "  *** STALE — serving an older build ***")))))
+  (dolist (host '("nsite.run" "nsite.lol"))
+    (dolist (path (list (format nil "/~a.html" (or (uiop:getenv "SITE_VERSION") "index")) "/index.html" "/"))
+      (multiple-value-bind (status got) (%http-head (format nil "https://~a.~a~a" *site-npub* host path))
+        (format t "   ~a~12t~a~34thttp ~a  ~a~a~%" host path status (%short got)
+                (cond ((null want) "")
+                      ((equal got want) "  MATCH — this gateway is current")
+                      (t "  *** STALE — serving an older build ***"))))))
   (format t "~%"))
