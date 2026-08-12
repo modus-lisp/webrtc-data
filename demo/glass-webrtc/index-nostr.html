@@ -26,6 +26,12 @@
        "relay->srflx 147ms" is exactly what you would otherwise open the debug log to learn. */
     #connstatus .card{display:flex;flex-direction:column;align-items:stretch;gap:14px;
       text-align:left;padding:28px;min-width:264px;max-width:min(86vw,340px)}
+    /* Which box is this?  Answered before the first packet — see the note at LEARNT-NAME. */
+    #connstatus .who{display:flex;flex-direction:column;gap:2px;margin:-4px 0 2px}
+    #connstatus .who .nm{font-size:15px;font-weight:600;letter-spacing:.01em;color:#eef4f8}
+    #connstatus .who .nm.unknown{font-weight:500;color:#9fb0bd}
+    #connstatus .who .id{font-size:11.5px;font-variant-numeric:tabular-nums;color:#7d8b96;
+      letter-spacing:.04em}
     #connstatus .steps{list-style:none;margin:0;padding:0;display:flex;flex-direction:column}
     #connstatus .steps li{position:relative;display:grid;grid-template-columns:16px 1fr;
       column-gap:12px;padding:6px 0;color:rgba(232,238,242,.34);transition:color .4s ease}
@@ -188,6 +194,7 @@
   <div id="linkstat" data-state="live" hidden><span class="dot"></span><span class="txt"></span
     ><button type="button">Reconnect</button></div>
   <div id="connstatus"><div class="card">
+    <div class="who"><span class="nm"></span><span class="id"></span></div>
     <ol class="steps">
       <li><b></b><span class="lbl">Finding a route</span><span class="det"></span></li>
       <li><b></b><span class="lbl">Reaching your desktop</span><span class="det"></span></li>
@@ -1660,7 +1667,9 @@ if (typeof window !== "undefined") window.makeWarpClient = makeWarpClient;
     ch.addEventListener('close', () => { diag('datachannel CLOSE');
       for (const b of [pasteBtn, micBtn, spkBtn, qBtn]) setBtn(b, 'disabled'); });
     ch.addEventListener('error', e => diag('datachannel ERROR ' + ((e.error && e.error.message) || '')));
-    rfb.addEventListener('connect', () => diag('RFB connect'));
+    // The handshake is the only place the box says what it is called, so it is the only place
+    // that can teach the progress screen for next time.  See LEARNT-NAME.
+    rfb.addEventListener('connect', () => { diag('RFB connect'); learnWho(rfb._fbName); });
     rfb.addEventListener('disconnect', e => diag('RFB disconnect ' + ((e.detail && e.detail.clean) ? 'clean' : 'UNCLEAN')));
     rfb.addEventListener('securityfailure', e => diag('RFB security-fail ' + ((e.detail && e.detail.reason) || '')));
     // heartbeat every 10s — but only log it when something's NOT fully healthy or the state
@@ -2028,6 +2037,43 @@ if (typeof window !== "undefined") window.makeWarpClient = makeWarpClient;
     // and a fresh browser silently dials a box that no longer exists.  Rotated 2026-08-12.
     const boxArg = urlBox || loadBox() ||
       '804f867fba14b70a9a84542a982a79d3775356a3d105e03af4bf4fd6ed7cfb55';
+
+    // ---- LEARNT-NAME: which box is this? ---------------------------------------------------
+    // The question worth answering while someone is watching the progress list is "is this the
+    // right desktop", and it has to be answered BEFORE the first packet — which rules out the
+    // box telling us, because glass sends its name (GLASS:*DESKTOP-NAME*) in the RFB handshake,
+    // three steps too late.
+    //
+    // So the box tells us once and we remember it: on connect we keep the RFB desktop name
+    // against this box's pubkey, and every later visit reads it from localStorage and renders it
+    // immediately.  Only the very first connection to a box shows a placeholder, and it is the
+    // one time you cannot have picked the wrong one by habit.
+    //
+    // The pubkey prefix is shown underneath and is NOT decoration: a cached name can be stale
+    // (a desktop renamed, a box rebuilt) while the key is the identity the connection is
+    // actually made against.  Name to recognise, key to verify.
+    const nameKey = 'glass-name:' + boxArg;
+    const whoNm = document.querySelector('#connstatus .who .nm');
+    const whoId = document.querySelector('#connstatus .who .id');
+    const showWho = () => {
+      let known = '';
+      try { known = localStorage.getItem(nameKey) || ''; } catch (_) {}
+      whoNm.textContent = known || 'this desktop — not seen before';
+      whoNm.classList.toggle('unknown', !known);
+      whoId.textContent = boxArg.slice(0, 12) + '…';
+    };
+    const learnWho = name => {
+      const n = (name || '').trim();
+      if (!n) return;
+      let had = '';
+      try { had = localStorage.getItem(nameKey) || ''; } catch (_) {}
+      if (n === had) return;
+      try { localStorage.setItem(nameKey, n); } catch (_) {}
+      showWho();                       // a rename lands now, not on the next visit
+      diag('desktop name: ' + n + (had ? ' (was "' + had + '")' : ''));
+    };
+    showWho();
+
     // ---- credential handling --------------------------------------------------------------
     // The token is  nonce.exp.mac  with exp a unix time, so the browser can judge its own
     // credential without asking anyone: an expired link is reported as expired instead of
