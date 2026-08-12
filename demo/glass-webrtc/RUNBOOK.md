@@ -124,16 +124,21 @@ exhausts.
 first, then RFC 5764 first-byte demux splits SRTP (128–191) from DTLS (20–63). Every inbound datagram
 stamps a receive time, which powers a 30 s consent timeout.
 
-**Data channels.** Two:
+**Data channels.** Three, of which the third is off by default:
 
 | channel | stream | negotiation | carries |
 |---|---|---|---|
 | `rfb` | 0 | DCEP | raw RFB, binary. noVNC takes the `RTCDataChannel` as its transport directly |
 | `control` | 100 | `negotiated: true` | flat JSON |
+| `warp` | 102 | `negotiated: true` | warp delta frames — the enrolled-terminal list (§7) |
 
 Control messages: `{"kbps":N}` to change rung, `{"get":1}` to poll, `{"request":"keyframe"}` when the
 decoder is stranded. **The box answers every control message with full state**, which the client
 exploits as an application-level heartbeat (~18 B/s).
+
+A negotiated channel has **no DCEP handshake**, so creating one costs nothing and the box cannot be
+told it exists — it learns by receiving a message on that stream. Both `control` and `warp` work that
+way, which is why an unused channel is indistinguishable from an absent one.
 
 A session ends at 1 hour, or after 30 s of peer silence, whichever comes first.
 
@@ -265,7 +270,62 @@ docstring and enforced nowhere.
 
 ---
 
-## 7. Dragons
+## 7. The warp channel — the terminal list, on the connection you already have
+
+**Off unless `WARP_CHANNEL` is set.** With it unset the warp systems are never loaded, no projection
+is built, no thread is started, nothing is sent, and the startup banner does not mention it. That is
+deliberate: a claim of "this changes nothing" has to be checkable by reading, and "the code is not
+loaded" is the only version of it that is.
+
+The one branch it adds to the session's message dispatch matches **stream 102 only**, and matches it
+*whether or not the flag is set* — disabled means the bytes are dropped, not that the clause is
+skipped. Skipping it would let a phone that has the panel, talking to a box that does not have the
+channel, fall through to the RFB branch and hand glass `{"t":"viewport",…}` as desktop input. For
+streams 0 and 100 — the only two any deployed client uses — the dispatch is unchanged.
+
+**What it is.** `revoke` and the enrolment list already exist as a command set on a type, with a
+real authorization rule, reachable only over DM. This gives that same set a second surface — a ▤
+button on the phone that opens a list of enrolled terminals, where a hold offers the applicable
+commands and a tap invokes one. Same command, same authorization predicate, written once.
+
+**Where it runs.** *Inside the gateway*, over the gateway's own `.glass-devices`. No bridge and no
+second process, because `:warp` depends on `bordeaux-threads` and nothing else.
+
+| file | what it is |
+|---|---|
+| `warp-channel.lisp` | the whole gateway side: stream id, invoker, query, open/message/close |
+| `gateway-nostr.lisp` | **29 added lines** — a `load`, a `let` binding, one `cond` clause, one close, one banner line |
+| `index-nostr.html` | the ▤ panel, plus `warp/dom/client.js` embedded verbatim |
+| `warp/dom/channel.lisp` | everything testable: the clock, the lock, the non-signalling send, the close |
+
+**Authorization.** The invoker is `:allowlist` iff `authorized-p` says so, and `:device` otherwise —
+so an allowlisted owner is offered `revoke` and an enrolled guest is not. It is deliberately **not**
+the session's `via` string: `via` takes the first match of code / allowlist / device, so an owner
+arriving on a magic link classifies as `"code"` and so does a guest who was sent one. Mapping that
+string would demote the owner and promote the guest at the same time. Menu filtering is courtesy;
+`warp:invoke` refuses an unauthorized command whatever the surface offered.
+
+**Cost.** `WARP_BUDGET` bytes per pass (default 1024) at `WARP_HZ` (default 4), and **zero in steady
+state** — a pass with nothing owed sends nothing, and enrolments do not change while you are
+watching a desktop. The budget bounds the first fill and the rare change.
+
+**A revoke from the panel** rewrites `.glass-devices`, and the gateway's own `sync-devices` picks it
+up on the next mtime check — the mechanism the device store was designed around. `device-enrolled-p`
+then refuses that terminal's next connection with no restart.
+
+**Environment.** `WARP_CHANNEL=1` to enable; `WARP_BUDGET`, `WARP_HZ`, `WARP_ROWS` to tune. warp must
+be checked out beside `webrtc-data` and reachable through `CL_SOURCE_REGISTRY`; if it is not, the
+load fails inside a handler, one line goes to the log, and the panel shows "no answer".
+
+**Tests, none of which start a gateway.** `demo/glass-webrtc/warp-channel-test.lisp` lifts
+`authorized-p` and the device store out of `gateway-nostr.lisp`'s *text* by name and runs
+`warp-channel.lisp` against a stubbed SCTP; `warp/t/channel.lisp` drives the channel module over a
+fake transport; `warp/t/panel.sh` drives the panel's actual bytes in headless Chromium. The
+untested remainder is `sctp-send-string` itself, which already carries RFB and the control channel.
+
+---
+
+## 8. Dragons
 
 **Security**
 

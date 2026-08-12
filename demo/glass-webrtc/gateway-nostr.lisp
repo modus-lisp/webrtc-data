@@ -290,6 +290,16 @@ silently drop CODE.)"
 (defparameter *video-max-frame-kb* (or (ignore-errors (parse-integer (uiop:getenv "VIDEO_MAX_FRAME_KB"))) 32))
 (defparameter *video-cleanup-ms* (or (ignore-errors (parse-integer (uiop:getenv "VIDEO_CLEANUP_MS"))) 700))
 
+;; ---- the warp channel: the device manager, on a third data channel ------------
+;; Loaded HERE and not at the top because it reads this file's device store and this file's
+;; allowlist predicate, and putting it after their definitions is what keeps the load silent.
+;;
+;; It is INERT unless WARP_CHANNEL is set: with the variable unset the warp systems are never
+;; loaded, no projection is built and no thread is started, and WARP-SID-P answers NIL from a
+;; single comparison — so the one branch it adds to the session dispatch below cannot be taken.
+;; See warp-channel.lisp's header for the whole of the argument.
+(load (merge-pathnames "warp-channel.lisp" (or *load-pathname* *default-pathname-defaults*)))
+
 ;;; ---- one live session per terminal ------------------------------------------
 ;; A phone never says goodbye.  It locks its screen, changes network, or just reloads the page and
 ;; offers again — and nothing in WebRTC tells the answerer the old session died.  Sessions used to run
@@ -384,7 +394,10 @@ make."
 (defun run-session (conn agent &key pub)
   "Drive DTLS, run the data channel, and bridge it to glass once the channel opens.
 Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
-  (let ((glass nil) (audio-stop nil) (video-stop nil) (cap nil) (tap nil) (mic nil))
+  (let ((glass nil) (audio-stop nil) (video-stop nil) (cap nil) (tap nil) (mic nil)
+        ;; This peer's warp channel, or NIL — which is what it stays unless the phone sends on
+        ;; stream 102, which it only does if somebody opens the panel.
+        (warp nil))
     (unwind-protect
          (handler-case
              (progn
@@ -515,6 +528,18 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                   ;; its own framing, and nothing here has to know how to tell the two apart.
                   (cond
                     ((control-sid-p sid) (handle-control-message assoc sid payload))
+                    ;; The phone's THIRD channel (stream 102) is warp: the enrolled-terminal list
+                    ;; as a delta stream, and the commands on it.  A negotiated channel has no
+                    ;; handshake, so the first message IS the open.
+                    ;;
+                    ;; This clause claims stream 102 WHETHER OR NOT WARP_CHANNEL IS SET, on
+                    ;; purpose: with the feature off WARP-ON-MESSAGE drops the bytes, and dropping
+                    ;; them is the point — gating the clause instead would let a phone that has the
+                    ;; panel, talking to a box that does not have the channel, fall through to the
+                    ;; RFB branch below and hand glass a JSON object as desktop input.
+                    ;; Streams 0 and 100 — the only two any deployed client uses — are matched
+                    ;; before and after this line exactly as they were.
+                    ((warp-sid-p sid) (setf warp (warp-on-message warp assoc sid payload pub)))
                     ((and glass (plusp (length payload)))
                      (let ((bytes (as-u8vec payload)))
                        ;; in video-primary mode drop FramebufferUpdateRequest (type 3, 10 bytes) so
@@ -549,6 +574,11 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
         (when (and quiet (>= quiet *peer-silence-limit*))
           (format *error-output* "~&[gw-nostr] peer silent ~,0fs — closing session~%" quiet)))
       (when pub (forget-session pub agent))
+      ;; This peer's warp consumer dies with the session, deliberately: its STREAM is its memory of
+      ;; what the far end holds, and a phone that comes back is a phone holding nothing.  Keeping it
+      ;; would hand the returning peer somebody else's high-water mark, which is rule 8's
+      ;; late-joiner bug with the roles reversed.  NIL when the channel was never opened.
+      (when warp (setf warp (warp-close warp)))
       (when cap (ignore-errors (capture-stop cap)))
       (when video-stop (ignore-errors (funcall video-stop)))
       (when audio-stop (ignore-errors (funcall audio-stop)))
@@ -677,6 +707,11 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
       (format t "@@ allowlist:  ~{~a~^, ~}~%" (mapcar (lambda (h) (subseq h 0 12)) *allow*))
       (format t "@@ allowlist:  (empty) — no NOSTR_ALLOW; only one-time codes admit clients.~%"))
   (format t "@@ login-link: sbcl --script login-link.lisp <npub|email> [ttl]  (DMs a code)~%")
+  ;; Printed ONLY when the channel is enabled, so a gateway that is not offering it logs exactly
+  ;; what it logged before — the banner is the last place a "changes nothing" claim could leak.
+  (when *warp-channel-enabled*
+    (format t "@@ warp:       stream ~a, ~a B/pass at ~a Hz (device manager)~%"
+            +warp-stream-id+ *warp-budget* *warp-hz*))
   (finish-output)
   (cl-nostr.pool:pool-subscribe
    pool

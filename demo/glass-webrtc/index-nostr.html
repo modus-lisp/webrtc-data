@@ -143,6 +143,42 @@
       animation:modlock 1.5s ease-in-out infinite}
     @keyframes modlock{0%,100%{box-shadow:0 0 0 0 rgba(124,252,155,.6)}
                        50%{box-shadow:0 0 0 5px rgba(124,252,155,0)}}
+    /* --- the warp panel: enrolled terminals, over the third data channel ----------------------
+       DISPLAY:NONE WHEN CLOSED, which is doing real work rather than saving pixels: a hidden
+       element is out of hit-testing entirely, so while the panel is shut the trackpad, the
+       modifier row and the desktop underneath behave exactly as they did before it existed.
+       Open, it DOES take pointer events — unlike the quality panel, which is a row of buttons over
+       a live desktop.  This one is a list you tap and hold, so the taps are its own; that is the
+       trade the ▤ button is asking you to make when you open it.
+       Class names come from warp/dom/client.js and are the same ones its standalone page styles:
+       .v .l .stale on a row, .t .c on a menu item, and selected / warn / bad / destructive. */
+    #warpPanel{position:fixed;left:10px;right:10px;top:52px;bottom:150px;z-index:23;display:none;
+      flex-direction:column;background:rgba(8,10,14,.93);border:1px solid rgba(255,255,255,.12);
+      border-radius:12px;overflow:hidden;
+      font:12px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;color:#dce4ec}
+    #warpHead{display:flex;justify-content:space-between;align-items:baseline;gap:10px;
+      padding:9px 12px;border-bottom:1px solid rgba(255,255,255,.1);color:#8a949c;flex:0 0 auto}
+    #warpHead b{color:#dce4ec;font-weight:600;letter-spacing:.04em}
+    #warpBody{flex:1 1 auto;overflow-y:auto;-webkit-overflow-scrolling:touch;position:relative}
+    #warpRows{list-style:none;margin:0;padding:0}
+    #warpRows li{display:flex;align-items:center;gap:12px;padding:10px 12px;
+      background:#161a20;border-bottom:1px solid #0c0e12;border-left:4px solid #5abe82;
+      touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+    #warpRows li.selected{background:#26303c}
+    #warpRows li.warn{border-left-color:#fabe3c}
+    #warpRows li.bad{border-left-color:#f04646}
+    #warpRows li .v{font-size:14px;min-width:64px}
+    #warpRows li .l{color:#8a949c;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    #warpRows li .stale{margin-left:auto;color:#5a646c;font-size:10px}
+    #warpMenu{list-style:none;margin:0;padding:0;position:absolute;left:12px;right:12px;top:8px;
+      box-shadow:0 10px 30px #000c;border-radius:9px;overflow:hidden}
+    #warpMenu:empty{display:none}
+    #warpMenu li{padding:12px 13px;background:#222c38;border-left:3px solid #dce4ec;
+      border-bottom:1px solid #0c0e12;display:flex;gap:10px;touch-action:manipulation}
+    #warpMenu li.destructive{background:#3a1c1c;border-left-color:#f04646;color:#ffb0b0}
+    #warpMenu li .c{margin-left:auto;color:#8a949c;font-size:10px}
+    #warpNote{padding:8px 12px;color:#8a949c;flex:0 0 auto;
+      border-top:1px solid rgba(255,255,255,.08)}
   </style>
 </head>
 <body>
@@ -626,6 +662,366 @@
       qOn = !qOn; qPanel.style.display = qOn ? 'flex' : 'none'; setBtn(qBtn, qOn ? 'on' : 'off');
       if (qOn && ctrl.readyState === 'open') ctrl.send('{"get":1}');
     });
+
+    // ==== BEGIN warp/dom/client.js — VERBATIM, checked by warp/t/client-sync.py ====
+// warp/dom/client.js — the DOM encoding's client.  ONE copy, two hosts, no transport.
+//
+// This file is loaded verbatim by two pages that have nothing else in common:
+//
+//   warp/dom/client.html                                a standalone page over a WebSocket
+//   webrtc-data/demo/glass-webrtc/index-nostr.html      a panel over a WebRTC data channel
+//
+// and it is the same file in both because the client's job does not vary with the link.  A frame
+// is a frame; MAKE-WARP-CLIENT takes a SEND and hands back an APPLY, which is the browser half of
+// the same statement the server half makes by taking a SEND function and nothing else.
+//
+// It is deliberately small, and the smallness is the argument.  The client holds a Map from key to
+// node and does four things with a delta: create, replace content, re-anchor, remove.  It does not
+// diff, does not reconcile, does not keep a shadow tree and does not know what a projection is —
+// all of that happened on the server, which is what "the stream carries state, not events" buys.
+//
+// It also does not decide anything about safety.  The menu it draws is whatever the server sent
+// it; it cannot invent a command, and if it tried, the server would refuse it at invocation
+// (DESIGN.md rule 6).
+//
+// THE HOST OWNS THE ELEMENTS AND THE STYLESHEET.  This file writes exactly these class names and
+// nothing else, so a page can look however it likes without touching the logic:
+//
+//   on a row       selected | warn | bad     and cells .v (value) .l (label) .stale (as-of)
+//   on a menu item destructive              and cells .t (label)  .c (cost class)
+//
+// GESTURES ARE SCOPED TO A ROOT ELEMENT, which is the one thing the standalone page did not need
+// and the panel absolutely does: a listener on `document` inside a remote-desktop client would eat
+// the pointer events the trackpad lives on.  ATTACHGESTURES(root) listens on root only.
+
+"use strict";
+function makeWarpClient(opts) {
+  const rowsEl = opts.rows;
+  const menuEl = opts.menu;
+  const send   = opts.send;                 // (object) -> void.  The whole of the transport.
+  const onStat = opts.onStat || function () {};
+  const ROWS   = opts.viewportRows || 14;   // what this viewport can show; reported to the server
+
+  // key -> {key, node, in, after}.  This is the client's ENTIRE model.  The server holds the
+  // memory of what we have been told; we hold the nodes it named and the anchor each one was given.
+  const nodes = new Map();
+
+  // Anchor key -> the records waiting for it.  THIS IS NOT DEFENSIVE PADDING, it is load-bearing,
+  // and it is the one thing an anchor-based encoding needs that a rectangle-based one does not.
+  //
+  // A rectangle is absolute: deltas carrying rectangles can be applied in any order at all.  An
+  // anchor is RELATIVE, so "insert X after Y" is unappliable until Y exists — and two independent
+  // things make that happen:
+  //
+  //   * the reconciler emits within a priority band in reverse layout order, so a pass that
+  //     appends two rows sends `r05 after r04` before it sends `r04`;
+  //   * and even in layout order, the BUDGET can defer the anchor to a later pass entirely, which
+  //     no ordering rule on the server could fix.
+  //
+  // So a node whose place we do not know yet is held OUT of the document rather than dropped into
+  // a place we invented, and it is inserted the moment its anchor lands.  Guessing would put a row
+  // in the wrong place and leave it there, which is exactly the silent-wrong-order failure this
+  // encoding's positions exist to prevent.
+  const waiting = new Map();
+  let gen = 0, frames = 0, bytes = 0, deltas = 0;
+  let scroll = 0;
+
+  function container(name) {
+    return name === "rows" ? rowsEl : menuEl;
+  }
+
+  // The four kinds, and nothing else.  Note what is NOT here: no re-render, no keyed list diff, no
+  // virtual DOM.  A :moved does not touch the node's content, which is the entire point of rule 2.
+  function applyDelta(d) {
+    const rec = nodes.get(d.key);
+    switch (d.k) {
+      case "appeared": {
+        const li = document.createElement("li");
+        li.dataset.key = d.key;
+        paint(li, d);
+        const r = {key: d.key, node: li, in: d.in, after: d.after};
+        nodes.set(d.key, r);
+        place(r);
+        break;
+      }
+      case "changed": {
+        if (!rec) return;
+        paint(rec.node, d);
+        rec.in = d.in; rec.after = d.after;
+        place(rec);
+        break;
+      }
+      case "moved": {
+        if (!rec) return;
+        rec.in = d.in; rec.after = d.after;
+        place(rec);                   // content untouched: the node is re-anchored, not rebuilt
+        break;
+      }
+      case "gone": {
+        if (!rec) return;
+        rec.node.remove();
+        nodes.delete(d.key);
+        break;
+      }
+    }
+  }
+
+  // `after` is the key of the sibling this node follows, null meaning first child.  That is the
+  // whole of the DOM's positional vocabulary and it is exactly what the server sends.
+  function place(rec) {
+    const parent = container(rec.in);
+    if (!parent) return;
+    if (rec.after == null) {
+      if (rec.node.parentNode !== parent || parent.firstChild !== rec.node) {
+        parent.insertBefore(rec.node, parent.firstChild);
+      }
+    } else {
+      const a = nodes.get(rec.after);
+      if (!a || a.node.parentNode !== parent) {   // the anchor has not arrived, or is itself parked
+        let w = waiting.get(rec.after);
+        if (!w) waiting.set(rec.after, w = []);
+        if (!w.includes(rec)) w.push(rec);
+        if (rec.node.parentNode) rec.node.remove();
+        return;
+      }
+      if (rec.node.parentNode !== parent || rec.node.previousSibling !== a.node) {
+        parent.insertBefore(rec.node, a.node.nextSibling);
+      }
+    }
+    const w = waiting.get(rec.key);               // anything that was waiting on us can go in now
+    if (w) { waiting.delete(rec.key); for (const r of w) place(r); }
+  }
+
+  function paint(li, d) {
+    const cells = d.cells || [];
+    if (d.type === "menu-item") {
+      li.className = cells[2] === "destructive" ? "destructive" : "";
+      li.innerHTML = "";
+      li.append(cell("t", cells[0]));
+      if (cells[1]) li.append(cell("c", cells[1]));
+    } else {
+      li.className = (d.state && d.state.selected) ? "selected " + trend(cells[2]) : trend(cells[2]);
+      li.innerHTML = "";
+      li.append(cell("v", cells[0]), cell("l", cells[1]));
+      // as_of is on every delta because DESIGN.md makes staleness first-class: under a budget a
+      // delta can arrive several passes late, and the consumer is entitled to see it.
+      if (d.as_of) { li.append(cell("stale", "as of " + d.as_of)); }
+    }
+  }
+  function trend(t) { return t === "bad" ? "bad" : t === "warn" ? "warn" : ""; }
+  function cell(cls, text) {
+    const s = document.createElement("span");
+    s.className = cls; s.textContent = text == null ? "" : String(text);
+    return s;
+  }
+
+  // One frame, as it arrived on whatever the link is.  Takes the raw string so the byte count is
+  // the real one; a host that already parsed it can pass the object instead.
+  function apply(data) {
+    let frame = data;
+    if (typeof data === "string") { bytes += data.length; try { frame = JSON.parse(data); } catch (_) { return null; } }
+    frames++;
+    if (!frame || !frame.deltas) return null;
+    // rule 4: snapshot chunks carry a generation, and anything older than the newest is discarded.
+    if (frame.gen < gen) return frame;
+    if (frame.gen > gen) { gen = frame.gen; }
+    for (const d of frame.deltas) { deltas++; applyDelta(d); }
+    onStat(stats());
+    return frame;
+  }
+
+  // A LINK THAT WENT AWAY TAKES THE SERVER'S MEMORY WITH IT.  The server detaches the consumer on
+  // close, so a reconnecting client is a NEW consumer with an empty stream and will be sent a full
+  // snapshot (rule 8: attaching is not a resync).  Holding our old nodes across that would leave
+  // rows on screen that the new stream never mentions and can therefore never remove.
+  function reset() {
+    for (const r of nodes.values()) r.node.remove();
+    nodes.clear(); waiting.clear();
+    rowsEl.innerHTML = ""; if (menuEl) menuEl.innerHTML = "";
+    gen = 0; deltas = 0;
+  }
+
+  function stats() {
+    return {gen, frames, bytes, deltas, nodes: nodes.size, parked: waiting.size, scroll};
+  }
+
+  // ---- gestures: recognized HERE, sent as semantics.  Rule 5's vocabulary is closed and this
+  // file does not extend it — every browser event below lands on tap / hold / two-finger.
+
+  let holdTimer = null, held = null, listeners = null;
+
+  function keyAt(ev) {
+    const li = ev.target.closest ? ev.target.closest("li[data-key]") : null;
+    return li ? li.dataset.key : null;
+  }
+
+  function attachGestures(root) {
+    detachGestures();
+    const onDown = (ev) => {
+      held = keyAt(ev);
+      if (!held) return;
+      // press-hold is a TIMING discrimination and it is timed locally, on purpose: 100-300ms of
+      // jittery link would make a hold read as a tap if the server tried to time it.
+      holdTimer = setTimeout(() => { holdTimer = null; send({t: "gesture", g: "hold", key: held}); },
+                             400);
+    };
+    const onUp = () => {
+      if (holdTimer) {
+        clearTimeout(holdTimer); holdTimer = null;
+        // A release inside the hold window is a tap.  A release AFTER it lands on whatever is under
+        // the finger, which for an open menu is a menu item — that is rule 5's hold-drag-release,
+        // and it needs no verb of its own because menu items are presentations you can tap.
+        if (held) send({t: "gesture", g: "tap", key: held});
+      }
+      held = null;
+    };
+    const onCtx = (ev) => {                                    // right-click is a hold
+      const k = keyAt(ev);
+      if (k) { ev.preventDefault(); send({t: "gesture", g: "hold", key: k}); }
+    };
+    const onWheel = (ev) => {                                  // wheel is the two-finger pan
+      const dy = ev.deltaY > 0 ? 1 : -1;
+      scroll = Math.max(0, scroll + dy);
+      send({t: "gesture", g: "two-finger", dy: dy});
+    };
+    root.addEventListener("pointerdown", onDown);
+    root.addEventListener("pointerup", onUp);
+    root.addEventListener("contextmenu", onCtx);
+    root.addEventListener("wheel", onWheel, {passive: true});
+    listeners = {root, onDown, onUp, onCtx, onWheel};
+  }
+
+  function detachGestures() {
+    if (!listeners) return;
+    const l = listeners; listeners = null;
+    l.root.removeEventListener("pointerdown", l.onDown);
+    l.root.removeEventListener("pointerup", l.onUp);
+    l.root.removeEventListener("contextmenu", l.onCtx);
+    l.root.removeEventListener("wheel", l.onWheel);
+    if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
+    held = null;
+  }
+
+  return {
+    apply, reset, stats, attachGestures, detachGestures,
+    // the viewport report: the consumer-negotiated slice, in ROWS, which is this encoding's axis
+    hello: (rows, sc) => send({t: "viewport", rows: rows || ROWS, scroll: sc == null ? scroll : sc}),
+    // the test harness drives these; a human uses the mouse
+    tap: (k) => send({t: "gesture", g: "tap", key: k}),
+    hold: (k) => send({t: "gesture", g: "hold", key: k}),
+    cmd: (name, key, confirmed) => send({t: "cmd", name, key, confirmed: !!confirmed}),
+    viewport: (rows, sc) => send({t: "viewport", rows, scroll: sc}),
+    keys: () => [...rowsEl.children].map((li) => li.dataset.key),
+    menu: () => (menuEl ? [...menuEl.children].map((li) => li.dataset.key) : []),
+    // the anchor chain as the client believes it, so a test can check the DOM against the WIRE
+    // rather than against the client's own idea of the DOM
+    anchors: () => Object.fromEntries([...nodes].map(([k, r]) => [k, r.after])),
+    parked: () => [...waiting.keys()]
+  };
+}
+if (typeof window !== "undefined") window.makeWarpClient = makeWarpClient;
+    // ==== END warp/dom/client.js ====
+
+    // --- ▤ the device manager: warp, on a third data channel ---------------------------------
+    //
+    // The box keeps a set of enrolled terminals and already administers them over gift-wrapped
+    // DMs (`devices`, `revoke <prefix|all>`, both allowlist-only).  This is that same command set
+    // as a SURFACE, on the connection this page already has — so revoking a terminal is a hold and
+    // a tap instead of composing a DM and waiting for a relay round trip.
+    //
+    // WHAT IT DOES NOT TOUCH.  This block is additive on purpose and the ways it is additive are
+    // load-bearing rather than tidy:
+    //
+    //   * the channel is NEGOTIATED on a fixed stream id, so creating it puts ZERO bytes on the
+    //     wire — there is no DCEP handshake to send.  Nothing is sent until the panel is opened
+    //     for the first time, so a session where nobody taps ▤ is byte-for-byte a session from
+    //     before this existed, at both ends;
+    //   * it does NOT call markAlive().  A warp frame really is proof the box is alive, but the
+    //     link watchdog's budget-clearing is deliberately tied to a CONTROL-channel pong, and a
+    //     second source of liveness would change when a stalled link is noticed.  This panel is
+    //     not allowed to make the watchdog more forgiving;
+    //   * the panel is display:none when shut, so it is out of hit-testing entirely and the
+    //     trackpad, the modifier row and the desktop behave exactly as they did.  Open, it DOES
+    //     take pointer events, because it is a list you tap and hold — that is what ▤ is asking;
+    //   * it never touches the video path, the RFB channel or the quality stepper.
+    //
+    // The client is warp/dom/client.js above, unmodified: the same file the standalone page uses.
+    // A frame is a frame, and a second client kept in step by hand is how the two silently drift.
+    const warpCh = pc.createDataChannel('warp', { ordered: true, negotiated: true, id: 102 });
+    const warpPanel = document.createElement('div');
+    warpPanel.id = 'warpPanel';
+    warpPanel.innerHTML =
+      '<div id="warpHead"><b>enrolled terminals</b><span id="warpStat">—</span></div>' +
+      '<div id="warpBody"><ul id="warpRows"></ul><ul id="warpMenu"></ul></div>' +
+      '<div id="warpNote"></div>';
+    document.body.appendChild(warpPanel);
+    const warpStat = warpPanel.querySelector('#warpStat');
+    const warpNote = warpPanel.querySelector('#warpNote');
+    const warpBody = warpPanel.querySelector('#warpBody');
+
+    // The browser measures its own viewport and says so — the consumer-negotiated slice, in ROWS,
+    // which is this encoding's scroll axis.  A framebuffer cannot do this; a browser knows.
+    const warpFit = () => Math.max(3, Math.floor((warpBody.clientHeight || 360) / 42));
+
+    const warpSend = o => {
+      if (warpCh.readyState !== 'open') { warpNote.textContent = 'channel ' + warpCh.readyState; return; }
+      try { warpCh.send(JSON.stringify(o)); }
+      catch (err) { warpNote.textContent = 'send failed (' + (err.name || err) + ')'; }
+    };
+    const warp = makeWarpClient({
+      rows: warpPanel.querySelector('#warpRows'),
+      menu: warpPanel.querySelector('#warpMenu'),
+      viewportRows: 12,
+      send: warpSend,
+      onStat: s => {
+        warpStat.textContent = s.nodes + (s.nodes === 1 ? ' terminal · ' : ' terminals · ') + s.bytes + ' B';
+        if (s.deltas) warpNote.textContent = '';
+      }
+    });
+    warp.attachGestures(warpPanel);
+    warpCh.addEventListener('message', e => warp.apply(e.data));
+    // A closed channel means the box detached our consumer, and its stream WAS its memory of what
+    // we hold.  Whatever comes back is a fresh snapshot from an empty stream, so keeping the old
+    // nodes would leave rows on screen that the new stream can never mention and therefore never
+    // remove.  Forget them; the reconnect will say what is true.
+    warpCh.addEventListener('close', () => {
+      warp.reset(); warpSpoke = false;
+      warpStat.textContent = '—'; warpNote.textContent = 'channel closed';
+      diag('warp channel CLOSE');
+    });
+
+    let warpOn = false, warpSpoke = false;
+    const warpBtn = mkToggle('▤', 14, 'enrolled terminals');
+    // Above the ≡, not beside the 📋: the right-hand row is five buttons wide already and a sixth
+    // runs off a 375px phone.  It also groups correctly — ≡ and ▤ are both things you go and look
+    // at, and the right-hand row is things you do to the desktop.
+    warpBtn.style.left = '14px'; warpBtn.style.right = 'auto'; warpBtn.style.bottom = '78px';
+    warpBtn.addEventListener('click', () => {
+      warpOn = !warpOn;
+      warpPanel.style.display = warpOn ? 'flex' : 'none';
+      setBtn(warpBtn, warpOn ? 'on' : 'off');
+      if (!warpOn) return;
+      // The FIRST open is what puts the first byte on this channel, which is what tells the box a
+      // warp consumer exists at all — a negotiated channel has no handshake, so the hello IS the
+      // open.  Every later open just re-reports the viewport, which may have changed with rotation.
+      warp.viewport(warpFit(), 0);
+      if (!warpSpoke) {
+        warpSpoke = true;
+        warpNote.textContent = 'asking the box…';
+        diag('warp channel: hello on stream 102');
+        // A box without the warp channel — an older build, or one started without WARP_CHANNEL —
+        // simply never answers.  Say so rather than showing an empty list, which is what "no
+        // terminals are enrolled" looks like and is a different and much more alarming claim.
+        setTimeout(() => {
+          if (warpOn && warp.stats().frames === 0) {
+            warpNote.textContent = 'no answer — this box is not serving the terminal list';
+            diag('warp channel: no answer from the box');
+          }
+        }, 5000);
+      }
+    });
+    window.addEventListener('resize', () => { if (warpOn) warp.viewport(warpFit(), 0); });
+
 
     const XK = { Enter:0xff0d, Backspace:0xff08, Tab:0xff09, Escape:0xff1b,
                  ArrowLeft:0xff51, ArrowUp:0xff52, ArrowRight:0xff53, ArrowDown:0xff54,
