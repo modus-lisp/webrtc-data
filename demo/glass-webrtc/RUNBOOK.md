@@ -124,13 +124,14 @@ exhausts.
 first, then RFC 5764 first-byte demux splits SRTP (128–191) from DTLS (20–63). Every inbound datagram
 stamps a receive time, which powers a 30 s consent timeout.
 
-**Data channels.** Three, of which the third is off by default:
+**Data channels.** Four, of which the last two are off by default:
 
 | channel | stream | negotiation | carries |
 |---|---|---|---|
 | `rfb` | 0 | DCEP | raw RFB, binary. noVNC takes the `RTCDataChannel` as its transport directly |
 | `control` | 100 | `negotiated: true` | flat JSON |
 | `warp` | 102 | `negotiated: true` | warp delta frames — the enrolled-terminal list (§7) |
+| `payload` | 104 | `negotiated: true` | the browser client's own code (§9). Off unless `PAYLOAD_CHANNEL` |
 
 Control messages: `{"kbps":N}` to change rung, `{"get":1}` to poll, `{"request":"keyframe"}` when the
 decoder is stranded. **The box answers every control message with full state**, which the client
@@ -371,3 +372,58 @@ untested remainder is `sctp-send-string` itself, which already carries RFB and t
 17. `GATHER_SRFLX` in the launcher is vestigial, and `link-request-p` is dead code.
 18. The FramebufferUpdateRequest filter is a magic-byte heuristic, and the RFB channel stays live in
     video-primary mode.
+
+---
+
+## 9. The payload channel — the client's own code, over the connection it is the client for
+
+**Off unless `PAYLOAD_CHANNEL` is set, and not deployed at the time of writing.** With it unset no
+file is read, no thread is started, and the startup banner does not mention it. The one branch it
+adds to the session dispatch matches **stream 104 only**, and matches it whether or not the flag is
+set — same argument as warp (§7): disabled means the bytes are answered `none`, not that they fall
+through to the RFB branch and reach glass as input.
+
+**What it is for.** Publishing to nsite **replaces** the manifest, so every client change means a
+new tag, a new URL, and the whole of `DEPLOY.md`. That happened four times in one day, and every one
+of those changes was to code that only matters *after* the connection is up. So the page is split at
+the only line that is forced — can this code arrive over the connection it is used to set up? —
+and the half that can, does.
+
+| | contents | where |
+|---|---|---|
+| **shell** | nostr-tools, the PeerConnection and all four channels, credentials, the progress screen, the pill, the desktop-name display | nsite, ~36 KB over the wire (was 97 KB) |
+| **payload** | noVNC, the trackpad, the modifier row, paste, the quality ladder, the warp panel, the getStats poll | the box, 71 KB gzipped on stream 104 |
+
+**The desktop is visible before the payload arrives.** In `VIDEO_PRIMARY` the picture is VP8/RTP
+into a `<video>`, which is the browser's job end to end; noVNC is only there for input coordinates
+and the RFB handshake. The monolith could not show a frame without it purely because it positioned
+the video from the *canvas's* rect — a layout convenience, not a dependency. The shell letterboxes
+the frame from `videoWidth`/`videoHeight` instead, and hands geometry to the payload when it lands.
+
+**Protocol.** `{"t":"hello","api":1,"have":"<sha256|>","enc":["gzip","raw"]}` up; `same` / `none` /
+`begin` + 16 KB binary chunks down. Ordered stream, so chunks carry no sequence numbers. The sha is
+over the bytes **as sent**, so it is both the integrity check and the cache key. A phone that
+already holds that build is answered `same` and **nothing goes on the wire**.
+
+**Shipping a payload change is `cp`.** The gateway mtime-checks the file, so a new `payload.js`
+needs no restart and no publish — the phone reloads the *same* URL. That is the whole benefit.
+
+**The version contract.** The shell's `api` object is **append-only**; `SHELL_API` increments on
+each addition; the payload exports the lowest `needs` it can run against. A payload needing more is
+refused out loud and the desktop stays view-only. Removing or redefining a member of `api` is the
+only change that forces a new shell onto nsite.
+
+**Where it lives.** `payload-channel.lisp` (the gateway side), `gateway-nostr.lisp` (**40 added
+lines** — a guarded `load`, a `let` binding, one `cond` clause, one close, one banner line),
+`shell.js` / `payload.js` / `index-shell.html` (the client), `mksplit.py` (the build),
+`payload-channel-test.lisp` (40 assertions, starts no gateway).
+
+**Cost when unused.** Zero, and checkable by reading: with the flag unset the file is never read and
+`payload-on-message` returns after one string compare. A phone that never sends on 104 is
+indistinguishable from one that has no such channel, because a negotiated channel has no handshake.
+
+**One trap it had to solve.** glass sends its RFB greeting the moment the box bridges stream 0 —
+which is seconds before noVNC exists in a split client. Unhandled, those bytes are dropped and the
+handshake deadlocks: video plays, the control channel answers, and there is no keyboard, no mouse
+and no desktop name. The shell buffers early RFB messages and the payload replays them into noVNC
+(`takeEarlyRfb`). This was found by the end-to-end test, not by reading.

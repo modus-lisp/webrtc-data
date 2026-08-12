@@ -1,0 +1,1495 @@
+// payload.js — everything that only matters once the connection is up.
+//
+// ===================================================================================================
+// WHAT THIS IS
+// ===================================================================================================
+//
+// The other half of the split described at the top of `shell.js`.  The shell is published to nsite
+// and is meant to stop changing; THIS file is served by the box over data channel 104, so changing
+// it costs a gateway restart and no publish at all.  That is the entire point of the exercise: the
+// four publishes in one day that prompted it were all changes to code in this file.
+//
+// It holds noVNC, the virtual trackpad, the latching modifier row, paste, the quality ladder, the
+// warp panel, the debug overlay and the getStats poll — every one of which is useless before there
+// is a connection, and all of which the user can therefore wait a moment for.
+//
+// ===================================================================================================
+// THE INTERFACE
+// ===================================================================================================
+//
+// `needs` is the lowest shell API this file can run against, and it is the only thing the shell
+// checks before running us.  The rule that makes a single number sufficient is that the shell's
+// `api` object is APPEND-ONLY: a member, once shipped, keeps its name and meaning forever.  So a
+// payload built against API 1 runs on every shell that will ever exist, and raising this number is
+// a decision to require a new shell on nsite — which is exactly the cost the split exists to avoid,
+// and is why it is one obvious line at the top of the file rather than something inferred.
+//
+// WHAT THE PAYLOAD MAY NOT DO, and both of these are properties of when it runs rather than taste:
+//
+//   * IT MAY NOT CREATE A DATA CHANNEL.  Signalling is one-shot and non-trickle and there is no
+//     renegotiation path anywhere in the system, so every channel had to exist before the offer —
+//     which was minutes ago, in the shell.  All four are on `api.chans`.
+//   * IT MAY NOT ASSUME IT IS FIRST.  The desktop has been visible since the first VP8 frame, the
+//     progress overlay may already be gone, and the link watchdog is already armed.  Everything
+//     here therefore ADDS to a running session rather than starting one.
+//
+// The one thing it must TAKE OVER is the video's geometry, and it does that through the single
+// `setGeometryOwner` slot rather than by writing the element: the shell letterboxes the frame into
+// the viewport, which is right until there is a noVNC canvas and a zoom, and wrong the moment there
+// is.  Two writers on that box is the bug the monolith's comments spend forty lines on.
+
+import RFB from './novnc/core/rfb.js';
+
+export const needs = 1;
+
+export async function init(api) {
+  // The shell's members, bound to the names the code below has always used.  This is deliberately a
+  // flat unpacking rather than `api.` everywhere: it keeps the bodies below textually identical to
+  // the monolith they came from, which is what makes them reviewable as a move rather than a
+  // rewrite.
+  const pc       = api.pc;
+  const ch       = api.chans.rfb;
+  const ctrl     = api.chans.ctrl;
+  const warpCh   = api.chans.warp;
+  const diag     = api.ui.diag;
+  const hud      = api.ui.hud;
+  const connEl   = api.ui.connEl;
+  const setStep  = api.ui.setStep;
+  const setDetail = api.ui.setDetail;
+  const vidEl    = api.video.el;
+  const videoPrimary = api.video.primary;
+  const syncVideo = api.video.sync;
+  const tStart   = performance.now() - api.stamp();   // the SHELL's clock, so the log is one timeline
+  const log      = (...a) => console.log('[glass-payload]', ...a);
+
+  // ---- the ICE half of the liveness check ------------------------------------------------------
+  // It lives HERE and not in the shell because it is a getStats reading, and getStats is polled by
+  // pollPath below — but what it produces is the shell's `markAlive`, which is why that is the only
+  // thing it touches.  The shell's own half (the control-channel ping) works with or without us,
+  // which is the property that lets the pill keep telling the truth in a session where the payload
+  // never arrived.
+  //
+  // WHAT IS NOT A LIVENESS SIGNAL, and this was measured rather than assumed:
+  // `candidate-pair.bytesReceived`.  ICE consent freshness (RFC 7675) does keep STUN moving both
+  // ways for the life of the connection — but Chromium counts only DATA packets into bytesReceived.
+  // Against a real ICE-lite answerer (which is what the box is) both bytesReceived and
+  // packetsReceived sat at exactly 0 for the whole life of an idle connection while consent checks
+  // ran every ~2.8 s.  WHAT IS: `responsesReceived` and `totalRoundTripTime`, which advance on every
+  // consent response.  They are SUMMED rather than picked, because which of them a given browser
+  // feeds is not a thing to assume — ANY of them advancing is proof something came back.
+  let rxSig = -1, rxSigSeen = false;
+  const noteRxSig = (pair) => {
+    let sig = 0; const have = [];
+    for (const k of ['bytesReceived', 'packetsReceived', 'requestsReceived', 'responsesReceived']) {
+      const v = pair[k]; if (typeof v === 'number') { sig += v; have.push(k); }
+    }
+    // microseconds: totalRoundTripTime accumulates one sample per consent response
+    if (typeof pair.totalRoundTripTime === 'number') {
+      sig += Math.round(pair.totalRoundTripTime * 1e6); have.push('totalRoundTripTime');
+    }
+    if (!have.length) return;                // nothing usable — the control channel is the whole check
+    if (!rxSigSeen) { rxSigSeen = true; diag('ice liveness counters: ' + have.join(' ')); }
+    if (rxSig < 0) { rxSig = sig; return; }  // first sample is a baseline, not evidence
+    if (sig !== rxSig) { rxSig = sig; api.markAlive('ice'); }
+  };
+
+  // ---- the payload's own stylesheet ------------------------------------------------------------
+  // IT TRAVELS WITH THE CODE IT STYLES, which is the only arrangement that keeps the promise this
+  // split is making.  If the button row's rules lived in the shell on nsite, then adding a button —
+  // the single most likely change to this file — would need a publish after all, and the split
+  // would have bought nothing.  So the shell's stylesheet describes only what the shell draws
+  // (the progress list, the pill, the log), and everything below is injected here.
+  const style = document.createElement('style');
+  style.id = 'payload-css';
+  style.textContent = `
+    /* --- the button row: three states, told apart by SHAPE rather than by shade ---------------
+       A tint is not a state.  Shaded-on against shaded-off is a difference you have to have seen
+       before to read, which is why 🎙 and 🔈 sat there looking switched on while the microphone
+       was off and the sound was muted.  So:
+         ON        green glyph, nothing over it
+         OFF       a dulled glyph AND a diagonal strike across it — the strike is the ONLY thing
+                   that ever draws one, so a strike always means "off, tap me".  Two half-signals
+                   read as clearly as one loud one, and neither of them has to shout.
+         DISABLED  faded well past OFF, desaturated, and pointer-events:none, so it cannot be
+                   mistaken for something worth tapping
+       Anything that is an action rather than a toggle (📋) stays plain: it has no "off". */
+    .gbtn{position:fixed;z-index:20;width:52px;height:52px;border-radius:26px;border:0;padding:0;
+      background:rgba(0,0,0,.6);color:#cdd6df;font-size:22px;line-height:1;
+      touch-action:manipulation;-webkit-tap-highlight-color:transparent;
+      transition:color .12s ease,background .12s ease,opacity .12s ease}
+    .gbtn[data-state="on"]{color:#7CFC9B}
+    /* OFF dulls the glyph as well as striking it.  The glyph lives in its own .gg span for exactly
+       one reason: opacity on the button would drag the strike down with it, and the strike is the
+       one part that has to hold up against whatever the desktop puts behind it. */
+    .gbtn .gg{transition:opacity .12s ease}
+    .gbtn[data-state="off"] .gg{opacity:.72}
+    .gbtn[data-state="disabled"]{color:rgba(255,255,255,.34);background:rgba(0,0,0,.3);
+      opacity:.42;filter:grayscale(1);pointer-events:none}
+    /* the strike is drawn TWICE — a dark stroke under a white one — for the same reason the
+       trackpad cursor is: the desktop shows through these buttons, and a single-colour line
+       disappears against half the things that can be behind it.  It is INSET rather than corner to
+       corner, and thin: it only has to cross the glyph, not underline the whole button. */
+    .gbtn::before,.gbtn::after{content:'';position:absolute;left:50%;top:50%;width:32px;
+      transform:translate(-50%,-50%) rotate(45deg);opacity:0;
+      transition:opacity .12s ease;pointer-events:none}
+    .gbtn::before{height:5px;border-radius:2.5px;background:rgba(0,0,0,.92)}
+    .gbtn::after{height:2px;border-radius:1px;background:#fff}
+    .gbtn[data-state="off"]::before,.gbtn[data-state="off"]::after{opacity:1}
+    /* --- latching modifier keys --------------------------------------------------------------
+       ARMED is outlined: held for the next key, then it lets go by itself.
+       LOCKED is filled AND breathing, because a modifier that quietly stays down is the trap
+       this row exists to avoid — you should be able to see one from across the screen. */
+    #mods{position:fixed;right:14px;bottom:var(--mods-bottom,78px);z-index:20;display:flex;gap:6px;
+      transition:bottom .18s ease}
+    .gmod{min-width:47px;height:38px;border-radius:10px;padding:0 7px;
+      background:rgba(0,0,0,.6);border:1px solid rgba(255,255,255,.16);color:#cdd6df;
+      font:600 13px/1 -apple-system,system-ui,sans-serif;letter-spacing:.02em;
+      touch-action:manipulation;-webkit-tap-highlight-color:transparent;
+      transition:background .12s ease,color .12s ease,border-color .12s ease}
+    .gmod[data-mod="armed"]{color:#7CFC9B;border-color:#7CFC9B;background:rgba(124,252,155,.18)}
+    .gmod[data-mod="locked"]{color:#08130c;border-color:#7CFC9B;background:#7CFC9B;
+      animation:modlock 1.5s ease-in-out infinite}
+    @keyframes modlock{0%,100%{box-shadow:0 0 0 0 rgba(124,252,155,.6)}
+                       50%{box-shadow:0 0 0 5px rgba(124,252,155,0)}}
+    /* --- the warp panel: enrolled terminals, over the third data channel ----------------------
+       DISPLAY:NONE WHEN CLOSED, which is doing real work rather than saving pixels: a hidden
+       element is out of hit-testing entirely, so while the panel is shut the trackpad, the
+       modifier row and the desktop underneath behave exactly as they did before it existed.
+       Open, it DOES take pointer events — unlike the quality panel, which is a row of buttons over
+       a live desktop.  This one is a list you tap and hold, so the taps are its own; that is the
+       trade the ▤ button is asking you to make when you open it.
+       Class names come from warp/dom/client.js and are the same ones its standalone page styles:
+       .v .l .stale on a row, .t .c on a menu item, and selected / warn / bad / destructive. */
+    #warpPanel{position:fixed;left:10px;right:10px;top:52px;bottom:150px;z-index:23;display:none;
+      flex-direction:column;background:rgba(8,10,14,.93);border:1px solid rgba(255,255,255,.12);
+      border-radius:12px;overflow:hidden;
+      font:12px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;color:#dce4ec}
+    #warpHead{display:flex;justify-content:space-between;align-items:baseline;gap:10px;
+      padding:9px 12px;border-bottom:1px solid rgba(255,255,255,.1);color:#8a949c;flex:0 0 auto}
+    #warpHead b{color:#dce4ec;font-weight:600;letter-spacing:.04em}
+    #warpBody{flex:1 1 auto;overflow-y:auto;-webkit-overflow-scrolling:touch;position:relative}
+    #warpRows{list-style:none;margin:0;padding:0}
+    #warpRows li{display:flex;align-items:center;gap:12px;padding:10px 12px;
+      background:#161a20;border-bottom:1px solid #0c0e12;border-left:4px solid #5abe82;
+      touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+    #warpRows li.selected{background:#26303c}
+    #warpRows li.warn{border-left-color:#fabe3c}
+    #warpRows li.bad{border-left-color:#f04646}
+    #warpRows li .v{font-size:14px;min-width:64px}
+    #warpRows li .l{color:#8a949c;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    #warpRows li .stale{margin-left:auto;color:#5a646c;font-size:10px}
+    #warpMenu{list-style:none;margin:0;padding:0;position:absolute;left:12px;right:12px;top:8px;
+      box-shadow:0 10px 30px #000c;border-radius:9px;overflow:hidden}
+    #warpMenu:empty{display:none}
+    #warpMenu li{padding:12px 13px;background:#222c38;border-left:3px solid #dce4ec;
+      border-bottom:1px solid #0c0e12;display:flex;gap:10px;touch-action:manipulation}
+    #warpMenu li.destructive{background:#3a1c1c;border-left-color:#f04646;color:#ffb0b0}
+    #warpMenu li .c{margin-left:auto;color:#8a949c;font-size:10px}
+    #warpNote{padding:8px 12px;color:#8a949c;flex:0 0 auto;
+      border-top:1px solid rgba(255,255,255,.08)}
+`;
+  document.head.appendChild(style);
+
+    // --- two-way audio (G.711/SRTP): level meters + play the box's track ----------------------
+    let audioCtx = null;
+    const ensureCtx = () => (audioCtx ||= new (window.AudioContext || window.webkitAudioContext)());
+    const mkMeter = (label, color) => {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:7px;font:11px ui-monospace,monospace;color:#cdd6df';
+      const lab = document.createElement('span'); lab.textContent = label; lab.style.cssText = 'width:26px';
+      const bar = document.createElement('div'); bar.style.cssText = 'flex:1;height:8px;border-radius:4px;background:rgba(255,255,255,.14);overflow:hidden';
+      const fill = document.createElement('div'); fill.style.cssText = `height:100%;width:0%;background:${color};transition:width .05s linear`;
+      bar.appendChild(fill); row.append(lab, bar);
+      return { row, set: p => { fill.style.width = Math.max(0, Math.min(100, p * 140)) + '%'; } };
+    };
+    const audioPanel = document.createElement('div');
+    // bottom:140 rather than 78 — the modifier row now occupies the strip directly above the
+    // button row, and on a portrait phone a left panel 190px wide reaches into it
+    audioPanel.style.cssText = 'position:fixed;left:14px;bottom:140px;z-index:22;width:190px;display:none;' +
+      'flex-direction:column;gap:6px;background:rgba(0,0,0,.55);padding:9px 11px;border-radius:11px';
+    const txM = mkMeter('mic', '#7CFC9B'), rxM = mkMeter('box', '#8fbaff');
+    audioPanel.append(txM.row, rxM.row); document.body.appendChild(audioPanel);
+    const showAudio = () => { audioPanel.style.display = 'flex'; };
+    const meterStream = (stream, setter) => {
+      const ctx = ensureCtx(); const an = ctx.createAnalyser(); an.fftSize = 256;
+      ctx.createMediaStreamSource(stream).connect(an);
+      const buf = new Uint8Array(an.fftSize);
+      const tick = () => { an.getByteTimeDomainData(buf);
+        let s = 0; for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; s += v * v; }
+        setter(Math.sqrt(s / buf.length)); requestAnimationFrame(tick); };
+      tick();
+    };
+
+
+    // ---- noVNC, and the RFB session --------------------------------------------------------
+    // The channel was created by the SHELL, before the offer — see its note on ordering.  All the
+    // payload does is hand it to noVNC, which rides an RTCDataChannel as its transport directly.
+
+    const rfb = new RFB(document.getElementById('screen'), ch, {});
+    rfb.scaleViewport = true;
+    rfb.focusOnClick = true;
+    rfb.showDotCursor = true;      // desktop: draw a dot when the remote cursor is empty, so a
+                                   // mouse user is never left with no pointer at all
+    rfb.addEventListener('connect', () => { log('RFB connected'); rfb.focus(); });
+    rfb.addEventListener('disconnect', e => log('RFB disconnect', e.detail));
+
+    // ---- REPLAY WHAT ARRIVED BEFORE WE EXISTED -------------------------------------------------
+    // glass sends its RFB protocol-version greeting the instant the box bridges this channel, which
+    // is seconds before this line runs.  The shell holds those bytes for us; without this the
+    // handshake deadlocks and the session looks perfectly healthy while having no input at all.
+    // See the note at RFB-EARLY in shell.js.
+    //
+    // Dispatched as real MessageEvents ON THE CHANNEL rather than pushed into noVNC's internals,
+    // because noVNC's transport contract is "an RTCDataChannel that emits message events" and that
+    // is the only part of it this file is entitled to know about.  Synchronously and in order: the
+    // handshake is a state machine, and a greeting that arrives after the version reply is worse
+    // than one that never arrives at all.
+    for (const data of api.takeEarlyRfb())
+      ch.dispatchEvent(new MessageEvent('message', { data }));
+
+    // --- mobile soft keyboard: iOS only shows it (and delivers keys) for a focused editable
+    // element, and only after a user gesture.  A ⌨ button focuses a hidden input; we translate
+    // its beforeinput/keydown into RFB key events (the canvas noVNC listens on can't do this).
+    const kbin = document.createElement('input');
+    kbin.setAttribute('autocapitalize', 'off'); kbin.setAttribute('autocorrect', 'off');
+    kbin.setAttribute('autocomplete', 'off');   kbin.setAttribute('spellcheck', 'false');
+    kbin.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;border:0;padding:0;';
+    document.body.appendChild(kbin);
+    // Every button in the bottom row is built the same way and wears the same three states —
+    // see the .gbtn rules in <style>.  SETBTN is the only thing that writes one, so "what state
+    // is this in" and "what does it look like" cannot drift apart.
+    //   'on'       green
+    //   'off'      dulled and struck through — available, currently not doing its thing
+    //   'idle'     plain — for the buttons that are ACTIONS and have no off (📋)
+    //   'disabled' faded and untouchable — the session cannot carry it right now
+    // the glyph goes in its own span so 'off' can dull the glyph without dulling the strike over it
+    const gGlyph = glyph => {
+      const s = document.createElement('span'); s.className = 'gg'; s.textContent = glyph; return s;
+    };
+    const mkToggle = (glyph, right, label) => {
+      const b = document.createElement('button');
+      b.appendChild(gGlyph(glyph));
+      b.className = 'gbtn';
+      b.dataset.state = 'off';
+      if (label) b.setAttribute('aria-label', label);
+      b.style.bottom = '14px'; b.style.right = right + 'px';
+      document.body.appendChild(b);
+      return b;
+    };
+    const setBtn = (b, state) => { b.dataset.state = state; b.disabled = state === 'disabled'; };
+    const isOn = b => b.dataset.state === 'on';
+    const kbBtn = mkToggle('⌨', 14, 'keyboard');
+    kbBtn.addEventListener('click', () => kbin.focus());
+    // the ⌨ is on exactly while the hidden field holds focus, which is exactly while the soft
+    // keyboard is up — so the strike is the honest answer to "will typing go anywhere?"
+    kbin.addEventListener('focus', () => setBtn(kbBtn, 'on'));
+    kbin.addEventListener('blur', () => setBtn(kbBtn, 'off'));
+    // --- mic / speaker toggles, both MUTED on load — and now they SAY so ----------------------
+    const micBtn = mkToggle('🎙', 74, 'microphone'), spkBtn = mkToggle('🔈', 134, 'desktop sound');
+    // No getUserMedia at all (an insecure origin, an old WebView) is a genuine "you can't",
+    // which is a different thing from "off", and used to look identical to it.
+    if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) setBtn(micBtn, 'disabled');
+    micBtn.addEventListener('click', async () => {
+      const on = isOn(micBtn);
+      if (on) {                                              // -> mute: drop the track entirely
+        if (window.__micStream) { window.__micStream.getTracks().forEach(t => t.stop()); window.__micStream = null; }
+        if (window.__micSender) { try { await window.__micSender.replaceTrack(null); } catch (_) {} }
+        setBtn(micBtn, 'off'); diag('mic muted');
+      } else {                                               // -> unmute: NOW ask for permission
+        try {
+          const ms = await navigator.mediaDevices.getUserMedia(
+            { audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+          window.__micStream = ms;
+          if (window.__micSender) await window.__micSender.replaceTrack(ms.getAudioTracks()[0]);
+          setBtn(micBtn, 'on'); showAudio(); meterStream(ms, txM.set); diag('mic live');
+        } catch (err) { diag('mic denied (' + (err.name || err) + ')'); }
+      }
+    });
+    spkBtn.addEventListener('click', () => {
+      const on = isOn(spkBtn);
+      const au = window.__boxAudio;
+      if (on) { if (au) au.muted = true; setBtn(spkBtn, 'off'); diag('speaker muted'); }
+      else {
+        // Nothing has arrived to unmute yet: say so rather than lighting the button green over
+        // silence.  The button stays struck through, which is the truth.
+        if (!au) { diag('speaker: no audio from the box yet'); return; }
+        au.muted = false; const p = au.play && au.play(); if (p && p.catch) p.catch(() => {});
+        setBtn(spkBtn, 'on'); showAudio();
+        if (window.__boxStream && !window.__rxMetered) { window.__rxMetered = true; meterStream(window.__boxStream, rxM.set); }
+        diag('speaker on');
+      }
+    });
+
+    // --- video bandwidth: a seven-rung ladder in kbps, moved on the running encoder -----------
+    // The box changes its encoder's knobs mid-stream, so a tap costs nothing: same session, same
+    // RTP stream, no reconnect.  The panel shows the video's OWN KB/s and fps beside the ladder,
+    // because that is the number a rung actually moves — and it is the only honest check that the
+    // box did what the tap asked for.
+    //
+    // RUNGS ARE KILOBITS/S, which is how a constrained link is described; the box works in
+    // kiloBYTES/s internally and answers with both, so the detail line can show what the rate
+    // turned into.  Seven across would be 30px a button, so they are laid out FOUR THEN THREE —
+    // still one tap to any rung, which a stepper would not be.
+    //
+    // It must not eat gestures.  The touch layer listens on #screen, so anything parented to
+    // <body> is already out of its way; on top of that the panel itself is pointer-events:none and
+    // only the buttons take input, so a two-finger scroll or a hold that begins on the panel's
+    // background still reaches the desktop underneath.
+    let QRUNGS = [5, 10, 20, 40, 80, 160, 320];
+    let qCurrent = null, qPending = null;
+    const qPanel = document.createElement('div');
+    qPanel.style.cssText = 'position:fixed;left:14px;bottom:210px;z-index:22;width:232px;display:none;' +
+      'flex-direction:column;gap:6px;background:rgba(0,0,0,.55);padding:9px 11px;border-radius:11px;' +
+      'font:11px ui-monospace,monospace;color:#cdd6df;pointer-events:none';
+    const qHead = document.createElement('div');
+    qHead.style.cssText = 'display:flex;justify-content:space-between;align-items:baseline;gap:8px';
+    const qTitle = document.createElement('span'); qTitle.textContent = 'video kbps';
+    const qRate = document.createElement('span');
+    qRate.style.cssText = 'color:#7CFC9B;font-variant-numeric:tabular-nums';
+    qRate.textContent = '– KB/s · – fps';
+    qHead.append(qTitle, qRate);
+    const qGrid = document.createElement('div');
+    qGrid.style.cssText = 'display:flex;flex-direction:column;gap:4px';
+    const qNote = document.createElement('div'); qNote.style.cssText = 'color:#8a949c;min-height:2.6em';
+    const qBtns = new Map();
+    const paintQ = () => {
+      for (const [kbps, b] of qBtns) {
+        const on = kbps === qCurrent, wait = kbps === qPending;
+        b.style.color = on ? '#7CFC9B' : (wait ? '#cdd6df' : '#8a949c');
+        b.style.background = on ? 'rgba(124,252,155,.16)' : 'rgba(255,255,255,.06)';
+        b.style.borderColor = on ? '#7CFC9B' : (wait ? 'rgba(255,255,255,.45)' : 'rgba(255,255,255,.18)');
+      }
+    };
+    const sendRung = kbps => {
+      if (ctrl.readyState !== 'open') { qNote.textContent = 'control channel ' + ctrl.readyState; return; }
+      qPending = kbps; paintQ(); qNote.textContent = 'moving to ' + kbps + ' kbps…';
+      ctrl.send(JSON.stringify({ kbps }));
+      diag('rung -> ' + kbps + ' kbps');
+    };
+    // Rebuilt from whatever ladder the box reports, so adding a rung on the box needs no new build
+    // of this page — the row split follows the count rather than assuming seven.
+    const buildRungs = () => {
+      qGrid.textContent = ''; qBtns.clear();
+      const perRow = Math.ceil(QRUNGS.length / 2);
+      for (let i = 0; i < QRUNGS.length; i += perRow) {
+        const row = document.createElement('div'); row.style.cssText = 'display:flex;gap:4px';
+        for (const kbps of QRUNGS.slice(i, i + perRow)) {
+          const b = document.createElement('button');
+          b.textContent = kbps;
+          // pointer-events:auto only on the button itself; touch-action stops the browser waiting
+          // to see whether the tap was the start of a zoom
+          b.style.cssText = 'pointer-events:auto;touch-action:manipulation;flex:1;padding:7px 2px;' +
+            'border-radius:7px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);' +
+            'color:#8a949c;font:11px ui-monospace,monospace';
+          b.addEventListener('click', e => { e.stopPropagation(); sendRung(kbps); });
+          qBtns.set(kbps, b); row.appendChild(b);
+        }
+        qGrid.appendChild(row);
+      }
+      paintQ();
+    };
+    buildRungs();
+    qPanel.append(qHead, qGrid, qNote); document.body.appendChild(qPanel);
+    // the box answers every message with the state it is ACTUALLY in, so the highlight follows the
+    // encoder rather than the tap
+    // COMING BACK FROM THE BACKGROUND is the SHELL's, and deliberately so.  It has to be: an iOS
+    // tab can be suspended before the payload has ever arrived, and a resume handler that only
+    // exists once the payload has loaded would miss exactly the case it is for.  The shell does the
+    // play(), the keyframe request and the probe; what is left for the payload is the one thing the
+    // shell cannot know about — that a rate measured before a nap is not a rate.  See the
+    // onResumeHooks registration at the bottom of this file.
+
+    let lastRungLine = '';
+    ctrl.addEventListener('message', e => {
+      // ANY message here is the pong to checkLink()'s '{"get":1}' — the box answers every control
+      // message with its state, so this doubles as the application-level proof of life.
+      api.markAlive('control');
+      let m = null; try { m = JSON.parse(e.data); } catch (_) { return; }
+      if (!m || m.kbps == null) return;
+      if (Array.isArray(m.rungs) && m.rungs.join() !== QRUNGS.join()) { QRUNGS = m.rungs; buildRungs(); }
+      qCurrent = m.kbps; qPending = null; paintQ();
+      // The derived settings, because on this ladder they are the whole story: the keyframe
+      // quantizer sets how long the FIRST picture takes, and the resync interval is what used to
+      // saturate the link.  Two lines so the note does not reflow the panel as rungs change.
+      qNote.innerHTML =
+        `${m.target_kbs} KB/s · frame ≤${m.max_frame_kb} KB · settle ${m.cleanup_ms} ms<br>` +
+        `qi ${m.qi}/${m.max_qi} · key qi ${m.key_qi} · resync ${m.key_secs} s`;
+      // ONLY WHEN IT CHANGED.  The liveness ping asks for this state every 10 s and the box always
+      // answers, so logging it unconditionally would bury the log under identical lines — the same
+      // reason the ♥ heartbeat above prints only on a change.  Every informative line survives.
+      const rungLine = `rung = ${m.kbps} kbps (${m.target_kbs} KB/s, key qi ${m.key_qi}, resync ${m.key_secs}s)`;
+      if (rungLine !== lastRungLine) { lastRungLine = rungLine; diag(rungLine); }
+    });
+    ctrl.addEventListener('open', () => { diag('control channel OPEN'); setBtn(qBtn, qOn ? 'on' : 'off');
+                                          ctrl.send('{"get":1}'); });
+    // The ladder is the box's to move, so with the control channel shut there is nothing this
+    // button can do — faded, not struck, because the difference matters.
+    ctrl.addEventListener('close', () => { diag('control channel CLOSE');
+      qOn = false; qPanel.style.display = 'none'; setBtn(qBtn, 'disabled'); });
+    // ◈ toggles the panel, like ≡ toggles the debug overlay
+    const qBtn = mkToggle('◈', 194, 'video quality');
+    setBtn(qBtn, 'disabled');                       // until the control channel is actually open
+    let qOn = false;
+    qBtn.addEventListener('click', () => {
+      qOn = !qOn; qPanel.style.display = qOn ? 'flex' : 'none'; setBtn(qBtn, qOn ? 'on' : 'off');
+      if (qOn && ctrl.readyState === 'open') ctrl.send('{"get":1}');
+    });
+
+    // ==== BEGIN warp/dom/client.js — VERBATIM, checked by warp/t/client-sync.py ====
+// warp/dom/client.js — the DOM encoding's client.  ONE copy, two hosts, no transport.
+//
+// This file is loaded verbatim by two pages that have nothing else in common:
+//
+//   warp/dom/client.html                                a standalone page over a WebSocket
+//   webrtc-data/demo/glass-webrtc/index-nostr.html      a panel over a WebRTC data channel
+//
+// and it is the same file in both because the client's job does not vary with the link.  A frame
+// is a frame; MAKE-WARP-CLIENT takes a SEND and hands back an APPLY, which is the browser half of
+// the same statement the server half makes by taking a SEND function and nothing else.
+//
+// It is deliberately small, and the smallness is the argument.  The client holds a Map from key to
+// node and does four things with a delta: create, replace content, re-anchor, remove.  It does not
+// diff, does not reconcile, does not keep a shadow tree and does not know what a projection is —
+// all of that happened on the server, which is what "the stream carries state, not events" buys.
+//
+// It also does not decide anything about safety.  The menu it draws is whatever the server sent
+// it; it cannot invent a command, and if it tried, the server would refuse it at invocation
+// (DESIGN.md rule 6).
+//
+// THE HOST OWNS THE ELEMENTS AND THE STYLESHEET.  This file writes exactly these class names and
+// nothing else, so a page can look however it likes without touching the logic:
+//
+//   on a row       selected | warn | bad     and cells .v (value) .l (label) .stale (as-of)
+//   on a menu item destructive              and cells .t (label)  .c (cost class)
+//
+// GESTURES ARE SCOPED TO A ROOT ELEMENT, which is the one thing the standalone page did not need
+// and the panel absolutely does: a listener on `document` inside a remote-desktop client would eat
+// the pointer events the trackpad lives on.  ATTACHGESTURES(root) listens on root only.
+
+"use strict";
+function makeWarpClient(opts) {
+  const rowsEl = opts.rows;
+  const menuEl = opts.menu;
+  const send   = opts.send;                 // (object) -> void.  The whole of the transport.
+  const onStat = opts.onStat || function () {};
+  const ROWS   = opts.viewportRows || 14;   // what this viewport can show; reported to the server
+
+  // key -> {key, node, in, after}.  This is the client's ENTIRE model.  The server holds the
+  // memory of what we have been told; we hold the nodes it named and the anchor each one was given.
+  const nodes = new Map();
+
+  // Anchor key -> the records waiting for it.  THIS IS NOT DEFENSIVE PADDING, it is load-bearing,
+  // and it is the one thing an anchor-based encoding needs that a rectangle-based one does not.
+  //
+  // A rectangle is absolute: deltas carrying rectangles can be applied in any order at all.  An
+  // anchor is RELATIVE, so "insert X after Y" is unappliable until Y exists — and two independent
+  // things make that happen:
+  //
+  //   * the reconciler emits within a priority band in reverse layout order, so a pass that
+  //     appends two rows sends `r05 after r04` before it sends `r04`;
+  //   * and even in layout order, the BUDGET can defer the anchor to a later pass entirely, which
+  //     no ordering rule on the server could fix.
+  //
+  // So a node whose place we do not know yet is held OUT of the document rather than dropped into
+  // a place we invented, and it is inserted the moment its anchor lands.  Guessing would put a row
+  // in the wrong place and leave it there, which is exactly the silent-wrong-order failure this
+  // encoding's positions exist to prevent.
+  const waiting = new Map();
+  let gen = 0, frames = 0, bytes = 0, deltas = 0;
+  let scroll = 0;
+
+  function container(name) {
+    return name === "rows" ? rowsEl : menuEl;
+  }
+
+  // The four kinds, and nothing else.  Note what is NOT here: no re-render, no keyed list diff, no
+  // virtual DOM.  A :moved does not touch the node's content, which is the entire point of rule 2.
+  function applyDelta(d) {
+    const rec = nodes.get(d.key);
+    switch (d.k) {
+      case "appeared": {
+        const li = document.createElement("li");
+        li.dataset.key = d.key;
+        paint(li, d);
+        const r = {key: d.key, node: li, in: d.in, after: d.after};
+        nodes.set(d.key, r);
+        place(r);
+        break;
+      }
+      case "changed": {
+        if (!rec) return;
+        paint(rec.node, d);
+        rec.in = d.in; rec.after = d.after;
+        place(rec);
+        break;
+      }
+      case "moved": {
+        if (!rec) return;
+        rec.in = d.in; rec.after = d.after;
+        place(rec);                   // content untouched: the node is re-anchored, not rebuilt
+        break;
+      }
+      case "gone": {
+        if (!rec) return;
+        rec.node.remove();
+        nodes.delete(d.key);
+        break;
+      }
+    }
+  }
+
+  // `after` is the key of the sibling this node follows, null meaning first child.  That is the
+  // whole of the DOM's positional vocabulary and it is exactly what the server sends.
+  function place(rec) {
+    const parent = container(rec.in);
+    if (!parent) return;
+    if (rec.after == null) {
+      if (rec.node.parentNode !== parent || parent.firstChild !== rec.node) {
+        parent.insertBefore(rec.node, parent.firstChild);
+      }
+    } else {
+      const a = nodes.get(rec.after);
+      if (!a || a.node.parentNode !== parent) {   // the anchor has not arrived, or is itself parked
+        let w = waiting.get(rec.after);
+        if (!w) waiting.set(rec.after, w = []);
+        if (!w.includes(rec)) w.push(rec);
+        if (rec.node.parentNode) rec.node.remove();
+        return;
+      }
+      if (rec.node.parentNode !== parent || rec.node.previousSibling !== a.node) {
+        parent.insertBefore(rec.node, a.node.nextSibling);
+      }
+    }
+    const w = waiting.get(rec.key);               // anything that was waiting on us can go in now
+    if (w) { waiting.delete(rec.key); for (const r of w) place(r); }
+  }
+
+  function paint(li, d) {
+    const cells = d.cells || [];
+    if (d.type === "menu-item") {
+      li.className = cells[2] === "destructive" ? "destructive" : "";
+      li.innerHTML = "";
+      li.append(cell("t", cells[0]));
+      if (cells[1]) li.append(cell("c", cells[1]));
+    } else {
+      li.className = (d.state && d.state.selected) ? "selected " + trend(cells[2]) : trend(cells[2]);
+      li.innerHTML = "";
+      li.append(cell("v", cells[0]), cell("l", cells[1]));
+      // as_of is on every delta because DESIGN.md makes staleness first-class: under a budget a
+      // delta can arrive several passes late, and the consumer is entitled to see it.
+      if (d.as_of) { li.append(cell("stale", "as of " + d.as_of)); }
+    }
+  }
+  function trend(t) { return t === "bad" ? "bad" : t === "warn" ? "warn" : ""; }
+  function cell(cls, text) {
+    const s = document.createElement("span");
+    s.className = cls; s.textContent = text == null ? "" : String(text);
+    return s;
+  }
+
+  // One frame, as it arrived on whatever the link is.  Takes the raw string so the byte count is
+  // the real one; a host that already parsed it can pass the object instead.
+  function apply(data) {
+    let frame = data;
+    if (typeof data === "string") { bytes += data.length; try { frame = JSON.parse(data); } catch (_) { return null; } }
+    frames++;
+    if (!frame || !frame.deltas) return null;
+    // rule 4: snapshot chunks carry a generation, and anything older than the newest is discarded.
+    if (frame.gen < gen) return frame;
+    if (frame.gen > gen) { gen = frame.gen; }
+    for (const d of frame.deltas) { deltas++; applyDelta(d); }
+    onStat(stats());
+    return frame;
+  }
+
+  // A LINK THAT WENT AWAY TAKES THE SERVER'S MEMORY WITH IT.  The server detaches the consumer on
+  // close, so a reconnecting client is a NEW consumer with an empty stream and will be sent a full
+  // snapshot (rule 8: attaching is not a resync).  Holding our old nodes across that would leave
+  // rows on screen that the new stream never mentions and can therefore never remove.
+  function reset() {
+    for (const r of nodes.values()) r.node.remove();
+    nodes.clear(); waiting.clear();
+    rowsEl.innerHTML = ""; if (menuEl) menuEl.innerHTML = "";
+    gen = 0; deltas = 0;
+  }
+
+  function stats() {
+    return {gen, frames, bytes, deltas, nodes: nodes.size, parked: waiting.size, scroll};
+  }
+
+  // ---- gestures: recognized HERE, sent as semantics.  Rule 5's vocabulary is closed and this
+  // file does not extend it — every browser event below lands on tap / hold / two-finger.
+
+  let holdTimer = null, held = null, listeners = null;
+
+  function keyAt(ev) {
+    const li = ev.target.closest ? ev.target.closest("li[data-key]") : null;
+    return li ? li.dataset.key : null;
+  }
+
+  function attachGestures(root) {
+    detachGestures();
+    const onDown = (ev) => {
+      held = keyAt(ev);
+      if (!held) return;
+      // press-hold is a TIMING discrimination and it is timed locally, on purpose: 100-300ms of
+      // jittery link would make a hold read as a tap if the server tried to time it.
+      holdTimer = setTimeout(() => { holdTimer = null; send({t: "gesture", g: "hold", key: held}); },
+                             400);
+    };
+    const onUp = () => {
+      if (holdTimer) {
+        clearTimeout(holdTimer); holdTimer = null;
+        // A release inside the hold window is a tap.  A release AFTER it lands on whatever is under
+        // the finger, which for an open menu is a menu item — that is rule 5's hold-drag-release,
+        // and it needs no verb of its own because menu items are presentations you can tap.
+        if (held) send({t: "gesture", g: "tap", key: held});
+      }
+      held = null;
+    };
+    const onCtx = (ev) => {                                    // right-click is a hold
+      const k = keyAt(ev);
+      if (k) { ev.preventDefault(); send({t: "gesture", g: "hold", key: k}); }
+    };
+    const onWheel = (ev) => {                                  // wheel is the two-finger pan
+      const dy = ev.deltaY > 0 ? 1 : -1;
+      scroll = Math.max(0, scroll + dy);
+      send({t: "gesture", g: "two-finger", dy: dy});
+    };
+    root.addEventListener("pointerdown", onDown);
+    root.addEventListener("pointerup", onUp);
+    root.addEventListener("contextmenu", onCtx);
+    root.addEventListener("wheel", onWheel, {passive: true});
+    listeners = {root, onDown, onUp, onCtx, onWheel};
+  }
+
+  function detachGestures() {
+    if (!listeners) return;
+    const l = listeners; listeners = null;
+    l.root.removeEventListener("pointerdown", l.onDown);
+    l.root.removeEventListener("pointerup", l.onUp);
+    l.root.removeEventListener("contextmenu", l.onCtx);
+    l.root.removeEventListener("wheel", l.onWheel);
+    if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
+    held = null;
+  }
+
+  return {
+    apply, reset, stats, attachGestures, detachGestures,
+    // the viewport report: the consumer-negotiated slice, in ROWS, which is this encoding's axis
+    hello: (rows, sc) => send({t: "viewport", rows: rows || ROWS, scroll: sc == null ? scroll : sc}),
+    // the test harness drives these; a human uses the mouse
+    tap: (k) => send({t: "gesture", g: "tap", key: k}),
+    hold: (k) => send({t: "gesture", g: "hold", key: k}),
+    cmd: (name, key, confirmed) => send({t: "cmd", name, key, confirmed: !!confirmed}),
+    viewport: (rows, sc) => send({t: "viewport", rows, scroll: sc}),
+    keys: () => [...rowsEl.children].map((li) => li.dataset.key),
+    menu: () => (menuEl ? [...menuEl.children].map((li) => li.dataset.key) : []),
+    // the anchor chain as the client believes it, so a test can check the DOM against the WIRE
+    // rather than against the client's own idea of the DOM
+    anchors: () => Object.fromEntries([...nodes].map(([k, r]) => [k, r.after])),
+    parked: () => [...waiting.keys()]
+  };
+}
+if (typeof window !== "undefined") window.makeWarpClient = makeWarpClient;
+    // ==== END warp/dom/client.js ====
+
+    // --- ▤ the device manager: warp, on a third data channel ---------------------------------
+    //
+    // The box keeps a set of enrolled terminals and already administers them over gift-wrapped
+    // DMs (`devices`, `revoke <prefix|all>`, both allowlist-only).  This is that same command set
+    // as a SURFACE, on the connection this page already has — so revoking a terminal is a hold and
+    // a tap instead of composing a DM and waiting for a relay round trip.
+    //
+    // WHAT IT DOES NOT TOUCH.  This block is additive on purpose and the ways it is additive are
+    // load-bearing rather than tidy:
+    //
+    //   * the channel is NEGOTIATED on a fixed stream id, so creating it puts ZERO bytes on the
+    //     wire — there is no DCEP handshake to send.  Nothing is sent until the panel is opened
+    //     for the first time, so a session where nobody taps ▤ is byte-for-byte a session from
+    //     before this existed, at both ends;
+    //   * it does NOT call api.markAlive().  A warp frame really is proof the box is alive, but the
+    //     link watchdog's budget-clearing is deliberately tied to a CONTROL-channel pong, and a
+    //     second source of liveness would change when a stalled link is noticed.  This panel is
+    //     not allowed to make the watchdog more forgiving;
+    //   * the panel is display:none when shut, so it is out of hit-testing entirely and the
+    //     trackpad, the modifier row and the desktop behave exactly as they did.  Open, it DOES
+    //     take pointer events, because it is a list you tap and hold — that is what ▤ is asking;
+    //   * it never touches the video path, the RFB channel or the quality stepper.
+    //
+    // The client is warp/dom/client.js above, unmodified: the same file the standalone page uses.
+    // A frame is a frame, and a second client kept in step by hand is how the two silently drift.
+    // THE CHANNEL IS THE SHELL'S — created before the offer, like all four of them, because a
+    // channel that does not exist by `createOffer` can never exist at all.  Everything else about
+    // this panel is unchanged: it still puts zero bytes on the wire until somebody taps ▤.
+    const warpPanel = document.createElement('div');
+    warpPanel.id = 'warpPanel';
+    warpPanel.innerHTML =
+      '<div id="warpHead"><b>enrolled terminals</b><span id="warpStat">—</span></div>' +
+      '<div id="warpBody"><ul id="warpRows"></ul><ul id="warpMenu"></ul></div>' +
+      '<div id="warpNote"></div>';
+    document.body.appendChild(warpPanel);
+    const warpStat = warpPanel.querySelector('#warpStat');
+    const warpNote = warpPanel.querySelector('#warpNote');
+    const warpBody = warpPanel.querySelector('#warpBody');
+
+    // The browser measures its own viewport and says so — the consumer-negotiated slice, in ROWS,
+    // which is this encoding's scroll axis.  A framebuffer cannot do this; a browser knows.
+    const warpFit = () => Math.max(3, Math.floor((warpBody.clientHeight || 360) / 42));
+
+    const warpSend = o => {
+      if (warpCh.readyState !== 'open') { warpNote.textContent = 'channel ' + warpCh.readyState; return; }
+      try { warpCh.send(JSON.stringify(o)); }
+      catch (err) { warpNote.textContent = 'send failed (' + (err.name || err) + ')'; }
+    };
+    const warp = makeWarpClient({
+      rows: warpPanel.querySelector('#warpRows'),
+      menu: warpPanel.querySelector('#warpMenu'),
+      viewportRows: 12,
+      send: warpSend,
+      onStat: s => {
+        warpStat.textContent = s.nodes + (s.nodes === 1 ? ' terminal · ' : ' terminals · ') + s.bytes + ' B';
+        if (s.deltas) warpNote.textContent = '';
+      }
+    });
+    warp.attachGestures(warpPanel);
+    warpCh.addEventListener('message', e => warp.apply(e.data));
+    // A closed channel means the box detached our consumer, and its stream WAS its memory of what
+    // we hold.  Whatever comes back is a fresh snapshot from an empty stream, so keeping the old
+    // nodes would leave rows on screen that the new stream can never mention and therefore never
+    // remove.  Forget them; the reconnect will say what is true.
+    warpCh.addEventListener('close', () => {
+      warp.reset(); warpSpoke = false;
+      warpStat.textContent = '—'; warpNote.textContent = 'channel closed';
+      diag('warp channel CLOSE');
+    });
+
+    let warpOn = false, warpSpoke = false;
+    const warpBtn = mkToggle('▤', 14, 'enrolled terminals');
+    // Above the ≡, not beside the 📋: the right-hand row is five buttons wide already and a sixth
+    // runs off a 375px phone.  It also groups correctly — ≡ and ▤ are both things you go and look
+    // at, and the right-hand row is things you do to the desktop.
+    warpBtn.style.left = '14px'; warpBtn.style.right = 'auto'; warpBtn.style.bottom = '78px';
+    warpBtn.addEventListener('click', () => {
+      warpOn = !warpOn;
+      warpPanel.style.display = warpOn ? 'flex' : 'none';
+      setBtn(warpBtn, warpOn ? 'on' : 'off');
+      if (!warpOn) return;
+      // The FIRST open is what puts the first byte on this channel, which is what tells the box a
+      // warp consumer exists at all — a negotiated channel has no handshake, so the hello IS the
+      // open.  Every later open just re-reports the viewport, which may have changed with rotation.
+      warp.viewport(warpFit(), 0);
+      if (!warpSpoke) {
+        warpSpoke = true;
+        warpNote.textContent = 'asking the box…';
+        diag('warp channel: hello on stream 102');
+        // A box without the warp channel — an older build, or one started without WARP_CHANNEL —
+        // simply never answers.  Say so rather than showing an empty list, which is what "no
+        // terminals are enrolled" looks like and is a different and much more alarming claim.
+        setTimeout(() => {
+          if (warpOn && warp.stats().frames === 0) {
+            warpNote.textContent = 'no answer — this box is not serving the terminal list';
+            diag('warp channel: no answer from the box');
+          }
+        }, 5000);
+      }
+    });
+    window.addEventListener('resize', () => { if (warpOn) warp.viewport(warpFit(), 0); });
+
+    const XK = { Enter:0xff0d, Backspace:0xff08, Tab:0xff09, Escape:0xff1b,
+                 ArrowLeft:0xff51, ArrowUp:0xff52, ArrowRight:0xff53, ArrowDown:0xff54,
+                 Shift:0xffe1, Insert:0xff63,
+                 // the latching modifiers.  Meta is Super_L (0xffeb) rather than Meta_L (0xffe7):
+                 // Super is what a Linux desktop actually binds, and what a ⌘ on a phone means.
+                 Control:0xffe3, Alt:0xffe9, Meta:0xffeb };
+    const tap = (keysym, code) => { rfb.sendKey(keysym, code, true); rfb.sendKey(keysym, code, false); };
+    const sendChar = ch => { const cp = ch.codePointAt(0); tap(cp < 0x100 ? cp : 0x01000000 + cp, null); };
+
+    // --- latching modifier keys ----------------------------------------------------------------
+    // A phone has no Ctrl.  On a terminal that means no ^C and no ^D — you can start something and
+    // then have no way to stop it — and everywhere else it means no shortcut at all.
+    //
+    // The mobile-terminal convention is a LATCH, and it has two depths on purpose:
+    //   TAP          arms the modifier for the NEXT key, then it lets go by itself.  This is the
+    //                one you want almost always: Ctrl, c, done.
+    //   DOUBLE-TAP   locks it down until tapped again, for the runs where it has to stay (Ctrl-W
+    //                Ctrl-W, arrowing about with Shift held).
+    // The two are drawn differently — outlined vs filled-and-breathing — because a lock that looks
+    // like an arm is a modifier you leave on by accident and then blame the keyboard for.
+    //
+    // THE ROW MUST NOT TAKE FOCUS.  iOS closes the soft keyboard the instant the hidden input
+    // blurs, so a press that moved focus would dismiss the very keyboard it is modifying; every
+    // press therefore preventDefaults.  Tapping a modifier while the keyboard is DOWN focuses the
+    // field instead, so Ctrl doubles as "open the keyboard with Ctrl already armed".
+    const MODS = [
+      { id: 'ctrl',  label: 'Ctrl',  sym: XK.Control, code: 'ControlLeft' },
+      { id: 'alt',   label: 'Alt',   sym: XK.Alt,     code: 'AltLeft' },
+      { id: 'shift', label: 'Shift', sym: XK.Shift,   code: 'ShiftLeft' },
+      { id: 'meta',  label: '⌘',     sym: XK.Meta,    code: 'MetaLeft' },
+    ];
+    const MOD_OFF = 0, MOD_ARMED = 1, MOD_LOCKED = 2, MOD_DBL_MS = 450;
+    const modRow = document.createElement('div');
+    modRow.id = 'mods';
+    const paintMods = () => { for (const m of MODS)
+      m.btn.dataset.mod = ['off', 'armed', 'locked'][m.state]; };
+    for (const m of MODS) {
+      m.state = MOD_OFF; m.last = 0;
+      const b = document.createElement('button');
+      b.className = 'gmod'; b.textContent = m.label; b.dataset.mod = 'off';
+      b.setAttribute('aria-label', m.label + ' (tap to arm, double-tap to lock)');
+      const toggle = () => {
+        const t = performance.now();
+        if (m.state === MOD_ARMED && t - m.last < MOD_DBL_MS) m.state = MOD_LOCKED;  // second tap
+        else m.state = m.state ? MOD_OFF : MOD_ARMED;                                // arm / clear
+        m.last = t; paintMods();
+        diag('mod ' + m.id + ' ' + ['off', 'armed', 'locked'][m.state]);
+        // the keyboard is what a modifier modifies: if it is not up, bring it up.  focus() inside
+        // the gesture handler is the same route the ⌨ button takes, which iOS does honour.
+        if (document.activeElement !== kbin) kbin.focus();
+      };
+      // Two entry points, one action.  touchend is the real one on a phone — preventDefault there
+      // both keeps focus where it is and suppresses the synthetic click; the click listener is for
+      // a mouse, and steps aside if a touch has just been through.
+      let lastTouch = 0;
+      b.addEventListener('mousedown', e => e.preventDefault());   // desktop: never blur the field
+      b.addEventListener('touchend', e => { e.preventDefault(); e.stopPropagation();
+                                            lastTouch = performance.now(); toggle(); },
+                         { passive: false });
+      b.addEventListener('click', e => { e.preventDefault(); e.stopPropagation();
+        if (performance.now() - lastTouch < 700) return;          // already handled as a touch
+        toggle(); });
+      m.btn = b; modRow.appendChild(b);
+    }
+    document.body.appendChild(modRow);
+    // Hold everything latched, emit the key, let go again — the same down / tap / up shape the
+    // Shift+Insert paste below uses, generalised over the row.  Armed modifiers then drop; locked
+    // ones stay down for the next key too.  Release is in a `finally` so a throw mid-key cannot
+    // leave Ctrl held on the desktop with nothing on this end still showing it.
+    const withMods = emit => {
+      const held = MODS.filter(m => m.state !== MOD_OFF);
+      if (!held.length) { emit(); return; }
+      for (const m of held) rfb.sendKey(m.sym, m.code, true);
+      try { emit(); }
+      finally {
+        for (let i = held.length - 1; i >= 0; i--) rfb.sendKey(held[i].sym, held[i].code, false);
+        let changed = false;
+        for (const m of held) if (m.state === MOD_ARMED) { m.state = MOD_OFF; changed = true; }
+        if (changed) paintMods();
+      }
+    };
+    // BOTH key routes go through these, and nothing else does: `tap`/`sendChar` stay bare so the
+    // paste below can spell out its own Shift+Insert without the row joining in.
+    const tapMod = (keysym, code) => withMods(() => tap(keysym, code));
+    // A paste is not a keystroke, and on a phone both arrive through this one hidden input.
+    // PASTE_MAX caps either route: a phone's clipboard can hold a whole document, and typing one
+    // is a key event per character down the data channel — a megabyte would be a million of them.
+    const PASTE_MAX = 4096;
+    const clampPaste = t => (t.length > PASTE_MAX ? t.slice(0, PASTE_MAX) : t);
+    // Type a string, one keysym at a time.  A newline becomes Enter rather than the character
+    // U+000A, or a shell gets a literal control byte where it wanted a line.
+    const sendText = t => {
+      for (const ch of t) {
+        if (ch === '\n' || ch === '\r') tap(XK.Enter, 'Enter'); else sendChar(ch);
+      }
+    };
+    // What the user TYPED, as opposed to what was pasted: the latched modifiers apply, and they
+    // apply to the FIRST character only.  iOS usually delivers one character per event, but
+    // autocorrect and dictation deliver whole words at once — and "Ctrl armed, a word arrives"
+    // means Ctrl-<first letter>, not a word with Ctrl held down through all of it.
+    const sendTyped = t => {
+      let first = true;
+      for (const ch of t) {
+        const emit = () => { if (ch === '\n' || ch === '\r') tap(XK.Enter, 'Enter'); else sendChar(ch); };
+        if (first) { withMods(emit); first = false; } else emit();
+      }
+    };
+    // A REAL modifier keydown is not a key to forward.  e.key for Shift/Control/Alt/Meta is the
+    // modifier's own name, which now collides with XK — forwarding it would send a press-and-
+    // release of Control every time a hardware Ctrl went DOWN, which is the opposite of holding it.
+    const HWMOD = { Shift: 1, Control: 1, Alt: 1, Meta: 1 };
+    kbin.addEventListener('keydown', e => {          // special keys (fire keydown even on iOS)
+      if (HWMOD[e.key]) return;
+      if (e.key in XK) { e.preventDefault(); tapMod(XK[e.key], e.code); }
+    });
+    kbin.addEventListener('beforeinput', e => {      // typed characters (iOS soft keyboard)
+      const it = e.inputType;
+      if (it === 'insertText' && e.data) { sendTyped(e.data); e.preventDefault(); }
+      // A long-press -> Paste (and a drag-and-drop) arrives as insertFromPaste / insertFromDrop,
+      // NOT insertText — so it used to match no branch and the text was thrown away by the
+      // kbin.value reset at the bottom, which is why pasting on iOS silently did nothing.  This
+      // is also the route that needs no clipboard permission: by the time the event fires, iOS
+      // has already decided to hand us the text.  Safari puts it in .data; the spec allows
+      // .dataTransfer instead, so read both.
+      else if (it === 'insertFromPaste' || it === 'insertFromDrop') {
+        const raw = e.data || (e.dataTransfer && e.dataTransfer.getData('text/plain')) || '';
+        const t = clampPaste(raw);
+        if (t) sendText(t);
+        e.preventDefault();
+        diag('paste: typed ' + t.length + ' chars' +
+             (t.length < raw.length ? ' (capped from ' + raw.length + ')' : ''));
+      }
+      else if (it === 'deleteContentBackward') { tapMod(XK.Backspace, 'Backspace'); e.preventDefault(); }
+      else if (it && it.startsWith('insertLine') || it === 'insertParagraph') {
+        tapMod(XK.Enter, 'Enter'); e.preventDefault();
+      }
+      kbin.value = '';
+    });
+
+    // --- 📋 paste: hand over the whole string, don't type it ---------------------------------
+    // The box now keeps a SESSION clipboard beside its framebuffer, so there are two ways to get
+    // text into it and the button takes the cheap one: ClientCutText carries the whole string in
+    // ONE message, and Shift+Insert then asks the desktop to paste it wherever focus is — four key
+    // messages regardless of length, against one per character.  Typing stays the fallback, and is
+    // the whole of the long-press route above, which needs no permission at all.
+    // 📋 is an ACTION, not a toggle: there is no "paste is off", so it never wears a strike.  It
+    // sits plain, flashes green when a paste goes through, and fades out entirely while there is
+    // no channel to paste down.
+    const pasteBtn = mkToggle('📋', 254, 'paste');
+    setBtn(pasteBtn, 'disabled');                   // until the RFB channel is actually open
+    const sendPaste = text => {
+      const t = clampPaste(text);
+      const capped = t.length < text.length ? ' (capped from ' + text.length + ')' : '';
+      if (typeof rfb.clipboardPasteFrom === 'function') {
+        try {
+          rfb.clipboardPasteFrom(t);                    // -> ClientCutText: the session's selection
+          rfb.sendKey(XK.Shift, 'ShiftLeft', true);     // -> Shift+Insert: paste it at the focus
+          tap(XK.Insert, 'Insert');
+          rfb.sendKey(XK.Shift, 'ShiftLeft', false);
+          diag('paste: ' + t.length + ' chars as cut text + Shift+Insert' + capped);
+          return;
+        } catch (err) { diag('paste: cut text failed (' + (err.name || err) + ') — typing it'); }
+      }
+      sendText(t);
+      diag('paste: typed ' + t.length + ' chars' + capped);
+    };
+    pasteBtn.addEventListener('click', async () => {
+      let text = null;
+      try {
+        if (!navigator.clipboard || !navigator.clipboard.readText) throw new Error('unsupported');
+        text = await navigator.clipboard.readText();   // inside the gesture — Safari requires that,
+                                                       // and shows its own confirmation, which is
+                                                       // the user's to make and cannot be skipped
+      } catch (err) {
+        // Denied, dismissed, or no async clipboard at all.  Not something to swallow: fall back to
+        // the route that never needed permission — focus the hidden field so a long-press offers
+        // Paste — and say which, because a button that does nothing visible reads as a broken one.
+        diag('paste: clipboard read refused (' + (err.name || err) +
+             ') — long-press the keyboard field and choose Paste');
+        kbin.focus();
+        return;
+      }
+      if (!text) { diag('paste: clipboard is empty'); return; }
+      setBtn(pasteBtn, 'on'); setTimeout(() => setBtn(pasteBtn, 'idle'), 600);
+      sendPaste(text);
+    });
+
+    // Keep the desktop above the soft keyboard: when it opens the visual viewport shrinks, so pin
+    // #screen to the visible height; noVNC's ResizeObserver refits the canvas and margin:auto
+    // re-centers it in the remaining space above the keyboard.
+    const vv = window.visualViewport;
+    if (vv) {
+      const screenEl = document.getElementById('screen');
+      const fitViewport = () => {
+        const lift = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+        const up = lift > 120;                                   // keyboard (not just a rotation)
+        screenEl.style.height = up ? vv.height + 'px' : '100vh';
+        // iOS pins position:fixed to the LAYOUT viewport, so the modifier row would slide UNDER
+        // the keyboard exactly when it is wanted.  Lift it to sit ON TOP of the keyboard instead,
+        // where an accessory row belongs; at rest it drops back above the button row.
+        document.documentElement.style.setProperty('--mods-bottom', (up ? lift + 10 : 78) + 'px');
+      };
+      vv.addEventListener('resize', fitViewport);
+      vv.addEventListener('scroll', fitViewport);
+      fitViewport();
+    }
+
+    // --- virtual trackpad (touch only): relative cursor motion, so your fingertip never hides the
+    // target.  Drag = move cursor · quick tap = left-click · two-finger tap = right-click ·
+    // pinch = zoom · two-finger drag = pan when zoomed / scroll when not · press-and-hold = grab
+    // (a second concentric arc sweeps clockwise; when it closes the grab locks left, so you drag
+    // windows / select until you lift).  Real mice keep noVNC's absolute pointer.
+    //
+    // Zoom is our own transform ON THE CANVAS (origin 0 0) — noVNC scales via the canvas's CSS
+    // width/height and maps pointers with that (untransformed) scale, so our transform is free and
+    // the pointer math stays exact.  vx/vy live in noVNC's element space [0, canvas.clientWidth];
+    // the cursor ring maps to the screen through sx = rect.width / clientWidth (= our zoom).
+    (() => {
+      const screen = document.getElementById('screen');
+      const canvasOf = () => screen.querySelector('canvas');
+      const SENS = 1.6, TAP_MS = 250, TAP_SLOP = 10, SCROLL_PX = 24, ZMAX = 6, SL_SLOP = 30;
+      const HOLD_MS = 500, ARM_AT = HOLD_MS / 2;             // press-and-hold to grab; arm at half
+      let vx = 0, vy = 0, posInit = false, mask = 0;         // cursor (element px) + held buttons
+      let lastX = 0, lastY = 0, startT = 0, moved = 0, fingers = 0;
+      let dragging = false, scrollAcc = 0, holdRAF = 0, holdStart = 0;
+      let zoom = 1, tx = 0, ty = 0;                          // our canvas transform (pan + zoom)
+      let multi = false, multiT = 0, dPrev = 0, mpx = 0, mpy = 0, pinchMoved = 0;
+      let slRAF = 0, slStart = 0, scrollLock = false, slAccX = 0, slAccY = 0;   // two-finger scroll-lock
+      let slBaseX = 0, slBaseY = 0, slBaseD = 0;             // hold-start baseline (net-displacement arming)
+      const nowMs = () => performance.now();
+      const dist = ts => Math.hypot(ts[0].clientX - ts[1].clientX, ts[0].clientY - ts[1].clientY);
+      // white cursor drawn as SVG: an inner ring is the pointer; an outer arc grows clockwise as the
+      // press-and-hold arms and, when it closes into a full second concentric ring, the grab locks.
+      const NS = 'http://www.w3.org/2000/svg', C = 2 * Math.PI * 12;
+      const svgEl = (n, a) => { const el = document.createElementNS(NS, n);
+        for (const k in a) el.setAttribute(k, a[k]); return el; };
+      const cur = svgEl('svg', { width: 40, height: 40, viewBox: '0 0 40 40' });
+      cur.style.cssText = 'position:fixed;margin:-20px 0 0 -20px;pointer-events:none;z-index:15;display:none;overflow:visible';
+      // each ring is drawn twice — a wider DARK stroke behind a white one — for a crisp dark outline,
+      // so the cursor reads on light AND dark backgrounds (a soft drop-shadow washed out on white).
+      const DARK = 'rgba(0,0,0,.9)';
+      const innerBg = svgEl('circle', { cx: 20, cy: 20, r: 8, fill: 'none', stroke: DARK, 'stroke-width': 5 });
+      const inner   = svgEl('circle', { cx: 20, cy: 20, r: 8, fill: 'none', stroke: '#fff', 'stroke-width': 2 });
+      const arcA = { cx: 20, cy: 20, r: 12, fill: 'none', 'stroke-linecap': 'round',
+                     transform: 'rotate(-90 20 20)', 'stroke-dasharray': C, 'stroke-dashoffset': C };
+      const arcBg = svgEl('circle', { ...arcA, stroke: DARK, 'stroke-width': 5 });
+      const arc   = svgEl('circle', { ...arcA, stroke: '#fff', 'stroke-width': 2 });
+      cur.append(arcBg, arc, innerBg, inner); document.body.appendChild(cur);    // dark backs drawn first
+      const setArc = o => { arc.setAttribute('stroke-dashoffset', o); arcBg.setAttribute('stroke-dashoffset', o); };
+      const ringIdle = () => setArc(C);                                          // outer arc hidden
+      const ringArm  = p  => setArc(C * (1 - p));                                // grows clockwise
+      const ringGrab = () => setArc(0);                                          // full second ring = grabbed
+      const applyT = () => {                                 // push pan/zoom onto the canvas
+        const c = canvasOf(); if (!c) return;
+        if (zoom <= 1.001) { zoom = 1; tx = 0; ty = 0; c.style.transform = ''; }
+        else { c.style.transformOrigin = '0 0'; c.style.transform = `translate(${tx}px,${ty}px) scale(${zoom})`; }
+        syncVid(c);
+      };
+      // Keep the video glued to the canvas by giving it the IDENTICAL transform, rather than
+      // re-positioning it from the canvas's (already transformed) rect: transforms are composited,
+      // so both surfaces move together on the same frame instead of the video lagging a layout
+      // behind.  The plain box is only written while unzoomed, where it is stable.
+      // The trackpad OWNS the pan/zoom, so it publishes it: the module-level SYNCVIDEONOW needs it
+      // to restate the video's box and its transform TOGETHER.  Without this it can only see the
+      // canvas's already-zoomed rect, and writing that underneath an unchanged transform is what
+      // put the picture off-screen on a resize or a resume taken while zoomed.
+      window.__vidXform = () => ({ zoom, tx, ty });
+      const syncVid = (c) => {
+        const v = window.__vidEl; if (!v || !window.__videoPrimary) return;
+        if (zoom <= 1.001) {
+          const r = c.getBoundingClientRect();
+          if (!r.width) return;
+          v.style.transform = '';
+          v.style.left = r.left + 'px'; v.style.top = r.top + 'px';
+          v.style.width = r.width + 'px'; v.style.height = r.height + 'px';
+        } else {
+          v.style.transformOrigin = '0 0';
+          v.style.transform = `translate(${tx}px,${ty}px) scale(${zoom})`;
+        }
+      };
+      const clampPan = () => {                               // keep the zoomed canvas covering #screen
+        const c = canvasOf(); if (!c || zoom <= 1.001) return;
+        const s = screen.getBoundingClientRect(), r = c.getBoundingClientRect();
+        let dx = 0, dy = 0;
+        if (r.width <= s.width) dx = s.left + (s.width - r.width) / 2 - r.left;
+        else if (r.left > s.left) dx = s.left - r.left; else if (r.right < s.right) dx = s.right - r.right;
+        if (r.height <= s.height) dy = s.top + (s.height - r.height) / 2 - r.top;
+        else if (r.top > s.top) dy = s.top - r.top; else if (r.bottom < s.bottom) dy = s.bottom - r.bottom;
+        if (dx || dy) { tx += dx; ty += dy; c.style.transform = `translate(${tx}px,${ty}px) scale(${zoom})`;
+                        syncVid(c); }
+      };
+      const SAFE = 0.25;                                     // cursor roams the central 50%; view pans past that
+      const followCursor = (frac = SAFE) => {                // pan a zoomed view to keep the cursor in a band
+        const c = canvasOf(); if (!c || zoom <= 1.001) return;
+        const s = screen.getBoundingClientRect(), r = c.getBoundingClientRect();
+        const sx = c.clientWidth ? r.width / c.clientWidth : 1, sy = c.clientHeight ? r.height / c.clientHeight : 1;
+        const cxs = r.left + vx * sx, cys = r.top + vy * sy; // cursor's screen position
+        const mx = s.width * frac, my = s.height * frac;
+        let dx = 0, dy = 0;
+        if (cxs < s.left + mx) dx = s.left + mx - cxs; else if (cxs > s.right - mx) dx = s.right - mx - cxs;
+        if (cys < s.top + my) dy = s.top + my - cys; else if (cys > s.bottom - my) dy = s.bottom - my - cys;
+        if (dx || dy) { tx += dx; ty += dy; applyT(); clampPan(); }  // clampPan stops us panning past the edge
+      };
+      const clampCursorToFrame = () => {                     // move the CURSOR (not the view) to keep it on-screen
+        const c = canvasOf(); if (!c || zoom <= 1.001) return false;
+        const s = screen.getBoundingClientRect(), r = c.getBoundingClientRect();
+        const sx = c.clientWidth ? r.width / c.clientWidth : 1, sy = c.clientHeight ? r.height / c.clientHeight : 1;
+        const EDGE = 24;                                      // keep the ~20px ring off the very edge
+        const loX = Math.max(0, (s.left + EDGE - r.left) / sx), hiX = Math.min(c.clientWidth - 1, (s.right - EDGE - r.left) / sx);
+        const loY = Math.max(0, (s.top + EDGE - r.top) / sy), hiY = Math.min(c.clientHeight - 1, (s.bottom - EDGE - r.top) / sy);
+        const nvx = Math.min(Math.max(vx, loX), hiX), nvy = Math.min(Math.max(vy, loY), hiY);
+        if (nvx !== vx || nvy !== vy) { vx = nvx; vy = nvy; return true; }
+        return false;
+      };
+      const place = () => {                                  // ring at the cursor's framebuffer point
+        const c = canvasOf(); if (!c) return;
+        const r = c.getBoundingClientRect();
+        const sx = c.clientWidth ? r.width / c.clientWidth : 1, sy = c.clientHeight ? r.height / c.clientHeight : 1;
+        cur.style.left = (r.left + vx * sx) + 'px'; cur.style.top = (r.top + vy * sy) + 'px'; cur.style.display = 'block';
+      };
+      const ensurePos = () => {
+        if (posInit) return; const c = canvasOf(); if (!c) return;
+        vx = c.clientWidth / 2; vy = c.clientHeight / 2; posInit = true;
+      };
+      const move = () => {
+        const c = canvasOf(); if (!c) return;
+        vx = Math.max(0, Math.min(c.clientWidth - 1, vx)); vy = Math.max(0, Math.min(c.clientHeight - 1, vy));
+        rfb._sendMouse(vx, vy, mask); followCursor(); place();
+      };
+      const click = bit => { rfb._sendMouse(vx, vy, mask | bit); rfb._sendMouse(vx, vy, mask); };
+      // --- scroll direction (TOUCH ONLY) ---------------------------------------------------
+      // Apple-style "natural" scrolling: the content follows the fingers.  Drag DOWN and the
+      // content moves DOWN — which is a wheel-UP event — and drag RIGHT and it moves RIGHT,
+      // a wheel-LEFT.  Traditional (the inverse) is what an unmodified wheel does.
+      //
+      // The whole thing is ONE sign flip, applied where the wheel bit is chosen, so the
+      // handlers below stay written in the obvious "acc > 0 means the fingers went down/right"
+      // form and this is a single line to revert or hang a setting off.  It does NOT touch the
+      // mouse: we register no mouse/wheel/pointer listeners at all, so a real wheel goes
+      // straight to noVNC's own handler and stays traditional.
+      const NATURAL_TOUCH_SCROLL = true;
+      const SDIR = NATURAL_TOUCH_SCROLL ? -1 : 1;
+      const W_UP = 1 << 3, W_DOWN = 1 << 4, W_LEFT = 1 << 5, W_RIGHT = 1 << 6;
+      const wheelV = acc => (acc * SDIR > 0 ? W_DOWN : W_UP);    // acc > 0: fingers moved DOWN
+      const wheelH = acc => (acc * SDIR > 0 ? W_RIGHT : W_LEFT); // acc > 0: fingers moved RIGHT
+      const cancelHold = () => { if (holdRAF) { cancelAnimationFrame(holdRAF); holdRAF = 0; } if (!dragging) ringIdle(); };
+      const startHold = () => {                              // arm a grab; a plain move cancels it
+        holdStart = nowMs();
+        const tick = () => {
+          const el = nowMs() - holdStart;
+          if (el >= HOLD_MS) { dragging = true; mask |= 1; ringGrab(); move(); holdRAF = 0; return; }
+          if (el >= ARM_AT) ringArm((el - ARM_AT) / (HOLD_MS - ARM_AT));
+          holdRAF = requestAnimationFrame(tick);
+        };
+        holdRAF = requestAnimationFrame(tick);
+      };
+      // --- two-finger scroll-lock: the two-finger analog of press-and-hold-to-grab ---
+      // Hold two fingers still and the ring arms at their midpoint; when it closes, "scroll lock"
+      // engages: two-finger drag then scrolls content BOTH axes (wheel events) and no longer
+      // zooms/pans the view.  Move before it closes -> arming cancels -> normal pinch/zoom/pan.
+      const cancelSL = () => { if (slRAF) { cancelAnimationFrame(slRAF); slRAF = 0; } if (!scrollLock) ringIdle(); };
+      const startSLHold = () => {                            // arm scroll-lock; a real pinch/pan cancels it
+        slStart = nowMs();
+        const tick = () => {
+          const el = nowMs() - slStart;
+          if (el >= HOLD_MS) { scrollLock = true; slAccX = slAccY = 0; ringGrab(); slRAF = 0; return; }
+          if (el >= ARM_AT) ringArm((el - ARM_AT) / (HOLD_MS - ARM_AT));
+          slRAF = requestAnimationFrame(tick);
+        };
+        slRAF = requestAnimationFrame(tick);
+      };
+      const opt = { capture: true, passive: false };
+      screen.addEventListener('touchstart', e => {
+        e.preventDefault(); e.stopPropagation(); ensurePos();
+        fingers = e.touches.length;
+        if (fingers >= 2) {                                   // second finger: begin a pinch/pan
+          multi = true; multiT = nowMs(); pinchMoved = 0; cancelHold();
+          dPrev = dist(e.touches);
+          mpx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+          mpy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+          scrollLock = false; place();
+          slBaseX = mpx; slBaseY = mpy; slBaseD = dPrev; startSLHold();   // arm two-finger scroll-lock (net-displacement)
+          return;
+        }
+        multi = false; const t = e.touches[0];               // fresh one-finger gesture
+        lastX = t.clientX; lastY = t.clientY; startT = nowMs(); moved = 0; scrollAcc = 0;
+        ringIdle(); move(); startHold();
+      }, opt);
+      screen.addEventListener('touchmove', e => {
+        e.preventDefault(); e.stopPropagation();
+        if (e.touches.length >= 2) {                          // pinch = zoom, translate = pan/scroll
+          cancelHold();
+          const d = dist(e.touches);
+          const mx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+          const my = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+          if (scrollLock) {                                   // scroll-lock: two-finger drag scrolls H+V; no zoom/pan
+            const pdx = mx - mpx, pdy = my - mpy;
+            slAccY += pdy; slAccX += pdx;
+            while (Math.abs(slAccY) >= SCROLL_PX) { const dn = slAccY > 0; click(wheelV(slAccY)); slAccY += dn ? -SCROLL_PX : SCROLL_PX; }
+            while (Math.abs(slAccX) >= SCROLL_PX) { const rt = slAccX > 0; click(wheelH(slAccX)); slAccX += rt ? -SCROLL_PX : SCROLL_PX; }
+            dPrev = d; mpx = mx; mpy = my; place(); ringGrab(); return;
+          }
+          if (slRAF) {                                        // ring still arming: park (no zoom/pan) unless a real pinch/pan
+            if (Math.hypot(mx - slBaseX, my - slBaseY) > SL_SLOP || Math.abs(d - slBaseD) > SL_SLOP) {
+              cancelSL();                                     // deliberate movement -> fall through to pinch/pan
+            } else {
+              dPrev = d; mpx = mx; mpy = my; place(); return;   // held still -> keep arming the ring
+            }
+          }
+          if (dPrev > 0) {
+            const z2 = Math.max(1, Math.min(ZMAX, zoom * d / dPrev));
+            if (z2 !== zoom) {                                // zoom about the pinch midpoint (natural pinch)
+              const r = canvasOf().getBoundingClientRect();
+              tx += (mx - r.left) * (1 - z2 / zoom); ty += (my - r.top) * (1 - z2 / zoom); zoom = z2;
+            }
+          }
+          const pdx = mx - mpx, pdy = my - mpy;
+          if (zoom > 1.001) { tx += pdx; ty += pdy; applyT(); clampPan();
+            // zoom gesture stays pure: slide the CURSOR back on-screen instead of panning the view
+            if (clampCursorToFrame()) rfb._sendMouse(vx, vy, mask); }
+          else {                                              // not zoomed: two-finger drag = scroll
+            applyT(); scrollAcc += pdy;
+            while (Math.abs(scrollAcc) >= SCROLL_PX) {
+              const dn = scrollAcc > 0; click(wheelV(scrollAcc)); scrollAcc += dn ? -SCROLL_PX : SCROLL_PX;
+            }
+          }
+          pinchMoved += Math.abs(d - dPrev) + Math.abs(pdx) + Math.abs(pdy);
+          dPrev = d; mpx = mx; mpy = my; place(); return;
+        }
+        if (multi) { lastX = e.touches[0].clientX; lastY = e.touches[0].clientY; return; }  // leftover finger
+        const t = e.touches[0], dx = t.clientX - lastX, dy = t.clientY - lastY;
+        lastX = t.clientX; lastY = t.clientY; moved += Math.abs(dx) + Math.abs(dy);
+        if (!dragging && moved > TAP_SLOP) cancelHold();      // moving = a plain cursor move, not a grab
+        vx += dx * SENS / zoom; vy += dy * SENS / zoom; move();  // finer control the more you're zoomed
+      }, opt);
+      screen.addEventListener('touchend', e => {
+        e.preventDefault(); e.stopPropagation();
+        if (e.touches.length > 0) {                           // a finger lifted, others remain
+          lastX = e.touches[0].clientX; lastY = e.touches[0].clientY;
+          if (e.touches.length >= 2) { dPrev = dist(e.touches);
+            mpx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+            mpy = (e.touches[0].clientY + e.touches[1].clientY) / 2; }
+          return;
+        }
+        if (dragging) { dragging = false; mask &= ~1; move(); }
+        else if (multi) { if (!scrollLock && pinchMoved < 14 && (nowMs() - multiT) < 350) click(1 << 2); }  // 2-finger tap = right
+        else if ((nowMs() - startT) < TAP_MS && moved < TAP_SLOP) click(1 << 0);              // 1-finger tap = left
+        scrollLock = false; slAccX = slAccY = 0; cancelSL(); cancelHold(); fingers = 0; multi = false;
+      }, opt);
+      screen.addEventListener('touchcancel', () => {
+        if (dragging) { dragging = false; mask &= ~1; move(); } scrollLock = false; slAccX = slAccY = 0; cancelSL(); cancelHold(); fingers = 0; multi = false;
+      }, opt);
+    })();
+
+
+    // ---- the counters the hud reports ------------------------------------------------------
+    let frames = 0, bytesIn = 0, msgsIn = 0;
+
+    let gotFirstFrame = false;
+    const origFBU = rfb._framebufferUpdate.bind(rfb);
+    rfb._framebufferUpdate = function () { const done = origFBU();
+      if (done) { frames++; if (!gotFirstFrame) { gotFirstFrame = true; api.ui.hideConn(); api.clearReconnAttempts(); } } return done; };
+
+    ch.addEventListener('message', e => { bytesIn += (e.data.byteLength ?? e.data.length ?? 0); msgsIn++; });
+
+    // copy button: grab the whole report to the clipboard (so it's easy to paste back on mobile)
+    const copyBtn = document.createElement('button');
+    copyBtn.textContent = '⧉ copy';
+    copyBtn.style.cssText = 'position:fixed;top:3px;right:4px;z-index:14;font:11px ui-monospace,monospace;' +
+      'background:rgba(0,0,0,.8);color:#7CFC9B;border:1px solid #7CFC9B;border-radius:5px;padding:3px 8px';
+    document.body.appendChild(copyBtn);
+    copyBtn.addEventListener('click', async () => {
+      const report = [
+        'glass-webrtc diag @ ' + new Date().toISOString(),
+        'ua: ' + navigator.userAgent,
+        'url: ' + location.href.replace(/code=[^&]+/, 'code=…'),   // don't leak the code
+        '', hud.innerText, '--- log ---', ...diagLines,
+      ].join('\n');
+      let ok = false;
+      try { await navigator.clipboard.writeText(report); ok = true; } catch (_) {
+        const ta = document.createElement('textarea');           // iOS-safe fallback
+        ta.value = report; ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+        document.body.appendChild(ta); ta.focus(); ta.setSelectionRange(0, report.length);
+        try { ok = document.execCommand('copy'); } catch (_) {} ta.remove();
+      }
+      copyBtn.textContent = ok ? '✓ copied' : '✗ failed';
+      setTimeout(() => { copyBtn.textContent = '⧉ copy'; }, 1600);
+    });
+    // debug toggle: bottom-left button to show/hide the whole diagnostics overlay (hud + log + copy)
+    const dbgBtn = document.createElement('button');
+    dbgBtn.appendChild(gGlyph('≡'));
+    dbgBtn.className = 'gbtn';                      // same three states as the rest of the row
+    dbgBtn.dataset.state = 'off';
+    dbgBtn.setAttribute('aria-label', 'diagnostics');
+    dbgBtn.style.cssText += 'bottom:14px;left:14px;z-index:31;font-size:26px';
+    document.body.appendChild(dbgBtn);
+    let dbgOn = false;                              // debug overlay hidden by default; ≡ toggles it
+    const applyDbg = () => {
+      const d = dbgOn ? '' : 'none';
+      hud.style.display = d; api.ui.diagEl.style.display = d; copyBtn.style.display = d;
+      document.body.classList.toggle('dbg', dbgOn);   // moves the link pill clear of the hud
+      setBtn(dbgBtn, dbgOn ? 'on' : 'off');
+      // debug view and the clean connecting overlay are mutually exclusive: showing debug hides the
+      // overlay; hiding debug brings the overlay back if we're still connecting (before first frame).
+      if (dbgOn) connEl.style.display = 'none';
+      else if (!api.ui.isConnHidden()) { connEl.style.display = ''; connEl.style.opacity = ''; }
+    };
+    dbgBtn.addEventListener('click', () => { dbgOn = !dbgOn; applyDbg(); });
+    applyDbg();
+
+    ch.addEventListener('open', () => { diag('datachannel OPEN'); setStep(3);
+                                        setBtn(pasteBtn, 'idle'); });
+    // The session is gone, so none of these can do anything — and "cannot" has to look different
+    // from "off", or the row goes on inviting taps that will not land.
+    ch.addEventListener('close', () => { diag('datachannel CLOSE');
+      for (const b of [pasteBtn, micBtn, spkBtn, qBtn]) setBtn(b, 'disabled'); });
+    ch.addEventListener('error', e => diag('datachannel ERROR ' + ((e.error && e.error.message) || '')));
+    // The handshake is the only place the box says what it is called, so it is the only place
+    // that can teach the progress screen for next time.  See LEARNT-NAME.
+    rfb.addEventListener('connect', () => { diag('RFB connect'); api.learnWho(rfb._fbName); });
+    rfb.addEventListener('disconnect', e => diag('RFB disconnect ' + ((e.detail && e.detail.clean) ? 'clean' : 'UNCLEAN')));
+    rfb.addEventListener('securityfailure', e => diag('RFB security-fail ' + ((e.detail && e.detail.reason) || '')));
+    // heartbeat every 10s — but only log it when something's NOT fully healthy or the state
+    // changed, so a steady-good session doesn't spam identical ♥ lines.
+    let lastHb = '';
+    setInterval(() => {
+      const hb = `pc=${pc.connectionState} ice=${pc.iceConnectionState} dc=${ch.readyState} rfb=${rfb._rfbConnectionState || '?'}`;
+      const healthy = pc.connectionState === 'connected' && ch.readyState === 'open' && rfb._rfbConnectionState === 'connected';
+      if (!healthy || hb !== lastHb) diag('♥ ' + hb);
+      lastHb = hb;
+    }, 10000);
+
+    // getStats: which candidate pair won (host/srflx/relay), its rtt, and transport rx bytes
+    let pathStr = 'path …', lastRx = 0, lastRxT = performance.now();
+    let vidKbs = 0, vidFps = 0, lastVid = null;      // the VP8 stream's own rate, for the quality panel
+    let lastKeyAsk = 0;                              // rate-limits the "I still have no picture" ask
+    let lastHeal = 0;                                // ... and the repaint watchdog's intervention
+    async function pollPath() {
+      try {
+        const s = await pc.getStats(); let pair = null;
+        s.forEach(r => { if (r.type === 'candidate-pair' && r.state === 'succeeded' && (r.nominated || r.selected)) pair = r; });
+        if (!pair) s.forEach(r => { if (r.type === 'transport' && r.selectedCandidatePairId) pair = s.get(r.selectedCandidatePairId); });
+        if (pair) {
+          const lc = s.get(pair.localCandidateId), rc = s.get(pair.remoteCandidateId);
+          const rtt = pair.currentRoundTripTime != null ? Math.round(pair.currentRoundTripTime * 1000) + 'ms' : '?';
+          const rx = pair.bytesReceived || 0, now = performance.now();
+          const rate = ((rx - lastRx) / 1024 / ((now - lastRxT) / 1000)) || 0; lastRx = rx; lastRxT = now;
+          noteRxSig(pair);           // the liveness signal — see the note above checkLink()
+          const path = `${lc ? lc.candidateType : '?'}→${rc ? rc.candidateType : '?'}`;
+          if (pathStr.indexOf(path) < 0) diag('PATH ' + path + ' via ' + (rc ? rc.protocol + ' ' + (rc.address || '?') : '?'));
+          if (!api.ui.isConnHidden()) setDetail(2, `${path.replace('→', ' → ')}${rtt !== '?' ? '  ·  ' + rtt : ''}`);
+          pathStr = `path ${path} rtt ${rtt} rx ${(rx/1024).toFixed(0)}KB ${rate.toFixed(0)}KB/s`;
+        } else pathStr = 'path (no pair)';
+        // the VIDEO's own rate and frame rate — dc-in above is the RFB channel, which in
+        // video-primary mode carries input only.  This is the number a quality profile moves.
+        let v = null; s.forEach(r => { if (r.type === 'inbound-rtp' && r.kind === 'video') v = r; });
+        if (v) {
+          const now = performance.now();
+          if (lastVid) {
+            const dt = (now - lastVid.t) / 1000;
+            if (dt > 0.2) {
+              vidKbs = ((v.bytesReceived || 0) - lastVid.b) / 1024 / dt;
+              vidFps = ((v.framesDecoded || 0) - lastVid.f) / dt;
+            }
+          }
+          // A DECIMAL, because the bottom of the ladder is 0.61 KB/s and "0 KB/s" beside a working
+          // stream reads as a dead one.  kbps too — that is the unit the rung is named in.
+          const prevB = lastVid ? lastVid.b : 0;
+          lastVid = { t: now, b: v.bytesReceived || 0, f: v.framesDecoded || 0 };
+          qRate.textContent = `${vidKbs.toFixed(1)} KB/s · ${(vidKbs * 8.192).toFixed(0)} kbps · ` +
+                              `${vidFps.toFixed(0)} fps · ${api.video.presented()} shown`;
+          // ---- THE REPAINT WATCHDOG ---------------------------------------------------------
+          // The user should not have to pinch.  Bytes arriving is already measured above; what
+          // this adds is whether those bytes reach the GLASS, and it distinguishes the two ways
+          // they can fail to, because the corrective action is different for each:
+          //
+          //   * PLAYBACK.  The element is paused — nothing is being presented however much
+          //     arrives.  Only play() helps, and only a policy can refuse it.
+          //   * LAYOUT.  Frames are being presented, into a box that is 1x1 (never synced, because
+          //     noVNC's canvas was not ready when we first looked) or wholly outside the viewport
+          //     (the double-applied zoom above).  play() cannot help; restating the geometry can.
+          //
+          // Both are checked only while bytes are actually moving, so a genuinely dead link is
+          // reported as dead rather than nudged forever, and at most one intervention every 3 s.
+          const moving = vidKbs > 0.05;
+          const vr = vidEl.getBoundingClientRect();
+          const offscreen = vr.width < 2 || vr.height < 2 || vr.right <= 0 || vr.bottom <= 0 ||
+                            vr.left >= innerWidth || vr.top >= innerHeight;
+          const dark = api.video.presentedAt() && (now - api.video.presentedAt() > 4000);
+          if (videoPrimary && moving && now - lastHeal > 3000) {
+            if (vidEl.paused) {
+              lastHeal = now;
+              diag(`PAUSED with ${vidKbs.toFixed(1)} KB/s arriving — play()`);
+              api.video.play('watchdog', true);
+            } else if (dark) {
+              lastHeal = now;
+              diag(`no frame presented for ${((now - api.video.presentedAt()) / 1000).toFixed(1)}s ` +
+                   `(rs${vidEl.readyState} ${vidEl.videoWidth}x${vidEl.videoHeight}) — play() + resync`);
+              api.video.play('stalled', true); syncVideo(); api.video.nudge();
+            } else if (offscreen && api.video.presented() > 0) {
+              lastHeal = now;
+              diag(`presenting into an unseeable box ${Math.round(vr.width)}x${Math.round(vr.height)}` +
+                   ` @ ${Math.round(vr.left)},${Math.round(vr.top)} — resync`);
+              syncVideo(); api.video.nudge();
+            }
+          }
+          // THE RECOVERY PATH.  The box parses no RTCP, so it cannot hear a PLI — if our decoder
+          // never got a keyframe there is nothing to tell it except this channel, and its own blind
+          // resync is minutes away at the low rungs by design.  Ask, but only when nothing is
+          // already on its way: a keyframe takes 35 s to arrive at 5 kbps, and re-asking while it
+          // is still in flight would restart it forever.
+          if (videoPrimary && ctrl.readyState === 'open' && !(v.framesDecoded > 0) &&
+              (v.bytesReceived || 0) === prevB && now - tStart > 6000 &&
+              now - lastKeyAsk > 20000) {
+            lastKeyAsk = now;
+            ctrl.send(JSON.stringify({ request: 'keyframe' }));
+            diag('no frame decoded and nothing arriving — keyframe requested');
+          }
+        }
+      } catch (_) { pathStr = 'path stats-err'; }
+    }
+
+    let last = performance.now();
+    setInterval(() => {
+      // NOT pollPath() and NOT checkLink(): the SHELL owns both clocks now.  It drives pollPath
+      // through api.setPoll once a second and on resume, and checkLink is its own — the pill has to
+      // go on working in a session where no payload ever arrived.  This interval is the hud alone.
+      const now = performance.now(), dt = (now - last) / 1000; last = now;
+      const fps = frames / dt, kbs = bytesIn / 1024 / dt, mps = msgsIn / dt;
+      frames = bytesIn = msgsIn = 0;
+      const buf = ch.bufferedAmount || 0;
+      hud.innerHTML =
+        `pc <b>${pc.connectionState}</b> · ice <b>${pc.iceConnectionState}</b> · dc <b>${ch.readyState}</b>\n` +
+        `${pathStr}\n` +
+        `dc-in <b>${kbs.toFixed(0)}</b>KB/s ${mps.toFixed(0)}msg · buf ${(buf/1024).toFixed(0)}KB · fps <b>${fps.toFixed(0)}</b>\n` +
+        // PRESENTED frames beside decoded ones, because that pair is the diagnosis: both climbing
+        // and a blank screen means the layer is in the wrong place; "shown" frozen means playback.
+        `vid <b>${vidKbs.toFixed(1)}</b>KB/s · <b>${vidFps.toFixed(0)}</b>fps · shown <b>${api.video.presented()}</b>` +
+        `${vidEl.paused ? ' <b>PAUSED</b>' : ''}${api.video.playFails() ? ' play✗' + api.video.playFails() : ''}` +
+        ` · rung <b>${qCurrent != null ? qCurrent + 'kbps' : '?'}</b>\n` +
+        `rfb ${rfb._rfbConnectionState || '?'} · ${rfb._fbName || '—'}`;
+      console.log(`PERF ${(now/1000).toFixed(1)} ${fps.toFixed(1)} ${kbs.toFixed(1)} ${mps.toFixed(1)} ${(buf/1024).toFixed(1)}`);
+    }, 1000);
+
+  // ---- take over the video's geometry ----------------------------------------------------------
+  // THE VIDEO'S BOX IS THE CANVAS'S *UNTRANSFORMED* RECT AND THE ZOOM IS A TRANSFORM ON TOP OF IT.
+  // That is the invariant, and breaking it is what produced a blank screen a pinch cured.
+  //
+  // The trackpad zooms by transforming the canvas and gives the video the IDENTICAL transform (see
+  // SYNCVID above), so the canvas's getBoundingClientRect() ALREADY CONTAINS the zoom.  Writing that
+  // rect into the video's left/top/width/height while the video still carries the transform applies
+  // the zoom TWICE: at zoom 2 with any pan the picture lands wholly outside the viewport, with
+  // frames still arriving, still decoding and still being presented — into a layer nobody can see.
+  //
+  // So read the transform the trackpad is holding (it publishes it as window.__vidXform), undo it to
+  // recover the untransformed rect, and restate BOTH halves together.
+  //
+  // INSTALLED LAST, on purpose.  Until this line the shell's letterbox owns the box and the desktop
+  // has been visible for however long the payload took to arrive; from here the canvas owns it, and
+  // the canvas exists because RFB above created it.  Handing over before noVNC had drawn a canvas
+  // would put the picture back at 1x1 — which is the shell's whole reason for owning it first.
+  let syncTries = 0;
+  api.video.setGeometryOwner(() => {
+    if (!videoPrimary) return;
+    const c = document.querySelector('#screen canvas');
+    const r = c && c.getBoundingClientRect();
+    if (!r || !r.width || !r.height) {
+      // noVNC creates and sizes this canvas from its own handshake, so it may not exist yet.  Come
+      // back for it rather than leaving the video wherever it happens to be.
+      if (syncTries++ < 40) setTimeout(syncVideo, 250);
+      return;
+    }
+    syncTries = 0;
+    const x = (window.__vidXform && window.__vidXform()) || null;
+    if (x && x.zoom > 1.001) {          // transform-origin 0 0: rect = untransformed + t, scaled
+      vidEl.style.left = (r.left - x.tx) + 'px'; vidEl.style.top = (r.top - x.ty) + 'px';
+      vidEl.style.width = (r.width / x.zoom) + 'px'; vidEl.style.height = (r.height / x.zoom) + 'px';
+      vidEl.style.transformOrigin = '0 0';
+      vidEl.style.transform = `translate(${x.tx}px,${x.ty}px) scale(${x.zoom})`;
+    } else {
+      vidEl.style.transform = '';
+      vidEl.style.left = r.left + 'px'; vidEl.style.top = r.top + 'px';
+      vidEl.style.width = r.width + 'px'; vidEl.style.height = r.height + 'px';
+    }
+  });
+
+  // The shell polls once a second and on resume; this is what it polls.  Registered at the end so a
+  // half-initialised payload is never called back into.
+  api.setPoll(pollPath);
+  // A nap is not a rate, and a counter read before one is not evidence.  Both of these are only
+  // wrong in the direction that matters: without them, returning from twenty minutes in the
+  // background produces a KB/s computed over twenty minutes, and an rxSig that "advanced" while
+  // nothing was being asked.
+  api.onResumeHooks.push(() => { lastVid = null; rxSig = -1; });
+
+  diag('payload ready — input, trackpad, quality, panels');
+}

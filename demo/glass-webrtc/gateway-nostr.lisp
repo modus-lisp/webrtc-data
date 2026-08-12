@@ -343,6 +343,29 @@ silently drop CODE.)"
       state)
     (defun warp-close (state) (declare (ignore state)) nil)))
 
+;; ---- the payload channel: the browser client, on the connection it is the client for ----------
+;; Guarded exactly like the warp load above it, and for exactly the same reason: gw-keepalive.sh
+;; respawns this process on exit, so an unguarded failure here is not a client that fails to load —
+;; it is a crashloop with no remote desktop at all until somebody reaches a shell.
+;;
+;; The fallbacks keep the four names the session dispatch calls, and keep stream 104 CLAIMED.  The
+;; literal 104 is deliberate: +PAYLOAD-STREAM-ID+ is exactly what we may not have.  Letting 104 fall
+;; through to the RFB branch would hand glass `{"t":"hello",...}` as desktop input.
+;;
+;; INERT unless PAYLOAD_CHANNEL is set: no file is read, no thread is started, and a phone that asks
+;; is answered `none` so it can say so and offer Retry.  See payload-channel.lisp.
+(handler-case
+    (load (merge-pathnames "payload-channel.lisp" (or *load-pathname* *default-pathname-defaults*)))
+  (error (e)
+    (format *error-output* "~&@@ payload: channel unavailable (~a) — serving without it~%" e)
+    (finish-output *error-output*)
+    (defparameter *payload-channel-enabled* nil)
+    (defun payload-sid-p (sid) (eql sid 104))
+    (defun payload-on-message (state assoc sid payload pub)
+      (declare (ignore assoc sid payload pub))
+      state)
+    (defun payload-close (state) (declare (ignore state)) nil)))
+
 ;;; ---- one live session per terminal ------------------------------------------
 ;; A phone never says goodbye.  It locks its screen, changes network, or just reloads the page and
 ;; offers again — and nothing in WebRTC tells the answerer the old session died.  Sessions used to run
@@ -440,7 +463,9 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
   (let ((glass nil) (audio-stop nil) (video-stop nil) (cap nil) (tap nil) (mic nil)
         ;; This peer's warp channel, or NIL — which is what it stays unless the phone sends on
         ;; stream 102, which it only does if somebody opens the panel.
-        (warp nil))
+        (warp nil)
+        ;; ...and its payload transfer, which is NIL until the phone's shell says hello on 104.
+        (payload-ch nil))
     (unwind-protect
          (handler-case
              (progn
@@ -583,6 +608,13 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                     ;; Streams 0 and 100 — the only two any deployed client uses — are matched
                     ;; before and after this line exactly as they were.
                     ((warp-sid-p sid) (setf warp (warp-on-message warp assoc sid payload pub)))
+                    ;; The phone's FOURTH channel (stream 104) is the client payload: the shell on
+                    ;; nsite asks for the rest of itself, and we push it from disk.  Claimed
+                    ;; whether or not PAYLOAD_CHANNEL is set, for the same reason 102 is — see
+                    ;; PAYLOAD-SID-P.  With the feature off the phone is answered `none`, which is
+                    ;; what lets it say so instead of spinning.
+                    ((payload-sid-p sid)
+                     (setf payload-ch (payload-on-message payload-ch assoc sid payload pub)))
                     ((and glass (plusp (length payload)))
                      (let ((bytes (as-u8vec payload)))
                        ;; in video-primary mode drop FramebufferUpdateRequest (type 3, 10 bytes) so
@@ -622,6 +654,10 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
       ;; would hand the returning peer somebody else's high-water mark, which is rule 8's
       ;; late-joiner bug with the roles reversed.  NIL when the channel was never opened.
       (when warp (setf warp (warp-close warp)))
+      ;; ...and stop a payload transfer that is still in flight.  A phone that drops mid-transfer
+      ;; leaves a thread pushing 16 KB at a time into an association nobody is reading; the sender
+      ;; checks this between chunks and unwinds.
+      (when payload-ch (setf payload-ch (payload-close payload-ch)))
       (when cap (ignore-errors (capture-stop cap)))
       (when video-stop (ignore-errors (funcall video-stop)))
       (when audio-stop (ignore-errors (funcall audio-stop)))
@@ -755,6 +791,9 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
   (when *warp-channel-enabled*
     (format t "@@ warp:       stream ~a, ~a B/pass at ~a Hz (device manager)~%"
             +warp-stream-id+ *warp-budget* *warp-hz*))
+  (when *payload-channel-enabled*
+    (format t "@@ payload:    stream ~a, ~a (client served from disk, ~a B/chunk)~%"
+            +payload-stream-id+ *payload-file* *payload-chunk*))
   (finish-output)
   (cl-nostr.pool:pool-subscribe
    pool

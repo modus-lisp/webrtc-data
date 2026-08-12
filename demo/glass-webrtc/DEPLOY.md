@@ -1,7 +1,23 @@
 # Deploying the browser client
 
-**Read this before editing any client code.** Edit `index-nostr.html`. Everything else in the
-pipeline is generated from it.
+**Read this before editing any client code.**
+
+There are now **two clients in this directory**, and which one you are shipping decides everything
+else on this page:
+
+| | source | built by | how a change ships |
+|---|---|---|---|
+| **single page** (deployed today, k39) | `index-nostr.html` | `mkbundle.py` | edit → build → **publish under a new tag** → check-deploy → re-point `site-url.env` → restart the gateway → hand out a new URL |
+| **split** (built, tested, **not deployed**) | `index-shell.html` + `shell.js` + `payload.js` | `mksplit.py` | edit `payload.js` → build → `cp payload.js* ` beside the gateway → **the user reloads the same URL** |
+
+The split exists because the second row is the whole point: four publishes happened in one day
+(k36→k39) and every one of them was a change to code that only matters after the connection is up.
+See "The split client" below. Until the shell is published, **the first row is what is live** and
+this page's original instructions are the ones that apply.
+
+## The single-page client
+
+Edit `index-nostr.html`. Everything else in that pipeline is generated from it.
 
 ## One source, several generated files
 
@@ -253,6 +269,129 @@ no nsyte config — `k23` was published with this same `publish.lisp`. So kind *
 this site actually uses and it does work; do not switch formats to chase a 404. (Publishing legacy
 kind-34128 per-path events as an experiment changed nothing — they were accepted by damus/nos.lol/
 primal and the gateway still served the old build — see "If the gateway will not pick it up".)
+
+---
+
+# The split client
+
+**Status: built, tested, committed, NOT deployed.** Nothing about the running system changes until
+somebody publishes the shell and sets `PAYLOAD_CHANNEL` on the box. Both halves of that are listed
+under "Deploying the split" below.
+
+## Why
+
+Publishing **replaces** the nsite manifest, so every client change costs a new tag, a publish, a
+check-deploy, a re-pointed `site-url.env`, a gateway restart and a user reloading at a *different*
+URL. That is a heavy price for moving a button, and it was paid four times in one day.
+
+But most of the client cannot possibly need to be on nsite. Split it at the only line that is
+actually forced — **can this code arrive over the connection it is used to set up?**
+
+| | what | where | size |
+|---|---|---|---|
+| **shell** | nostr-tools, the PeerConnection and all four channels, credentials, the progress screen, the link pill, error reporting, the desktop-name display | nsite | 109 KB raw / **~36 KB** over the wire |
+| **payload** | noVNC, the trackpad, the modifier row, paste, the quality ladder, the warp panel, the debug overlay, the getStats poll | **the box, over data channel 104** | 229 KB raw / **71 KB** gzipped on the channel |
+
+Today's single page is 330 KB raw / **97 KB** over the wire (the CDN serves it brotli'd — the raw
+number is not what anyone downloads). So the shell is **37% of what nsite serves today**, and
+noVNC — 61% of the old bundle on its own — never touches nsite again.
+
+## Build
+
+```sh
+export NSITE_BUILD=/path/to/nsite-build     # needs node_modules AND a ./novnc symlink
+python3 mksplit.py
+```
+
+Four artefacts, and the self-check must read `leftover esm.sh: 0 | import-from-url: 0`:
+
+```
+nsite-shell.html    -> publish this to nsite (self-contained; the shell module is spliced in)
+payload.js          -> goes beside the gateway
+payload.js.gz       -> ditto; the gateway prefers it when the browser can inflate
+standalone.html     -> both halves in one page, no channel involved
+```
+
+`standalone.html` is the escape hatch and is worth knowing about: publishing it puts you exactly
+where the single-page client is today, **from the same sources**, with no second copy of the client
+to keep in step. It is also the way to test a payload change without a box.
+
+## Shipping a payload change
+
+This is the entire procedure, and it is the reason the split exists:
+
+```sh
+$EDITOR payload.js
+python3 mksplit.py
+cp "$NSITE_BUILD"/payload.js "$NSITE_BUILD"/payload.js.gz  <beside the gateway>
+# ...and the user reloads the SAME url.
+```
+
+**No publish, no new tag, no `site-url.env`, and no gateway restart** — the gateway re-reads the
+file when its mtime changes (`payload-bytes` in `payload-channel.lisp`). The phone asks for the
+payload by hash on every connection, sees a hash it does not have, and fetches it.
+
+## Shipping a shell change
+
+Exactly the old procedure — build with `mksplit.py`, publish `nsite-shell.html` under a new tag,
+check-deploy, re-point `site-url.env`, restart the gateway. **This is what the split is for
+avoiding**, so the question to ask first is always whether the change can be made in `payload.js`
+instead.
+
+The shell's API is **append-only**, and that is what keeps the answer to that question "yes":
+
+* `SHELL_API` (in `shell.js`) increments whenever a member is **added** to the `api` object;
+* `payload.js` exports `needs` — the lowest `SHELL_API` it can run against;
+* the shell runs the payload iff `needs <= SHELL_API`, and otherwise says so on screen and stays in
+  view-only mode rather than half-running it.
+
+So a payload built against API 1 runs on every shell that will ever exist. **Adding** to `api` is
+free — an old payload does not reach for the new member. **Removing or redefining** a member is the
+only change that forces a new shell onto nsite, and it is checkable: it is a diff of one object.
+
+## Deploying the split
+
+Both halves are needed; either one alone is a no-op:
+
+1. **Publish the shell.** `SITE_VERSION=<tag> sbcl --script publish.lisp "$NSITE_BUILD/nsite-shell.html"`,
+   then `check-deploy.lisp`, then re-point `site-url.env` at nsite.run, then restart the gateway so
+   `LOGIN_URL_BASE` picks up the new path. (All the usual traps on this page still apply.)
+2. **Put the payload on the box** and set **`PAYLOAD_CHANNEL=1`** in `gw-keepalive.sh`, plus
+   `PAYLOAD_FILE` if it is not `payload.js` beside the gateway. Restart the gateway.
+
+Order does not matter, and neither step breaks the other's absence:
+
+* shell published, box without `PAYLOAD_CHANNEL` → the box answers `none`, and the phone shows the
+  desktop **view-only** with "This desktop is not serving the client" and a Retry button;
+* box serving, phones still on the old single page → nothing ever sends on stream 104, so the
+  channel is byte-for-byte absent.
+
+## The one real cost: there are now two copies of the client
+
+`payload.js` was lifted out of `index-nostr.html` and carries the same gesture layer, modifier row,
+quality ladder and warp panel — so **a fix applied to one does not reach the other**, which is
+exactly the complaint this file already makes about `index.html` and `index-ws.html`.
+
+That is tolerable only because it is meant to be temporary. **Once the shell is deployed and has
+run for a while, delete `index-nostr.html` and `mkbundle.py`**: `standalone.html` is the same page,
+built from the split sources, so nothing is lost by retiring the monolith. Until then, a change that
+matters to both has to be made in both, and the `.gbtn`/`#mods`/`#warpPanel` CSS lives in
+`payload.js` on one side and in `index-nostr.html`'s `<style>` on the other.
+
+## Tests
+
+```sh
+sbcl --dynamic-space-size 2048 --non-interactive --load payload-channel-test.lisp
+```
+
+40 assertions over the gateway side — the stream-id gate, the file read and hash, the cache answer,
+the chunking, the duplicate-hello guard, the close — plus the five added lines in
+`gateway-nostr.lisp` checked against its **text**. It does not start a gateway and writes only to
+`/tmp`, for the reasons in `warp-channel-test.lisp`'s header.
+
+The browser half (a real data channel, the blob import under the real nsite CSP, the seam, the
+cache, the fallback, the version contract) is a Playwright harness that was run out of tree; see
+the report in the commit message for what it covered.
 
 ## Recommendation
 
