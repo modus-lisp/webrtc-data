@@ -17,7 +17,8 @@
 # Requires: sbcl, python3+aiortc, iproute2, iptables, a userns-capable kernel.
 set -u
 RIG="$(cd "$(dirname "$0")" && pwd)"
-: "${CL_SOURCE_REGISTRY:=(:source-registry (:tree \"/home/claude\") :inherit-configuration)}"
+WS="$(cd "$RIG/../../.." && pwd)"          # the workspace holding the sibling repos
+: "${CL_SOURCE_REGISTRY:=(:source-registry (:tree \"$WS\") :inherit-configuration)}"
 export CL_SOURCE_REGISTRY
 export RIG
 SHARE="$(mktemp -d /tmp/nat-rig.XXXXXX)"

@@ -7,7 +7,8 @@
 #   srflx-only — answerer advertises NO relay candidate  -> expect NO CONNECT (nothing to pair)
 set -u
 RIG="$(cd "$(dirname "$0")" && pwd)"
-: "${CL_SOURCE_REGISTRY:=(:source-registry (:tree \"/home/claude\") :inherit-configuration)}"
+WS="$(cd "$RIG/../../.." && pwd)"          # the workspace holding the sibling repos
+: "${CL_SOURCE_REGISTRY:=(:source-registry (:tree \"$WS\") :inherit-configuration)}"
 export CL_SOURCE_REGISTRY
 DIR=$(mktemp -d /tmp/turn-int.XXXXXX)
 export TURN_DIR="$DIR/"
