@@ -298,7 +298,28 @@ silently drop CODE.)"
 ;; loaded, no projection is built and no thread is started, and WARP-SID-P answers NIL from a
 ;; single comparison — so the one branch it adds to the session dispatch below cannot be taken.
 ;; See warp-channel.lisp's header for the whole of the argument.
-(load (merge-pathnames "warp-channel.lisp" (or *load-pathname* *default-pathname-defaults*)))
+;;
+;; GUARDED, unlike the VIDEO-PROFILES load above it, and for a reason that is about the
+;; supervisor rather than about this feature: gw-keepalive.sh respawns the gateway on exit, so
+;; an unguarded failure here is not a missing terminal list — it is a crashloop, with no remote
+;; desktop at all, until somebody reaches a shell.  A feature nobody has used yet does not get
+;; to take the desktop down with it.
+;;
+;; The fallbacks keep the four names the session dispatch calls, and keep stream 102 CLAIMED.
+;; Dropping a frame the phone sends is correct; letting 102 fall through to the RFB branch would
+;; hand glass a JSON blob as desktop input (0x7B is not an RFB message type).  The literal 102 is
+;; deliberate — +WARP-STREAM-ID+ is exactly what we may not have.
+(handler-case
+    (load (merge-pathnames "warp-channel.lisp" (or *load-pathname* *default-pathname-defaults*)))
+  (error (e)
+    (format *error-output* "~&@@ warp: channel unavailable (~a) — serving without it~%" e)
+    (finish-output *error-output*)
+    (defparameter *warp-channel-enabled* nil)
+    (defun warp-sid-p (sid) (eql sid 102))
+    (defun warp-on-message (state assoc sid payload pub)
+      (declare (ignore assoc sid payload pub))
+      state)
+    (defun warp-close (state) (declare (ignore state)) nil)))
 
 ;;; ---- one live session per terminal ------------------------------------------
 ;; A phone never says goodbye.  It locks its screen, changes network, or just reloads the page and
