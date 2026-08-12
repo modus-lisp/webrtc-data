@@ -31,10 +31,32 @@
   (let ((e (uiop:getenv "NOSTR_RELAYS")))
     (if e (remove "" (uiop:split-string e :separator ",") :test #'string=)
         '("wss://relay.damus.io" "wss://nos.lol" "wss://relay.primal.net"))))
-;; A fixed secret so the box's npub is stable (bake it into the page). NOSTR_SEC overrides.
+;; The box's identity.  REQUIRED — there is deliberately no fallback.
+;;
+;; There used to be one: "a fixed secret so the box's npub is stable (bake it into the page),
+;; NOSTR_SEC overrides".  A dev convenience meant to be overridden, which never was — so this
+;; gateway ran for months on a secret committed to a PUBLIC repo.  That is not merely an identity
+;; leak, because the same secret is the HMAC key for login tokens (login-token.lisp): anyone who
+;; read the repo could mint a code, and a valid code authorises INDEPENDENTLY of the allowlist and
+;; then enrols the caller as a device for 24h.  Full desktop access, from a git clone.
+;;
+;; So it refuses, the way publish.lisp already refuses without a site key.  Note the consequence
+;; and accept it: gw-keepalive.sh respawns on exit, so a missing NOSTR_SEC is a restart loop that
+;; prints this message every three seconds.  That is the correct failure — a box with no identity
+;; of its own must not serve, and a loud loop is easier to diagnose than a gateway quietly running
+;; as somebody else.
 (defparameter *box-secret*
-  (or (uiop:getenv "NOSTR_SEC")
-      "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b"))
+  (let ((s (uiop:getenv "NOSTR_SEC")))
+    (unless (and s (= (length s) 64) (every (lambda (c) (digit-char-p c 16)) s))
+      (format *error-output*
+              "~&@@ FATAL: NOSTR_SEC unset or not 64 hex chars.~@
+                 @@ This box has no identity of its own and will not serve.~@
+                 @@   openssl rand -hex 32   -> export NOSTR_SEC=... in gw-keepalive.sh~@
+                 @@ Rotating it changes the box npub: every issued login link and every enrolled~@
+                 @@ device is invalidated, and the client's baked fallback pubkey needs updating.~%")
+      (finish-output *error-output*)
+      (sb-ext:exit :code 2))
+    s))
 
 ;; ---- pubkey auth: only these clients may open the desktop --------------------
 ;; NOSTR_ALLOW is a comma-separated list of authorized client pubkeys (npub or 64-hex).

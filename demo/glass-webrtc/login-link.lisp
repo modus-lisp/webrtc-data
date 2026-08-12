@@ -19,9 +19,20 @@
 (defpackage #:login-link-cli (:use #:cl))
 (in-package #:login-link-cli)
 
+;; REQUIRED, and for a sharper reason here than in the gateway: this script MINTS credentials.
+;; With the old committed fallback it would cheerfully issue a link signed by a secret anyone can
+;; read — a link that looks exactly like a real one and admits anybody who copies it.  A minter
+;; with no key must fail, never improvise.  See gateway-nostr.lisp's note.
 (defparameter *box-secret*
-  (or (uiop:getenv "NOSTR_SEC")
-      "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b"))
+  (let ((s (uiop:getenv "NOSTR_SEC")))
+    (unless (and s (= (length s) 64) (every (lambda (c) (digit-char-p c 16)) s))
+      (format *error-output*
+              "~&login-link: NOSTR_SEC unset or not 64 hex chars — refusing to mint a link.~@
+                 ~&  Use the same secret the gateway runs on (gw-keepalive.sh), or the code will~@
+                 ~&  not verify:  NOSTR_SEC=$(...) sbcl --script login-link.lisp <npub|email>~%")
+      (finish-output *error-output*)
+      (sb-ext:exit :code 2))
+    s))
 (defparameter *site*
   (or (uiop:getenv "NSITE_NPUB")
       "npub1ajvjnhgcmdxkng22lzsh22qvl63es78gk6p9mwksepju974teguq4l4evc"))

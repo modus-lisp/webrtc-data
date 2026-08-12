@@ -2021,8 +2021,13 @@ if (typeof window !== "undefined") window.makeWarpClient = makeWarpClient;
     };
     const urlBox = hp.get('box') || params.get('box') || '';
     if (urlBox) storeBox(urlBox);                                // arrived with a link: remember it
+    // Last resort only: a link's #box wins, then what a previous link stored.  This is reached by
+    // a fresh browser opening a bare URL, which cannot authenticate anyway — it exists so that
+    // case fails at the door rather than with "no box configured".
+    // ROTATION SITE: this is derived from the gateway's NOSTR_SEC.  Rotate that and this is stale,
+    // and a fresh browser silently dials a box that no longer exists.  Rotated 2026-08-12.
     const boxArg = urlBox || loadBox() ||
-      '75427ab8309aad26beea8142edf427674e4544604ae4dc5045108ad21fc8a0db';   // dev fallback
+      '804f867fba14b70a9a84542a982a79d3775356a3d105e03af4bf4fd6ed7cfb55';
     // ---- credential handling --------------------------------------------------------------
     // The token is  nonce.exp.mac  with exp a unix time, so the browser can judge its own
     // credential without asking anyone: an expired link is reported as expired instead of
