@@ -29,8 +29,44 @@
 
 (in-package #:webrtc-data)
 
-(defparameter *glass-host* (or (uiop:getenv "GLASS_HOST") "127.0.0.1"))
+(defparameter *glass-host* (or (uiop:getenv "GLASS_HOST") "127.0.0.1")
+  "Where the desktop is, in either form.
+
+A hostname beside GLASS_PORT — `127.0.0.1', which is what it has always been and still is by
+default — or a SOCKET FILE: `unix:/home/claude/.glass/run/seat-0.rfb', or a bare absolute path.
+
+The second form is worth having because 127.0.0.1 IS NOT A BOUNDARY: every process of every uid
+on the box can open a loopback port, so `the gateway and the desktop are both on this machine'
+was the whole of the access control on the screen, the mix, the microphone and admission.  A
+socket file at mode 0600 is owner-only, decided by the kernel on connect(), and the desktop can
+additionally ask WHO connected (SO_PEERCRED) — which is this gateway, by pid, with no key
+material anywhere.  Nothing in glass or here changes what a TCP configuration does.")
 (defparameter *glass-port* (or (ignore-errors (parse-integer (uiop:getenv "GLASS_PORT"))) 5900))
+
+(defparameter *glass-path*
+  (multiple-value-bind (kind host port path) (glass:parse-endpoint *glass-host* *glass-port*)
+    (declare (ignore host port))
+    (and (eq kind :unix) path))
+  "The desktop's RFB SOCKET FILE, or NIL when GLASS_HOST names a port.")
+
+(defun glass-endpoint (env type port)
+  "Where one of the desktop's other three sockets is, as a HOST for GLASS:OPEN-CONNECTION.
+
+ENV (GLASS_AUDIO_HOST and friends) wins if it is set — an operator who has put the sockets
+somewhere unusual must be able to say so.  Otherwise it FOLLOWS THE SCREEN, which is what it has
+always done and the only thing that keeps four endpoints from drifting apart in two files:
+
+  a port -> the same host, PORT beside it        (5903 -> 5913 / 5914 / 5915, unchanged)
+  a path -> the name beside it in the same directory  (seat-0.rfb -> seat-0.audio / .mic / .admit)
+
+GLASS:SOCKET-SIBLING is that second derivation, and it lives in glass rather than here for the
+reason both ends of glass-audio/1 already do: a convention with a copy on each side of the wire
+is a convention that drifts."
+  (declare (ignorable port))
+  (let ((e (uiop:getenv env)))
+    (cond ((and e (plusp (length e))) e)
+          (*glass-path* (format nil "unix:~a" (glass:socket-sibling *glass-path* type)))
+          (t *glass-host*))))
 (defparameter *relays*
   (let ((e (uiop:getenv "NOSTR_RELAYS")))
     (if e (remove "" (uiop:split-string e :separator ",") :test #'string=)
@@ -141,6 +177,10 @@
                                    5915)
   "Where the desktop answers admission questions.  Beside the screen by the same convention the
 audio ports follow: 5903 -> 5913 mix out, 5914 microphone in, 5915 who may open any of it.")
+(defparameter *admission-host* (glass-endpoint "GLASS_ADMISSION_HOST" "admit" *admission-port*)
+  "...and on which host, or in which socket file.  A socket file is worth most HERE: this is the
+question `may this person open the desktop', and on a loopback port the qualification to ask it —
+including to ask it as somebody else — was a process on this machine.")
 
 ;; Live pipeline stats, written as data rather than only logged, so a UI can present them instead of
 ;; a human grepping the log.  Same file-as-source-of-truth arrangement as the device store: any
@@ -170,17 +210,19 @@ audio ports follow: 5903 -> 5913 mix out, 5914 microphone in, 5915 who may open 
 FAILS CLOSED.  A service that cannot be reached refuses the offer and says so loudly, naming the
 port, because a silent refusal here would be diagnosed for an hour in the wrong process."
   (multiple-value-bind (via token plist)
-      (glass:admission-admit pubkey code :host *glass-host* :port *admission-port*)
+      (glass:admission-admit pubkey code :host *admission-host* :port *admission-port*)
     (let ((n (and plist (ignore-errors (parse-integer (getf plist :devices))))))
       (when n (setf *devices-known* n)))
     (when (eq token :unreachable)
       (incf *admission-refusals*)
-      (setf *last-error* (format nil "admission service ~a:~a unreachable" *glass-host* *admission-port*))
-      (format t "~&@@ ADMISSION UNREACHABLE at ~a:~a — refusing ~a... (FAIL CLOSED).~@
+      (setf *last-error* (format nil "admission service ~a unreachable"
+                                (glass:endpoint-string :host *admission-host* :port *admission-port*)))
+      (format t "~&@@ ADMISSION UNREACHABLE at ~a — refusing ~a... (FAIL CLOSED).~@
                  @@   The desktop owns the enrolment store; this gateway keeps no copy on purpose.~@
                  @@   Start it there:  (glass:start-session-nostr)  — or load :glass/nostr in the~@
                  @@   desktop launcher.  Nothing this peer wants (screen, audio, mic) is up either.~%"
-              *glass-host* *admission-port* (subseq pubkey 0 8))
+              (glass:endpoint-string :host *admission-host* :port *admission-port*)
+              (subseq pubkey 0 8))
       (finish-output))
     (values via (and (stringp token) token))))
 
@@ -194,10 +236,10 @@ silently drop CODE.)"
         (values payload nil))))
 
 (defun glass-connect ()
-  (let ((s (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
-    (sb-bsd-sockets:socket-connect s (sb-bsd-sockets:make-inet-address *glass-host*) *glass-port*)
-    (setf (sb-bsd-sockets:sockopt-tcp-nodelay s) t)      ; no Nagle on the tiny FBUR/input path
-    s))
+  ;; GLASS:OPEN-CONNECTION takes the endpoint in either form and sets TCP_NODELAY where there is
+  ;; a Nagle to disable (there is none on a socket file, and it ignores the ENOPROTOOPT).  No
+  ;; Nagle on the tiny FBUR/input path is the same reason it always was.
+  (values (glass:open-connection :host *glass-host* :port *glass-port*)))
 
 (defvar *last-assoc* nil)
 
@@ -347,6 +389,8 @@ ALIVE-P sees the agent stopped and unwinds, which is what releases the TURN allo
 (defparameter *audio-port*
   (or (ignore-errors (parse-integer (uiop:getenv "GLASS_AUDIO_PORT"))) 5913)
   "Where the glass desktop serves its mix.  Beside the VNC port by convention (5903 -> 5913).")
+(defparameter *audio-host* (glass-endpoint "GLASS_AUDIO_HOST" "audio" *audio-port*)
+  "...and on which host, or in which socket file — see GLASS-ENDPOINT.")
 (defparameter *mic-port*
   (or (ignore-errors (parse-integer (uiop:getenv "GLASS_MIC_PORT"))) 5914)
   "Where the glass desktop takes a peer's MICROPHONE — the other direction, one port past the mix.
@@ -356,6 +400,8 @@ until now it was measured for a level meter and dropped on the floor.  It goes t
 the same reason the mix comes FROM the desktop: what would listen to it — the ear, an application,
 anything — lives in the image the desktop's applications live in, and a microphone consumed in
 here could only ever be heard by this gateway.")
+(defparameter *mic-host* (glass-endpoint "GLASS_MIC_HOST" "mic" *mic-port*)
+  "...and on which host, or in which socket file — see GLASS-ENDPOINT.")
 
 (defparameter *audio-gain*
   (or (ignore-errors (let ((e (uiop:getenv "AUDIO_GAIN"))) (and e (float (read-from-string e) 1d0))))
@@ -393,7 +439,7 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                ;; gets preempted, and 40 ms of cushion is cheaper than a gap every time it does.
                (setf tap (ignore-errors
                           (glass:make-audio-tap
-                           :host *glass-host* :port *audio-port*
+                           :host *audio-host* :port *audio-port*
                            :name (if pub (subseq pub 0 8) "peer")
                            :rate 8000 :frame-samples 160 :prime 2 :gain *audio-gain*
                            :log (lambda (m) (format *error-output* "~&[audio] ~a~%" m)))))
@@ -406,7 +452,7 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                ;; about, and a port with nobody behind it is exactly the silence case above.
                (setf mic (ignore-errors
                           (glass:make-mic-sender
-                           :host *glass-host* :port *mic-port*
+                           :host *mic-host* :port *mic-port*
                            :name (if pub (subseq pub 0 8) "peer")
                            :rate 8000 :frame-samples 160
                            :log (lambda (m) (format *error-output* "~&[mic] ~a~%" m)))))
@@ -426,9 +472,11 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                  (setf audio-stop astop)
                  (format *error-output* "~&[gw-nostr] audio started — ~a -> browser, browser mic -> ~a~%"
                          (if tap
-                             (format nil "desktop mix from ~a:~d @8k" *glass-host* *audio-port*)
+                             (format nil "desktop mix from ~a @8k"
+                                     (glass:endpoint-string :host *audio-host* :port *audio-port*))
                              "NO TAP (silence)")
-                         (if mic (format nil "~a:~d" *glass-host* *mic-port*) "NOWHERE (dropped)"))
+                         (if mic (glass:endpoint-string :host *mic-host* :port *mic-port*)
+                             "NOWHERE (dropped)"))
                  ;; video: our from-scratch VP8 keyframes, over the same SRTP keys (own SSRC)
                  (when (and ctx *video-pt*)
                    (when *video-primary*
@@ -457,7 +505,8 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                                                :no-relay *no-relay-count*
                                                :last-error *last-error*
                                                :devices *devices-known*
-                                               :glass (list :host *glass-host* :port *glass-port*)
+                                               :glass (list :host *glass-host* :port *glass-port*
+                                                            :path *glass-path*)
                                                :qi-base *video-qi* :target-kbs *video-target-kbs*)))
                             :log (lambda (m)
                                    (let ((cs (and cap (capture-stats cap))))
@@ -475,8 +524,8 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                 (lambda (assoc sid)
                   (setf glass (glass-connect) *last-assoc* assoc)
                   (incf *sessions-ok*)
-                  (format *error-output* "~&[gw-nostr] channel open -> glass ~a:~a~%"
-                          *glass-host* *glass-port*)
+                  (format *error-output* "~&[gw-nostr] channel open -> glass ~a~%"
+                          (glass:endpoint-string :host *glass-host* :port *glass-port*))
                   ;; glass -> browser: one message per read (SCTP fragments it)
                   (bt:make-thread
                    (lambda ()
@@ -688,7 +737,8 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
        (box-pub (cl-nostr.keys:public-hex kp))
        (box-npub (ignore-errors (cl-nostr.bech32:npub-encode (cl-nostr.keys:public-key-of-secret *box-secret*))))
        (pool    (cl-nostr.pool:make-pool *relays*)))
-  (format t "~&@@ nostr gateway  (glass ~a:~a)~%" *glass-host* *glass-port*)
+  (format t "~&@@ nostr gateway  (glass ~a)~%"
+          (glass:endpoint-string :host *glass-host* :port *glass-port*))
   (format t "@@ box npub:   ~a~%" (or box-npub "(npub encode failed; use hex)"))
   (format t "@@ box pubkey: ~a~%" box-pub)
   (when box-npub
@@ -701,11 +751,12 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
   ;; a gateway that refuses every offer for an hour without ever having said the service was down
   ;; is the failure mode that makes fail-closed a bad idea.  It is a report, not a gate: the
   ;; gateway starts either way, and the desktop may simply not be up yet.
-  (let ((posture (glass:admission-ping :host *glass-host* :port *admission-port*)))
+  (let ((posture (glass:admission-ping :host *admission-host* :port *admission-port*)))
     (if posture
         (progn
-          (format t "@@ admission:  ~a:~a — ~a enrolled, ~a allowed, device ttl ~ah~%"
-                  *glass-host* *admission-port* (getf posture :devices) (getf posture :allow)
+          (format t "@@ admission:  ~a — ~a enrolled, ~a allowed, device ttl ~ah~%"
+                  (glass:endpoint-string :host *admission-host* :port *admission-port*)
+                  (getf posture :devices) (getf posture :allow)
                   (round (or (ignore-errors (parse-integer (getf posture :ttl))) 86400) 3600))
           (setf *devices-known* (or (ignore-errors (parse-integer (getf posture :devices))) 0))
           (unless (equal (string-downcase (getf posture :box)) (string-downcase box-pub))
@@ -717,10 +768,10 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                        @@            SHARED by design; these disagreeing means one of the two~%~
                        @@            launchers has a different NOSTR_SEC.~%"
                     (subseq (or (getf posture :box) "?") 0 12) (subseq box-pub 0 12))))
-        (format t "@@ admission:  ~a:~a NOT ANSWERING — every offer will be REFUSED until it is.~%~
+        (format t "@@ admission:  ~a NOT ANSWERING — every offer will be REFUSED until it is.~%~
                    @@            The desktop owns the enrolment store (:glass/nostr); this~%~
                    @@            gateway keeps no copy.  Nothing a peer wants is up either.~%"
-                *glass-host* *admission-port*))
+                (glass:endpoint-string :host *admission-host* :port *admission-port*)))
     (finish-output))
   (format t "@@ relays:     ~a~%" *relays*)
   (format t "@@ login-link: sbcl --script login-link.lisp <npub|email> [ttl]  (DMs a code)~%")

@@ -34,11 +34,17 @@
 (defconstant +rfb-last-rect+ -224)                            ; "no more rects in this update"
 
 (defun capture-connect (host port)
-  "RFB handshake with glass; returns a CAPTURE with allocated planes (native 32bpp, Raw)."
-  (let* ((sock (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
-    (sb-bsd-sockets:socket-connect sock (sb-bsd-sockets:make-inet-address host) port)
-    (let ((s (sb-bsd-sockets:socket-make-stream sock :input t :output t
-                                                :element-type '(unsigned-byte 8))))
+  "RFB handshake with glass; returns a CAPTURE with allocated planes (native 32bpp, Raw).
+
+HOST is the endpoint in either form — a hostname beside PORT, or `unix:/…/seat-0.rfb' for a
+socket file.  This is the SECOND RFB client this gateway opens onto the desktop (the browser's
+bridged connection is the other), and it is the one that has to keep working when the desktop
+stops being reachable over a port: the capture feeds the only picture the viewer has."
+  (multiple-value-bind (sock s) (glass:open-connection :host host :port port)
+    ;; The CAPTURE keeps the stream; the socket object is the stream's, and closing the stream
+    ;; is what %CAPTURE-RECONNECT has always done.
+    (declare (ignorable sock))
+    (progn
       (%rd s 12)                                            ; ProtocolVersion
       (write-sequence (map '(vector (unsigned-byte 8)) #'char-code "RFB 003.008
 ") s)

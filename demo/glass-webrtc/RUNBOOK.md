@@ -145,7 +145,7 @@ of one. The client half returns `:UNREACHABLE` distinctly, and that distinction 
 failing closed is safe rather than indistinguishable from denying everybody.
 
 Loopback and unauthenticated on it — the same trust boundary the desktop's `:4013` eval socket
-already draws.
+already draws, and see §10 for why that boundary is thinner than it reads.
 
 ### The login link
 
@@ -518,3 +518,93 @@ which is seconds before noVNC exists in a split client. Unhandled, those bytes a
 handshake deadlocks: video plays, the control channel answers, and there is no keyboard, no mouse
 and no desktop name. The shell buffers early RFB messages and the payload replays them into noVNC
 (`takeEarlyRfb`). This was found by the end-to-end test, not by reading.
+
+## 10. Sockets that are files — closing the loopback hole
+
+`127.0.0.1` is not an access boundary. **Every process of every uid on the box can connect to a
+loopback port**, so "the gateway and the desktop are both on this machine" was the whole of the
+protection on five sockets: the screen (`:5903`), the mix (`:5913`), the microphone (`:5914`),
+admission (`:5915`) — and `:4013`, which is an unauthenticated `READ` + `EVAL`.
+
+glass can now carry all five on **UNIX-domain sockets** instead, as a sibling transport and not a
+replacement (`GLASS:OPEN-LISTENER`, `CLIM-GLASS:OPEN-SEAT-TRANSPORT :KIND :RFB-UNIX`). What that
+buys, all of it enforced by the kernel rather than intended by us:
+
+* the socket is a **file**: `connect(2)` needs write permission on it, so mode `0600` in a `0700`
+  directory is owner-only. A wrong uid gets `EACCES` at the syscall.
+* **`SO_PEERCRED`**: the desktop can ask who connected — uid, gid and **pid**, filled in by the
+  kernel and unforgeable by the peer. `[audio] uid=1001 pid=2486993` instead of `peer`. That is
+  peer authentication with no key material anywhere near it.
+* no port to bind, scan, or expose by editing an address.
+
+**Nothing is switched on by default.** TCP is unchanged and is still what every launcher does.
+Moving over is a deployment decision, and it is these two diffs.
+
+### The gateway: one line of `gw-keepalive.sh`
+
+```diff
+-export NOSTR_ALLOW='ynniv@ynniv.com' GLASS_HOST=127.0.0.1 GLASS_PORT=5903 GATHER_SRFLX=1 ICE_LOCAL_IP=192.168.5.22
++export NOSTR_ALLOW='ynniv@ynniv.com' GLASS_HOST=unix:/home/claude/.glass/run/seat-0.rfb GATHER_SRFLX=1 ICE_LOCAL_IP=192.168.5.22
+```
+
+That is the whole of it. `GLASS_PORT`, `GLASS_AUDIO_PORT` and `GLASS_ADMISSION_PORT` become
+inert but harmless, and the other three endpoints **follow the screen**, exactly as the ports did:
+`GLASS-ENDPOINT` derives `seat-0.audio`, `seat-0.mic` and `seat-0.admit` beside it with
+`GLASS:SOCKET-SIBLING` — the socket-file reading of `5903 -> 5913 / 5914 / 5915`. Override any one
+of them with `GLASS_AUDIO_HOST` / `GLASS_MIC_HOST` / `GLASS_ADMISSION_HOST` if they are not where
+the convention says.
+
+### The desktop: four `:path` arguments in `warren/desktop-5903.lisp`
+
+```diff
+-      (addr "127.0.0.1"))
+-  (start-control-socket 4013)
++      (addr "127.0.0.1")
++      (rfb (glass:socket-path "seat-0.rfb")))
++  (start-control-socket 4013 rfb)
+@@
+-        (funcall start :port 5913 :address "127.0.0.1" :file nil)
++        (funcall start :path (glass:socket-sibling rfb "audio") :file nil)
+@@
+-        (funcall start :port 5914 :address "127.0.0.1")
++        (funcall start :path (glass:socket-sibling rfb "mic"))
+@@
+-        (funcall start :port 5915 :address "127.0.0.1")
++        (funcall start :path (glass:socket-sibling rfb "admit"))
+@@
+   (clim-glass:run-wm '((:terminal :cols 80 :rows 24 :ppem 14))
+                      :port 5903 :width 1280 :height 800
+-                     :address addr
++                     :kind :rfb-unix :path rfb
+                      :background wp :background-mode :cover))
+```
+
+...and `START-CONTROL-SOCKET` — the `EVAL` one, and the one that most wants this — becomes:
+
+```diff
+-(defun start-control-socket (&optional (port 4013))
++(defun start-control-socket (&optional (port 4013) rfb-path)
+   (sb-thread:make-thread
+    (lambda ()
+-     (let ((listen (glass:tcp-listen port :address "127.0.0.1")))
++     (let ((listen (if rfb-path
++                       (glass:open-listener :unix :path (glass:socket-sibling rfb-path "control"))
++                       (glass:tcp-listen port :address "127.0.0.1"))))
+        (loop
+          (handler-case
+-             (let ((s (sb-bsd-sockets:socket-make-stream
+-                       (sb-bsd-sockets:socket-accept listen)
+-                       :input t :output t :element-type 'character :buffering :full)))
++             (let ((s (glass:accept-stream listen :element-type 'character)))
+```
+
+`GLASS:*PEER-POLICY*` then refuses any peer that is not this uid (or root) **before** the `READ`,
+which is checked in `glass/inspect/unix-socket-gate.lisp`. Reaching it by hand becomes
+`nc -U ~/.glass/run/seat-0.control` in place of `nc 127.0.0.1 4013`.
+
+### Checking it
+
+`demo/glass-webrtc/unix-socket-test.lisp` stands a fake desktop up under `/tmp` on four socket
+files and drives the gateway's four clients at it — the RFB bridge, `CAPTURE-CONNECT`, the audio
+tap, the mic sender — plus admission, and the endpoint derivation read out of `gateway-nostr.lisp`
+itself. It never starts a gateway: loading that file would put a second one on the live npub.

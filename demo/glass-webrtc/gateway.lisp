@@ -15,6 +15,11 @@
 #+sbcl (setf (sb-ext:bytes-consed-between-gcs) (* 256 1024 1024))
 (handler-bind ((warning #'muffle-warning))
   (asdf:load-system "webrtc-data")
+  ;; glass, for GLASS:OPEN-CONNECTION alone: the desktop can be a port or a SOCKET FILE, and the
+  ;; endpoint syntax that says which lives in glass so that both ends of it cannot drift.  It
+  ;; starts nothing and listens on nothing — see gateway-nostr.lisp, which loads it for the
+  ;; audio, microphone and admission halves as well.
+  (asdf:load-system "glass")
   (ql:quickload '(:hunchentoot) :silent t))
 
 (in-package #:webrtc-data)
@@ -27,17 +32,19 @@
 (defparameter *index* (uiop:read-file-string (merge-pathnames "index.html" *dir*)))
 (defparameter *port*       (or (ignore-errors (parse-integer (uiop:getenv "GW_PORT"))) 8765))
 (defparameter *epoch* (get-internal-real-time))   ; series time origin (ms since load)
-(defparameter *glass-host* (or (uiop:getenv "GLASS_HOST") "127.0.0.1"))
+(defparameter *glass-host* (or (uiop:getenv "GLASS_HOST") "127.0.0.1")
+  "Where the desktop is: a hostname beside GLASS_PORT (the default, unchanged), or a SOCKET FILE
+   — `unix:/home/claude/.glass/run/seat-0.rfb', or a bare absolute path.  127.0.0.1 is not a
+   boundary: every process of every uid on the box can open a loopback port.  A socket file at
+   mode 0600 is owner-only and the kernel enforces it.")
 (defparameter *glass-port* (or (ignore-errors (parse-integer (uiop:getenv "GLASS_PORT"))) 5900))
 
 (defun glass-connect ()
-  (let ((s (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
-    (sb-bsd-sockets:socket-connect s (sb-bsd-sockets:make-inet-address *glass-host*) *glass-port*)
-    ;; no Nagle: we forward tiny RFB messages (FramebufferUpdateRequests, key/pointer events)
-    ;; toward glass — Nagle would batch them and add ~40ms of interactive latency per round trip.
-    ;; glass sets TCP_NODELAY on its accept socket; we set it on our end of the same connection.
-    (setf (sb-bsd-sockets:sockopt-tcp-nodelay s) t)
-    s))
+  ;; no Nagle: we forward tiny RFB messages (FramebufferUpdateRequests, key/pointer events)
+  ;; toward glass — Nagle would batch them and add ~40ms of interactive latency per round trip.
+  ;; glass sets TCP_NODELAY on its accept socket; we set it on our end of the same connection.
+  ;; (On a socket file there is no Nagle to disable, and OPEN-CONNECTION ignores the refusal.)
+  (values (glass:open-connection :host *glass-host* :port *glass-port*)))
 
 (defvar *last-assoc* nil)   ; most recent SCTP association, for the /stats endpoint
 
@@ -53,8 +60,8 @@
                :on-ready
                (lambda (assoc sid)
                  (setf glass (glass-connect) *last-assoc* assoc)
-                 (format *error-output* "~&[gw] channel open (stream ~a) -> glass ~a:~a~%"
-                         sid *glass-host* *glass-port*)
+                 (format *error-output* "~&[gw] channel open (stream ~a) -> glass ~a~%"
+                         sid (glass:endpoint-string :host *glass-host* :port *glass-port*))
                  ;; glass -> browser: read RFB, send each read as ONE message — SCTP now
                  ;; fragments it internally and the peer reassembles, so noVNC sees one
                  ;; onmessage per read instead of one per 1KB (far fewer data-channel events)
@@ -163,7 +170,7 @@
 
 (defvar *acceptor*
   (hunchentoot:start (make-instance 'hunchentoot:easy-acceptor :port *port* :address "0.0.0.0")))
-(format t "~&@@ gateway on http://0.0.0.0:~a  (glass ~a:~a, noVNC ~a)~%"
-        *port* *glass-host* *glass-port* *novnc*)
+(format t "~&@@ gateway on http://0.0.0.0:~a  (glass ~a, noVNC ~a)~%"
+        *port* (glass:endpoint-string :host *glass-host* :port *glass-port*) *novnc*)
 (finish-output)
 (loop (sleep 5))
