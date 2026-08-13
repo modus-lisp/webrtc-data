@@ -29,7 +29,12 @@
 (load (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))
 (handler-bind ((warning #'muffle-warning))
   (let ((*standard-output* (make-broadcast-stream)))
-    (asdf:load-system "webrtc-data")))
+    (asdf:load-system "webrtc-data")
+    ;; The enrolment store is the DESKTOP's now, so this harness starts a real one: a glass
+    ;; admission service on a loopback port, over a /tmp fixture.  That is not a stub — it is the
+    ;; same code and the same socket protocol the gateway uses in production, and the panel's
+    ;; query, invoker and revoke all go through it here exactly as they do there.
+    (asdf:load-system "glass/nostr")))
 
 (in-package #:webrtc-data)
 
@@ -57,19 +62,30 @@ read, evaluated, or so much as looked at."
     (eval (read-from-string source t nil :start at))
     name))
 
-(format t "~&== the gateway's own device store and allowlist predicate, lifted by name ==~%")
-(dolist (v '("*device-ttl*" "*devices*" "*devices-lock*" "*devices-mtime*"))
-  (lift (if (string= v "*device-ttl*") "defparameter" "defvar") v))
-(dolist (f '("%unix-now" "authorized-p" "load-devices" "save-devices" "sync-devices"
-             "device-enrolled-p" "enrol-device"))
-  (lift "defun" f))
+(format t "~&== the gateway's own names for the desktop, lifted out of its source ==~%")
+;; What warp-channel.lisp needs from the gateway is no longer a store — it is WHERE THE DESKTOP IS.
+;; Lifted rather than transcribed for the same reason AUTHORIZED-P used to be: the harness must
+;; break if the gateway renames or re-defaults them, instead of quietly agreeing with itself.
+(dolist (f '("%unix-now")) (lift "defun" f))
+(dolist (v '("*glass-host*" "*admission-port*")) (lift "defparameter" v))
 ;; and the control channel's id, from the file that owns it, so "these two do not collide" is a
 ;; claim about the shipped constants rather than about two numbers written down in a test
 (lift "defconstant" "+control-stream-id+" *profiles-source*)
 (lift "defun" "control-sid-p" *profiles-source*)
-(ok "AUTHORIZED-P is the gateway's, lifted out of its source" (fboundp 'authorized-p))
-(ok "and so is the device store it reads" (and (fboundp 'sync-devices) (boundp '*devices*)))
+(ok "the gateway names its desktop's admission port, and the default is the convention"
+    (and (boundp '*admission-port*) (= 5915 *admission-port*)))
+(ok "...one past the microphone's 5914, which is one past the mix's 5913, which is a decade past
+        the screen's 5903 — arithmetic, not four numbers typed into a startup script"
+    (= *admission-port* (glass:seat-admission-port 5903)))
 (ok "and the control channel's stream id, from video-profiles.lisp" (= 100 +control-stream-id+))
+(ok "THE GATEWAY NO LONGER HAS A DEVICE STORE OR AN ALLOWLIST OF ITS OWN.
+        That is the claim the whole move rests on: one store, one writer, in the process that
+        stays up.  A second copy here would be a second writer to a file synced by mtime"
+    (and (null (search "(defvar *devices*" *gateway-source*))
+         (null (search "(defun authorized-p" *gateway-source*))
+         (null (search "(defun sync-devices" *gateway-source*))
+         (null (search "(defun enrol-device" *gateway-source*))
+         (null (search "(defparameter *device-file*" *gateway-source*))))
 
 ;;; ---- a fixture, in /tmp, and never anywhere else ----------------------------------------
 ;;; REVOKE-TERMINAL genuinely rewrites whatever the device file names.  A suite that pointed at the
@@ -79,7 +95,16 @@ read, evaluated, or so much as looked at."
 (defparameter *owner-npub* "1111111111111111111111111111111111111111111111111111111111111111")
 (defparameter *guest-npub* "2222222222222222222222222222222222222222222222222222222222222222")
 (defparameter *rando*     "3333333333333333333333333333333333333333333333333333333333333333")
-(defparameter *allow* (list *owner-npub*))
+
+;; A REAL DESKTOP, on a port no desktop uses, over that fixture.  Its allowlist is the owner and
+;; nobody else, which is what makes the invoker mapping below a test of the policy rather than of a
+;; local variable named *ALLOW*.
+(setf glass:*enrolment-file* *device-file*
+      glass::*enrolments-mtime* nil
+      glass:*box-secret* (make-string 64 :initial-element #\7))
+(clrhash glass:*enrolments*)
+(glass:refresh-nostr-allow *owner-npub*)
+(setf *admission-port* 15917)
 
 (defun write-fixture ()
   (let ((now (%unix-now)))
@@ -87,12 +112,19 @@ read, evaluated, or so much as looked at."
                                      :if-does-not-exist :create)
       (format s "~a ~a~%" *guest-npub* (+ now 86400))
       (format s "~a ~a~%" *rando* (+ now 43200))))
-  (setf *devices-mtime* nil))
+  (setf glass::*enrolments-mtime* nil))
 (write-fixture)
+
+(defparameter *desktop* (glass:start-admission-service :port *admission-port* :install nil))
+(sleep 0.2)
+(ok "a desktop is answering on the port the gateway would ask"
+    (not (null (glass:admission-ping :host *glass-host* :port *admission-port*))))
 
 (ok "the fixture is in /tmp, and the live enrolment file is not named anywhere here"
     (and (eql 0 (search "/tmp/" *device-file*))
          (null (search ".glass-devices" *device-file*))))
+(ok "and the test port is not the one a real desktop serves on"
+    (/= 5915 *admission-port*))
 
 ;;; ---- the two calls that need a live association, and nothing else ------------------------
 
@@ -147,10 +179,10 @@ read, evaluated, or so much as looked at."
 ;;; who was sent one is classified "code" too.  One string, two opposite authorities.
 (format t "~&   -- and it is not the session's `via`, which conflates two opposite peers --~%")
 (flet ((via (pub code-ok)
-         ;; the session's own classification, transcribed from gateway-nostr.lisp
+         ;; the desktop's own classification, which the session now asks for rather than computes
          (cond (code-ok "code")
-               ((authorized-p pub) "allowlist")
-               ((device-enrolled-p pub) "device")
+               ((glass:allowed-pubkey-p pub) "allowlist")
+               ((glass:device-enrolled-p pub) "device")
                (t nil))))
   (ok "the owner on a magic link is classified \"code\", not \"allowlist\""
       (string= "code" (via *owner-npub* t)))
@@ -176,8 +208,14 @@ read, evaluated, or so much as looked at."
     (and *warp-loaded* (find-package "WARP") (find-package "WARP-DOM")))
 (ok "and the projection is shared — one query, however many phones"
     (not (null *warp-projection*)))
-(ok "the revoke handler was aimed at OUR device file, not at its compiled-in default"
-    (equal *device-file* (symbol-value (find-symbol "*DEVICES-FILE*" "WARP-MONITOR"))))
+(ok "the revoke handler no longer WRITES A FILE at all — it asks the desktop that owns the store.
+        A panel still rewriting a local .glass-devices would be revoking terminals nobody enforces"
+    (let ((src (with-output-to-string (o)
+                 (let ((*print-readably* nil))
+                   (princ (function-lambda-expression
+                           (fdefinition (find-symbol "REVOKE-IN-FILE" "WARP-MONITOR")))
+                          o)))))
+      (search "ADMISSION-REVOKE" (string-upcase src))))
 
 (sleep 0.6)                                     ; let the channel's own clock take a pass
 (ok "frames reached the fake stream, on the warp stream id and no other"
@@ -239,11 +277,8 @@ read, evaluated, or so much as looked at."
 ;;; ===========================================================================================
 
 (defun devices-now ()
-  (sort (let ((out '()))
-          (sync-devices)
-          (bt:with-lock-held (*devices-lock*)
-            (maphash (lambda (k v) (declare (ignore v)) (push k out)) *devices*))
-          out)
+  "The enrolments, asked of the desktop the way the panel's query asks."
+  (sort (mapcar #'car (glass:admission-devices :host *glass-host* :port *admission-port*))
         #'string<))
 
 (let ((before (devices-now)))
@@ -253,8 +288,14 @@ read, evaluated, or so much as looked at."
                    *guest-npub*)
   (ok "the enrolment survives — the menu was courtesy, INVOKE is the enforcement point"
       (equal before (devices-now)))
-  (ok "and the gateway's own view of who is enrolled is unchanged"
-      (device-enrolled-p *rando*)))
+  (ok "and the desktop's own view of who is enrolled is unchanged"
+      (glass:device-enrolled-p *rando*))
+  ;; belt and braces, and the braces are the point: even if warp's rule 6 were bypassed entirely,
+  ;; the desktop refuses a revoke whose invoking pubkey is not on ITS allowlist
+  (ok "...and the desktop would have refused it anyway, on its own side of the socket"
+      (multiple-value-bind (r why)
+          (glass:admission-revoke *guest-npub* *rando* :host *glass-host* :port *admission-port*)
+        (and (null r) (eq :denied why)))))
 
 (format t "~&== ...and the owner's is not, and the GATEWAY honours it ==~%")
 (let ((before (devices-now)))
@@ -263,10 +304,11 @@ read, evaluated, or so much as looked at."
                            *rando*)
                    *owner-npub*)
   (ok "the terminal is revoked" (= (1- (length before)) (length (devices-now))))
-  (ok "and DEVICE-ENROLLED-P — the gateway's own admission check — now says no.
-        The file is the source of truth and SYNC-DEVICES is what makes that true without a restart"
-      (not (device-enrolled-p *rando*)))
-  (ok "the terminal that was not named is untouched" (device-enrolled-p *guest-npub*)))
+  (ok "and the DESKTOP's own admission check now says no — which is the check that matters,
+        because it is the one every offer is measured against"
+      (null (nth-value 0 (glass:admission-admit *rando* nil
+                                                :host *glass-host* :port *admission-port*))))
+  (ok "the terminal that was not named is untouched" (glass:device-enrolled-p *guest-npub*)))
 
 ;;; ===========================================================================================
 (format t "~&== a peer that vanishes: the send refuses rather than blocking forever ==~%")
@@ -329,6 +371,24 @@ read, evaluated, or so much as looked at."
     (setf (fdefinition 'warp-ensure-loaded) real)))
 
 (warp-close *guest-ch*)
+
+;;; ===========================================================================================
+(format t "~&== and with no desktop answering: an empty list, and everybody a guest ==~%")
+;;; ===========================================================================================
+;;; The safe direction in both cases, and neither is silent.  A list that cannot be fetched is
+;;; empty rather than stale; an authority that cannot be checked is not granted.  Note that a
+;;; phone in this state is a phone whose screen, audio and microphone are all coming from the same
+;;; process that is not answering — the panel is not the thing it will notice.
+
+(glass:stop-admission-service *desktop*)
+(sleep 0.3)
+(setf *warp-query-complained* nil)
+(ok "the query answers no rows rather than signalling into a session thread"
+    (null (warp-enrolments)))
+(ok "and everybody is a guest, including the owner — the one mistake with consequences here
+        would be offering `revoke' to somebody whose authority could not be checked"
+    (and (eq :device (warp-invoker-for *owner-npub*))
+         (eq :device (warp-invoker-for *guest-npub*))))
 
 (format t "~&~:[~a TEST(S) FAILED~;ALL TESTS PASSED~]~%" (zerop *fails*) *fails*)
 (unless (zerop *fails*) (sb-ext:exit :code 1))

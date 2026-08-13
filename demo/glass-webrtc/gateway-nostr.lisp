@@ -17,8 +17,12 @@
   (asdf:load-system "webrtc-media/rtc")     ; SRTP audio (G.711 both ways) over the same transport
   (asdf:load-system "glass/audio-stream")   ; the DESKTOP's mix, over a socket — we listen on it
   (asdf:load-system "glass/mic-stream")     ; ...and the phone's microphone, back the other way
+  ;; ...and WHO MAY OPEN IT AT ALL.  Same relationship as the two above and the same argument:
+  ;; the desktop owns its identity, its enrolled terminals and its login tokens, and this
+  ;; process ASKS.  Loading the system gets the client half (ADMISSION-ADMIT and friends) —
+  ;; it starts nothing, subscribes to nothing, and listens on nothing.
+  (asdf:load-system "glass/nostr")
   (asdf:load-system "cl-nostr"))
-(load (merge-pathnames "login-token.lisp" (or *load-pathname* *default-pathname-defaults*)))
 (load (merge-pathnames "glass-capture.lisp" (or *load-pathname* *default-pathname-defaults*)))
 ;; the video profiles + the control channel that switches between them mid-session
 (load (merge-pathnames "video-profiles.lisp" (or *load-pathname* *default-pathname-defaults*)))
@@ -58,30 +62,15 @@
       (sb-ext:exit :code 2))
     s))
 
-;; ---- pubkey auth: only these clients may open the desktop --------------------
-;; NOSTR_ALLOW is a comma-separated list of authorized client pubkeys (npub or 64-hex).
-;; The sender is the VERIFIED seal signer from unwrap-giftwrap (a forged rumor pubkey is
-;; already rejected there), so an allowlist hit is a real cryptographic identity.  Unset
-;; => refuse everyone (fail closed): with no allowlist there is no one to authorize.
-(defun %normalize-pubkey (s)
-  "npub1... / 64-hex / name@domain (NIP-05) -> 64-hex; blank -> NIL."
-  (let ((s (string-trim '(#\Space #\Tab #\Newline #\Return) s)))
-    (cond ((zerop (length s)) nil)
-          ((cl-nostr.nip05:nip05-address-p s)                       ; an email-style identifier
-           (ignore-errors (string-downcase (cl-nostr.nip05:resolve-pubkey s))))
-          ((and (>= (length s) 4) (string-equal (subseq s 0 4) "npub"))
-           (ignore-errors (string-downcase (cl-nostr.util:bytes->hex (cl-nostr.bech32:npub-decode s)))))
-          (t (string-downcase s)))))
-
-(defparameter *allow*
-  (let ((e (uiop:getenv "NOSTR_ALLOW")))
-    (when e
-      (remove nil (mapcar #'%normalize-pubkey
-                          (remove "" (uiop:split-string e :separator ",") :test #'string=))))))
-
-(defun authorized-p (pubkey)
-  "T iff PUBKEY (hex) is on the allowlist.  No allowlist => NIL (deny all)."
-  (and pubkey *allow* (member (string-downcase pubkey) *allow* :test #'string=) t))
+;; ---- pubkey auth: NOSTR_ALLOW is the DESKTOP's list now ----------------------
+;; The allowlist, the enrolment store and the login-token key all moved to glass with the command
+;; surface, and admission moved with them: this process no longer decides who may open the desktop,
+;; it ASKS the desktop.  See ASK-ADMISSION below for what that costs and what it buys.
+;;
+;; NOSTR_ALLOW is read by the desktop launcher instead (GLASS_NOSTR_ALLOW falls back to it, so a
+;; launcher that already exports it needs no change) — and there it can be re-read at run time,
+;; where here it was resolved once at start inside IGNORE-ERRORS and failed open-to-empty on a
+;; transient DNS failure.
 
 ;; ---- the DM command surface is NOT HERE ANY MORE -----------------------------
 ;; `link', `devices', `revoke' and `help' used to be answered by this file.  They are answered by
@@ -113,23 +102,46 @@
 (defparameter *nsite-npub*
   (or (uiop:getenv "NSITE_NPUB")
       "npub1ajvjnhgcmdxkng22lzsh22qvl63es78gk6p9mwksepju974teguq4l4evc"))
-;; LOGIN_URL_BASE went with the `link' command: the only thing here that built a URL was the command
-;; that replied with one, and the desktop reads the same variable now (GLASS_LOGIN_URL_BASE, falling
-;; back to LOGIN_URL_BASE, so a launcher that already exports it needs no change).  What stays is the
-;; TTL, because the renewal token that rides back with every ANSWER is still minted here.
-(defparameter *link-ttl* (or (ignore-errors (parse-integer (uiop:getenv "LINK_TTL"))) 1800))
+;; LOGIN_URL_BASE and LINK_TTL went with the `link' command and with the mint.  The desktop reads
+;; both now (GLASS_LOGIN_URL_BASE / GLASS_LOGIN_TTL, each falling back to the old name, so a
+;; launcher that already exports them needs no change), and it is the desktop that mints the
+;; renewal token riding back with every ANSWER — this process only copies it into the envelope.
 
-;; ---- enrolled devices ("remember this terminal") -----------------------------
-;; A browser cannot hold the user's Nostr identity without a signer, so instead each page keeps
-;; its OWN key and signs its offers with it.  When such an offer is admitted by a valid one-time
-;; code, we ENROL that sender for DEVICE_TTL (default 24h): afterwards the device can ask us for
-;; a fresh magic link itself, over the same gift-wrapped DM channel, with no user involved.
+;; ---- who may open the desktop: the DESKTOP's answer, over a socket -----------
+;; The enrolment store used to be here — a hash table, a file, an mtime check and a lock — and it
+;; is glass's now (:glass/nostr, glass/src/nostr.lisp).  This process keeps NO copy of it, on
+;; purpose: a second copy is a second writer to a file synchronised by mtime, which is exactly the
+;; arrangement that stops working the moment there are two transports.
 ;;
-;; This is a deliberate trust delegation — the device key becomes a bearer credential — so it is
-;; bounded two ways: it only ever comes from a session that already authenticated, and it lapses
-;; unless refreshed by connecting.  Enrolments are persisted because the gateway restarts often
-;; (a keepalive supervises it) and an in-memory set would silently un-enrol every device on deploy.
-(defparameter *device-ttl* (or (ignore-errors (parse-integer (uiop:getenv "DEVICE_TTL"))) 86400))
+;; So one call replaces all of it.  ADMISSION-ADMIT hands the desktop a pubkey and whatever code
+;; came in the offer envelope, and the desktop decides (code / allowlist / device, first match),
+;; enrols or renews the terminal, and mints the renewal token that rides back with the answer —
+;; one round trip on loopback, once per offer.
+;;
+;; IT FAILS CLOSED, and that is a decision worth writing down rather than a default.
+;;
+;; The alternative would be to keep a local store as a fallback and log loudly when it is used.
+;; It is rejected because THE DESKTOP IS ALREADY A HARD DEPENDENCY OF THIS PROCESS, and demonstrably
+;; so: RUN-SESSION's channel callback opens (GLASS-CONNECT) with no IGNORE-ERRORS around it, so a
+;; session admitted while the desktop is down dies the instant its data channel opens.  Everything
+;; a peer connects FOR — the screen on :5903, the mix on :5913, the microphone on :5914 — is that
+;; process.  Admitting somebody to a desktop that is not there does not give them access; it gives
+;; them a session that fails a second later, with a denial that never happened to explain it.
+;;
+;; So the fallback would buy nothing real, and it would cost the whole point of the move: a second
+;; store, drifting, with two writers.  Fail closed, count it, and say so in a line that names the
+;; port — because "no answer" and "no" arrive differently on this protocol, which is the property
+;; that makes a closed failure diagnosable instead of mysterious.
+;;
+;; The one case it genuinely costs: a desktop running WITHOUT :glass/nostr answers nothing, and
+;; then nobody can connect at all.  That is the same posture as a gateway with no NOSTR_SEC, which
+;; already crashloops rather than serve as nobody, and it is visible in one line at startup.
+
+(defparameter *admission-port* (or (ignore-errors (parse-integer (uiop:getenv "GLASS_ADMISSION_PORT")))
+                                   5915)
+  "Where the desktop answers admission questions.  Beside the screen by the same convention the
+audio ports follow: 5903 -> 5913 mix out, 5914 microphone in, 5915 who may open any of it.")
+
 ;; Live pipeline stats, written as data rather than only logged, so a UI can present them instead of
 ;; a human grepping the log.  Same file-as-source-of-truth arrangement as the device store: any
 ;; process can read it, no IPC.
@@ -141,81 +153,36 @@
         (let ((*print-readably* nil) (*print-pretty* nil))
           (prin1 plist s) (terpri s)))
     (error () nil)))
-(defparameter *device-file*
-  (or (uiop:getenv "DEVICE_FILE")
-      ;; make-pathname with an explicit :type nil — merge-pathnames would inherit "lisp" from
-      ;; gateway-nostr.lisp and write ".glass-devices.lisp", i.e. a data file that looks like
-      ;; source in a directory we load source from.
-      (namestring (make-pathname :name ".glass-devices" :type nil
-                                 :defaults (or *load-pathname* *default-pathname-defaults*)))))
-(defvar *devices* (make-hash-table :test 'equal))     ; pubkey-hex -> expiry (unix)
-(defvar *devices-lock* (bt:make-lock))
-(defvar *devices-mtime* nil)
 
-(defun load-devices ()
-  (handler-case
-      (with-open-file (s *device-file* :if-does-not-exist nil)
-        (when s
-          (bt:with-lock-held (*devices-lock*)
-            (loop for line = (read-line s nil) while line do
-              (let* ((sp (position #\Space line))
-                     (pk (and sp (subseq line 0 sp)))
-                     (exp (and sp (ignore-errors (parse-integer (subseq line (1+ sp)))))))
-                (when (and pk exp (> exp (%unix-now)))
-                  (setf (gethash (string-downcase pk) *devices*) exp)))))))
-    (error () nil)))
+;; What the desktop last told us, so the stats file and the monitor still have the number they had
+;; when this process owned the store.  A COUNT and not a copy: it is read from the admission reply
+;; and never consulted for a decision.
+(defvar *devices-known* 0)
+(defvar *admission-refusals* 0 "Offers refused because the desktop could not be asked.")
 
-(defun save-devices ()
-  (handler-case
-      (with-open-file (s *device-file* :direction :output :if-exists :supersede
-                                       :if-does-not-exist :create)
-        (bt:with-lock-held (*devices-lock*)
-          (maphash (lambda (pk exp) (when (> exp (%unix-now)) (format s "~a ~a~%" pk exp)))
-                   *devices*)))
-    (error () nil)))
+(defun ask-admission (pubkey code)
+  "Ask the desktop whether PUBKEY, holding CODE, may connect.  Returns (values VIA TOKEN):
 
-(defun sync-devices ()
-  "Re-read DEVICE_FILE if it changed underneath us.  The file — not this process's memory — is the
-source of truth, so a separate tool (a glass admin app, a shell one-liner) can list or revoke
-terminals and the gateway will honour it on the next check without a restart."
-  (handler-case
-      (let ((mt (file-write-date *device-file*)))
-        (unless (eql mt *devices-mtime*)
-          (setf *devices-mtime* mt)
-          (bt:with-lock-held (*devices-lock*) (clrhash *devices*))
-          (load-devices)))
-    (error () nil)))
+  VIA    :code / :allowlist / :device, or NIL — and NIL is the only thing this function's caller
+         is allowed to act on, whether the desktop said no or said nothing at all.
+  TOKEN  the renewal code to put in the answer envelope, or NIL.
 
-(defun enrol-device (pubkey)
-  "Trust PUBKEY to request its own magic links for *DEVICE-TTL*.  Renews an existing enrolment."
-  (when pubkey
-    (bt:with-lock-held (*devices-lock*)
-      (setf (gethash (string-downcase pubkey) *devices*) (+ (%unix-now) *device-ttl*)))
-    (save-devices)))
-
-(defun device-enrolled-p (pubkey)
-  (sync-devices)
-  (and pubkey
-       (bt:with-lock-held (*devices-lock*)
-         (let ((exp (gethash (string-downcase pubkey) *devices*)))
-           (and exp (> exp (%unix-now)) t)))))
-
-;; ---- login codes (magic-link, keyed by *box-secret*) ------------------------
-;; A code arrives inside the offer envelope (see PARSE-OFFER); it was delivered to a
-;; user via a gift-wrapped DM (login-link), so holding a valid one is proof enough —
-;; no browser signer needed.  A code is REUSABLE until it expires: its TTL (+ the
-;; authenticated DM delivery) is the security boundary, and reuse is what lets a page
-;; reload / retry work (single-use burned the code on the first, possibly-failed, try).
-(defun code-status (code)
-  "Classify CODE: :OK (valid + unexpired), :EXPIRED, :BAD (wrong MAC / malformed), or
-:ABSENT.  Distinct reasons so a denied login is diagnosable."
-  (if (or (not (stringp code)) (zerop (length code)))
-      :absent
-      (multiple-value-bind (ok nonce) (glass-login:verify-token *box-secret* code)
-        (cond
-          ((null nonce) :bad)                          ; bad MAC / not a token
-          ((not ok) :expired)                          ; MAC good but past its expiry
-          (t :ok)))))
+FAILS CLOSED.  A service that cannot be reached refuses the offer and says so loudly, naming the
+port, because a silent refusal here would be diagnosed for an hour in the wrong process."
+  (multiple-value-bind (via token plist)
+      (glass:admission-admit pubkey code :host *glass-host* :port *admission-port*)
+    (let ((n (and plist (ignore-errors (parse-integer (getf plist :devices))))))
+      (when n (setf *devices-known* n)))
+    (when (eq token :unreachable)
+      (incf *admission-refusals*)
+      (setf *last-error* (format nil "admission service ~a:~a unreachable" *glass-host* *admission-port*))
+      (format t "~&@@ ADMISSION UNREACHABLE at ~a:~a — refusing ~a... (FAIL CLOSED).~@
+                 @@   The desktop owns the enrolment store; this gateway keeps no copy on purpose.~@
+                 @@   Start it there:  (glass:start-session-nostr)  — or load :glass/nostr in the~@
+                 @@   desktop launcher.  Nothing this peer wants (screen, audio, mic) is up either.~%"
+              *glass-host* *admission-port* (subseq pubkey 0 8))
+      (finish-output))
+    (values via (and (stringp token) token))))
 
 (defun parse-offer (payload)
   "An offer PAYLOAD is either a {\"sdp\",\"code\"} JSON envelope or a bare SDP string.
@@ -489,7 +456,7 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                                                :sessions-failed *sessions-failed*
                                                :no-relay *no-relay-count*
                                                :last-error *last-error*
-                                               :devices (hash-table-count *devices*)
+                                               :devices *devices-known*
                                                :glass (list :host *glass-host* :port *glass-port*)
                                                :qi-base *video-qi* :target-kbs *video-target-kbs*)))
                             :log (lambda (m)
@@ -729,12 +696,33 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
             (or (uiop:getenv "NSITE_NPUB")
                 "npub1ajvjnhgcmdxkng22lzsh22qvl63es78gk6p9mwksepju974teguq4l4evc")
             box-npub))
-  (load-devices)
-  (format t "@@ devices:    ~a enrolled (ttl ~ah)~%" (hash-table-count *devices*) (round *device-ttl* 3600))
+  ;; ASK THE DESKTOP WHO IT IS, ONCE, AT STARTUP.  Not because anything here needs the answer —
+  ;; every admission asks again — but because this is where "nobody can connect" is diagnosed, and
+  ;; a gateway that refuses every offer for an hour without ever having said the service was down
+  ;; is the failure mode that makes fail-closed a bad idea.  It is a report, not a gate: the
+  ;; gateway starts either way, and the desktop may simply not be up yet.
+  (let ((posture (glass:admission-ping :host *glass-host* :port *admission-port*)))
+    (if posture
+        (progn
+          (format t "@@ admission:  ~a:~a — ~a enrolled, ~a allowed, device ttl ~ah~%"
+                  *glass-host* *admission-port* (getf posture :devices) (getf posture :allow)
+                  (round (or (ignore-errors (parse-integer (getf posture :ttl))) 86400) 3600))
+          (setf *devices-known* (or (ignore-errors (parse-integer (getf posture :devices))) 0))
+          (unless (equal (string-downcase (getf posture :box)) (string-downcase box-pub))
+            ;; A DIFFERENT BOX SECRET ON THE TWO SIDES.  Codes minted there will not verify... they
+            ;; will, in fact, verify there and only there — but the npub a link names is OURS, so a
+            ;; person would be sent to a box that is not the one holding their credential.  Loud,
+            ;; and not fatal, because the desktop is what people are trying to reach.
+            (format t "@@ WARNING:   the desktop's box key is ~a, ours is ~a — the secret is~%~
+                       @@            SHARED by design; these disagreeing means one of the two~%~
+                       @@            launchers has a different NOSTR_SEC.~%"
+                    (subseq (or (getf posture :box) "?") 0 12) (subseq box-pub 0 12))))
+        (format t "@@ admission:  ~a:~a NOT ANSWERING — every offer will be REFUSED until it is.~%~
+                   @@            The desktop owns the enrolment store (:glass/nostr); this~%~
+                   @@            gateway keeps no copy.  Nothing a peer wants is up either.~%"
+                *glass-host* *admission-port*))
+    (finish-output))
   (format t "@@ relays:     ~a~%" *relays*)
-  (if *allow*
-      (format t "@@ allowlist:  ~{~a~^, ~}~%" (mapcar (lambda (h) (subseq h 0 12)) *allow*))
-      (format t "@@ allowlist:  (empty) — no NOSTR_ALLOW; only one-time codes admit clients.~%"))
   (format t "@@ login-link: sbcl --script login-link.lisp <npub|email> [ttl]  (DMs a code)~%")
   ;; Said out loud, because "the box stopped answering `link'" is otherwise diagnosed here, in the
   ;; process that no longer has the answer.  The DM surface is the DESKTOP's; this process answers
@@ -776,39 +764,37 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                         (subseq phone-pub 0 8) (- (%unix-now) rumor-at))
                 (finish-output))
                ((and (stringp offer-sdp) (search "m=application" offer-sdp))   ; a data-channel offer
-                ;; a valid one-time code OR an allowlisted signer authorizes the connection
-                (let* ((cstatus (code-status code))
-                       ;; Three ways in, with deliberately different lifetimes:
-                       ;;   allowlist — the npub this box was started for.  Always authorised.
-                       ;;   code      — a one-time magic link.  Valid for its own TTL.
-                       ;;   device    — a browser we enrolled after it came in on a valid code.
-                       ;;               Authorised for *DEVICE-TTL* (~24h) and renewed by use, so
-                       ;;               an active terminal keeps working and an idle one lapses.
-                       (via (cond ((eq cstatus :ok) "code")
-                                  ((authorized-p phone-pub) "allowlist")
-                                  ((device-enrolled-p phone-pub) "device")
-                                  (t nil))))
+                ;; WHO MAY CONNECT IS THE DESKTOP'S ANSWER.  Three ways in, with deliberately
+                ;; different lifetimes — a code (a magic link, valid for its own TTL, and it
+                ;; authorises independently of the allowlist), the allowlist (permanent), or an
+                ;; enrolment (a browser admitted earlier on a code, renewed by use and lapsing
+                ;; without it) — and all three are decided over there, in one round trip, along
+                ;; with the enrolment and the renewal token.  See ASK-ADMISSION: no answer refuses.
+                (multiple-value-bind (via renewal) (ask-admission phone-pub code)
                   (cond
                     ((null via)
-                     (format t "~&@@ DENIED ~a... — code:~(~a~), not on the allowlist~%"
-                             (subseq phone-pub 0 8) cstatus)
+                     ;; RENEWAL carries the reason here: :absent / :bad / :expired from the desktop,
+                     ;; or :unreachable, which ASK-ADMISSION has already said out loud.
+                     (format t "~&@@ DENIED ~a... — ~(~a~)~%" (subseq phone-pub 0 8) renewal)
                      (finish-output))
                     (t
-                     (format t "~&@@ offer from ~a... (via ~a) -> answering~%" (subseq phone-pub 0 8) via)
-                     ;; remember this terminal, and renew it on every admitted connection: use
-                     ;; keeps a device alive, disuse lets it expire
-                     (enrol-device phone-pub)
+                     (format t "~&@@ offer from ~a... (via ~(~a~)) -> answering~%"
+                             (subseq phone-pub 0 8) via)
                      (finish-output)
                      (let* ((answer (process-offer offer-sdp :pub phone-pub :at rumor-at))
                             ;; NIL means the offer was ignored (older than the live session) — there
                             ;; is nothing to reply with, and replying NIL would hand the phone a
                             ;; malformed answer.
                             (skip (null answer))
-                            ;; RENEW: a client that authenticated with a valid code gets a fresh
-                            ;; one back with the answer, so simply reconnecting before it expires
-                            ;; keeps the credential alive and a dropped session never needs a new
-                            ;; magic link.  Renewal rides the exchange that already proved who they
-                            ;; are — no new message type, no new crypto.
+                            ;; RENEW: a client that authenticated with a code, or as an enrolled
+                            ;; terminal, gets a fresh one back with the answer, so simply
+                            ;; reconnecting before it expires keeps the credential alive and a
+                            ;; dropped session never needs a new magic link.  Renewal rides the
+                            ;; exchange that already proved who they are — no new message type and
+                            ;; no new crypto — and the token was MINTED BY THE DESKTOP, in the same
+                            ;; call that admitted them, because the desktop holds the store the
+                            ;; credential is a credential against.  An allowlisted owner is handed
+                            ;; none, exactly as before: RENEWAL is simply NIL for them.
                             ;; ALWAYS an envelope, and it carries the OFFER'S ICE UFRAG back.  A
                             ;; gift-wrapped answer lives on the relays forever, and the phone's
                             ;; subscription has no since/limit — so on the next connection the relays
@@ -822,9 +808,7 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                                        (setf (gethash "sdp" ht) answer
                                              (gethash "ufrag" ht)
                                              (ignore-errors (sdp-ice-ufrag (parse-sdp offer-sdp))))
-                                       (when (or (eq cstatus :ok) (string= via "device"))
-                                         (setf (gethash "code" ht)
-                                               (glass-login:mint-token *box-secret* :ttl *link-ttl*)))
+                                       (when renewal (setf (gethash "code" ht) renewal))
                                        (com.inuoe.jzon:stringify ht)))
                             (reply  (and (not skip)
                                          (cl-nostr.nip59:build-giftwrap kp phone-pub payload

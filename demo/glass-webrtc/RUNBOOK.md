@@ -80,21 +80,72 @@ The desktop also ignores a command whose rumour is older than `*NOSTR-COMMAND-MA
 The gateway never had that guard, so restarting it could re-answer a `link` from hours ago in the
 relay backlog with a fresh live credential.
 
-### Three ways in
+### 2.2 Three ways in — and the gateway asks, it does not decide
 
-Checked in this order, and **the first match wins**:
+Checked in this order, **by the desktop**, and the first match wins:
 
 1. **code** — a valid unexpired login token in the offer envelope. Valid for its own TTL.
-2. **allowlist** — `NOSTR_ALLOW`. Permanent.
-3. **device** — a browser enrolled after arriving on a valid code. `DEVICE_TTL`, default 24 h,
-   **renewed on every connection**, persisted to `.glass-devices`.
+2. **allowlist** — `NOSTR_ALLOW` (`GLASS_NOSTR_ALLOW` overrides). Permanent.
+3. **device** — a browser enrolled after arriving on a valid code. `DEVICE_TTL`
+   (`GLASS_DEVICE_TTL`), default 24 h, **renewed on every connection**, persisted to
+   `.glass-devices` — **the desktop's copy**, `GLASS_DEVICE_FILE`, default `~/.glass-devices`.
 
-Note that a code authorises *independently of the allowlist*, and that any admitted connection enrols
-the caller as a device. One leaked link is therefore durable access until someone runs `revoke`.
+A code authorises *independently of the allowlist*, and any admitted connection enrols the caller as
+a device. One leaked link is therefore durable access until someone runs `revoke`.
 
-`NOSTR_ALLOW` accepts npub, 64-hex, or a NIP-05 `name@domain` — the last resolved over HTTP **once, at
-gateway start**, inside `ignore-errors`. A transient DNS failure at that moment yields an empty
-allowlist and a gateway that starts anyway. Prefer a raw npub.
+The gateway makes **one call per offer**:
+
+```
+glass:admission-admit <pubkey> <code>   →  via / token / devices-count
+```
+
+which decides, enrols or renews, and mints the renewal token that rides back in the answer — all on
+the desktop, in one round trip on loopback. The gateway keeps no store, no allowlist and no mint.
+
+**It fails closed.** No answer from `:5915` means no admission, counted, with a log line that names
+the port. The reasoning, written out beside `ASK-ADMISSION`: **the desktop is already a hard
+dependency** — `RUN-SESSION` opens `GLASS-CONNECT` to `:5903` with no `ignore-errors`, so a peer
+admitted while the desktop is down gets a session that dies the instant its data channel opens, and
+everything they connected *for* (screen, mix, microphone) is that same process. A fallback store
+would buy nothing real and would cost the whole point of the move: two writers, drifting.
+
+The cost to accept: **a desktop running without `:glass/nostr` admits nobody.** That is the same
+posture as a gateway with no `NOSTR_SEC`, which already crashloops rather than serve as nobody, and
+the gateway says so in one line at startup (`@@ admission: … NOT ANSWERING`).
+
+`NOSTR_ALLOW` accepts npub, 64-hex, or a NIP-05 `name@domain`. The desktop can re-read it at run
+time — `(glass:refresh-nostr-allow)` over the control socket — where the gateway resolved it once at
+start inside `ignore-errors` and failed open-to-empty on a transient DNS failure.
+
+### The admission protocol (`:5915`)
+
+Text-framed like its neighbours on 5913/5914, so `nc` is a diagnostic:
+
+```
+client → server   glass-admit/1 <verb> [k=v …]
+server → client   glass-admit/1 ok   [k=v …] [rows=<n>]   then n body lines
+                  glass-admit/1 deny reason=<why>
+                  glass-admit/1 err  reason=<why>
+
+$ printf 'glass-admit/1 ping\n' | nc 127.0.0.1 5915
+glass-admit/1 ok box=<64hex> allow=1 devices=2 ttl=86400
+```
+
+| verb | asks | answers |
+|---|---|---|
+| `ping` | is there a desktop, and what is its posture | `box` `allow` `devices` `ttl` |
+| `admit pub= code=` | may this peer connect (decides + enrols + mints) | `via` `code` `token` `devices` |
+| `allowed pub=` | is this pubkey on the allowlist | `allowed=1\|0` |
+| `devices` | the enrolments (the shared warp query) | `rows=N` + `<pubkey> <expiry>` |
+| `revoke pub= arg=` | un-enrol, on `pub`'s authority — **allowlist only** | `rows=N` + revoked keys |
+| `mint pub= [ttl=]` | a login token, on `pub`'s authority | `token` |
+
+**Three statuses and not two.** `deny` is an answer; `err`, or no connection at all, is the absence
+of one. The client half returns `:UNREACHABLE` distinctly, and that distinction is the only reason
+failing closed is safe rather than indistinguishable from denying everybody.
+
+Loopback and unauthenticated on it — the same trust boundary the desktop's `:4013` eval socket
+already draws.
 
 ### The login link
 
@@ -111,7 +162,9 @@ claims single-use is enforced by the gateway. It is not; the gateway's own comme
 Every successful answer carries a *fresh* token back, stored in `localStorage`, so an active terminal
 never needs a new link.
 
-TTLs disagree between call sites: 900 s from the CLI, 1800 s (`LINK_TTL`) for the `link` DM.
+TTLs disagree between call sites: 900 s from the CLI (`login-link.lisp`), 1800 s
+(`GLASS_LOGIN_TTL`, falling back to `LINK_TTL`) for the desktop's `link` DM and for the renewal that
+rides back with each answer.
 
 ### Message formats
 
@@ -226,10 +279,10 @@ silently fall back to.
 
 | secret | where | if you skip it |
 |---|---|---|
-| **box Nostr identity** | `NOSTR_SEC` in the launcher | **silently uses the committed placeholder.** That value is public, and it is also the login-token HMAC key — anyone with the source can mint valid codes. Set it. |
+| **box Nostr identity** | `NOSTR_SEC` in **both** launchers — the gateway's and the desktop's (`GLASS_NOSTR_SEC` falls back to it) | the gateway crashloops; the desktop starts but runs **no admission service and no DM bot**, so nobody can connect. The secret is deliberately shared for now: the gateway cannot decrypt an offer without it. Making the desktop the only holder is a marked follow-up (`ADMISSION-SERVE` in `glass/src/nostr.lisp`). |
 | **nsite site key** | `~/.glass/site-key`, mode 600 | `publish.lisp` refuses to run. This key *is* your site npub; losing it orphans every link ever issued |
 | **TURN credential** | launcher **and** the browser bundle | cellular clients cannot connect |
-| **`NOSTR_ALLOW`** | launcher | fails closed — nobody is authorised |
+| **`NOSTR_ALLOW`** | the **desktop's** launcher (`GLASS_NOSTR_ALLOW` overrides) | fails closed — nobody is authorised |
 | **VNC password** | `~/.glass-vnc-pass` | the desktop listens unauthenticated. **But see dragons — setting it currently breaks video** |
 
 `openssl rand -hex 32` produces the first two.
@@ -272,7 +325,7 @@ be reconstructed. `demo/turn-rig/turn-server.py` is a small RFC 5766 server usab
 
 **Sequence.**
 
-1. Desktop: `cd warren && sbcl --control-stack-size 256 --dynamic-space-size 4096 --load desktop-5903.lisp`
+1. Desktop: `NOSTR_SEC=<box> NOSTR_ALLOW=<your npub> LOGIN_URL_BASE=<published client> cd warren && sbcl --control-stack-size 256 --dynamic-space-size 4096 --load desktop-5903.lisp` — the launcher must load `:glass/nostr` and call `(glass:start-session-nostr)`, or the box has no identity and admits nobody
 2. Client: build and publish per `DEPLOY.md` (`mkbundle.py`, then `publish.lisp` **with the file as
    argv**, then `check-deploy.lisp`, then re-point `site-url.env` at nsite.run)
 3. Gateway: `./gw-keepalive.sh` under nohup or tmux
@@ -313,8 +366,15 @@ real authorization rule, reachable only over DM. This gives that same set a seco
 button on the phone that opens a list of enrolled terminals, where a hold offers the applicable
 commands and a tap invokes one. Same command, same authorization predicate, written once.
 
-**Where it runs.** *Inside the gateway*, over the gateway's own `.glass-devices`. No bridge and no
-second process, because `:warp` depends on `bordeaux-threads` and nothing else.
+**Where it runs.** *Inside the gateway*, but over the **desktop's** store: the query is
+`glass:admission-devices`, the invoker is `glass:admission-allowed-p`, and warp-monitor's
+`revoke-in-file` is replaced at load time with `glass:admission-revoke` so the panel cannot rewrite
+a file nobody enforces. `:warp` still depends on `bordeaux-threads` and nothing else; what changed
+is where the rows come from.
+
+With the desktop unreachable the panel shows **no rows** (logged once, not silently rendered as
+"none enrolled") and **everybody is a guest** — the safe direction, since offering `revoke` to
+somebody whose authority could not be checked is the one mistake here with consequences.
 
 | file | what it is |
 |---|---|
@@ -334,17 +394,17 @@ string would demote the owner and promote the guest at the same time. Menu filte
 state** — a pass with nothing owed sends nothing, and enrolments do not change while you are
 watching a desktop. The budget bounds the first fill and the rare change.
 
-**A revoke from the panel** rewrites `.glass-devices`, and the gateway's own `sync-devices` picks it
-up on the next mtime check — the mechanism the device store was designed around. `device-enrolled-p`
-then refuses that terminal's next connection with no restart.
+**A revoke from the panel** goes to the desktop, which rewrites its `.glass-devices` and refuses
+that terminal's next admission — with no restart anywhere, and with the desktop checking the
+invoking pubkey against its own allowlist a second time, after warp's rule 6 already did.
 
 **Environment.** `WARP_CHANNEL=1` to enable; `WARP_BUDGET`, `WARP_HZ`, `WARP_ROWS` to tune. warp must
 be checked out beside `webrtc-data` and reachable through `CL_SOURCE_REGISTRY`; if it is not, the
 load fails inside a handler, one line goes to the log, and the panel shows "no answer".
 
-**Tests, none of which start a gateway.** `demo/glass-webrtc/warp-channel-test.lisp` lifts
-`authorized-p` and the device store out of `gateway-nostr.lisp`'s *text* by name and runs
-`warp-channel.lisp` against a stubbed SCTP; `warp/t/channel.lisp` drives the channel module over a
+**Tests, none of which start a gateway.** `demo/glass-webrtc/warp-channel-test.lisp` lifts the
+gateway's own names for *where the desktop is* out of its *text*, starts a real glass admission
+service on a /tmp fixture, and runs `warp-channel.lisp` against a stubbed SCTP; `warp/t/channel.lisp` drives the channel module over a
 fake transport; `warp/t/panel.sh` drives the panel's actual bytes in headless Chromium. The
 untested remainder is `sctp-send-string` itself, which already carries RFB and the control channel.
 
@@ -369,34 +429,39 @@ untested remainder is `sctp-send-string` itself, which already carries RFB and t
    browser's bridged RFB (which does authenticate) keeps working. It surfaces only as
    `desktop capture FAILED`. **The secure configuration is the broken one.**
 6. **The desktop's control socket is an unauthenticated `eval`** on loopback — a trust boundary worth
-   naming.
+   naming. `:5915` (admission) draws exactly the same one, deliberately: anything that can open
+   loopback on this box can already eval in that image.
+7. **The desktop must be started with `NOSTR_SEC` now.** It holds the identity, the store and the
+   mint; a desktop without it serves a screen that nobody is admitted to.
 
 **Operational**
 
-7. `LOGIN_URL_BASE` is read **once at gateway start**; the launcher's own `export` also runs once.
-   Only the `site-url.env` sourced *inside* the restart loop actually updates a running system.
-8. Publishing **replaces** the manifest, so the previous `/<tag>.html` stops resolving and every link
+8. `LOGIN_URL_BASE` is read **once at desktop start** — it is the desktop that builds a link now, so
+   re-pointing the client at a new tag means restarting the desktop, not the gateway. Only the
+   `site-url.env` sourced *inside* the gateway's restart loop updates a running gateway.
+9. Publishing **replaces** the manifest, so the previous `/<tag>.html` stops resolving and every link
    minted against it 404s. Always publish under a new tag.
-9. `publish.lisp` writes an **nsite.lol** URL into `site-url.env`, but nsite.lol serves a stale
-   manifest — worse, `/index.html` returns 200 with an *older* build, which looks like success. Verify
-   on nsite.run. Zero `accepted=T` lines means nothing was published.
-10. NIP-05 allowlist resolution happens once at startup and fails open-to-empty.
+10. `publish.lisp` writes an **nsite.lol** URL into `site-url.env`, but nsite.lol serves a stale
+    manifest — worse, `/index.html` returns 200 with an *older* build, which looks like success. Verify
+    on nsite.run. Zero `accepted=T` lines means nothing was published.
+11. NIP-05 allowlist resolution happens once at startup and fails open-to-empty — but it is now
+    re-runnable: `(glass:refresh-nostr-allow)` over the desktop's control socket, no restart.
 
 **Code smells that will confuse a reader**
 
-11. Six `VIDEO_*` gateway parameters are **dead** — overridden by the profile from the first encoder
+12. Six `VIDEO_*` gateway parameters are **dead** — overridden by the profile from the first encoder
     pass. The `[rung]` log line is the one that tells the truth.
-12. `*video-pt*` and `*last-assoc*` are process globals mutated per session, despite comments saying
+13. `*video-pt*` and `*last-assoc*` are process globals mutated per session, despite comments saying
     otherwise — unsafe with overlapping sessions.
-13. `link` is matched by **substring**, so `blink` and `linkedin` both mint a login link. (Now in
+14. `link` is matched by **substring**, so `blink` and `linkedin` both mint a login link. (Now in
     `glass/src/nostr.lisp`, deliberately preserved: people have it in their message history.)
-14. `revoke` accepts a 4-character prefix while advertising 8. Also preserved, also in glass.
-15. The seen-wrap set is flushed **wholesale** at 4096 entries, briefly reopening the replay window.
-16. Control-channel JSON is hand-scraped and hand-formatted on the box; any format drift breaks it
+15. `revoke` accepts a 4-character prefix while advertising 8. Also preserved, also in glass.
+16. The seen-wrap set is flushed **wholesale** at 4096 entries, briefly reopening the replay window.
+17. Control-channel JSON is hand-scraped and hand-formatted on the box; any format drift breaks it
     silently.
-17. `GATHER_SRFLX` in the launcher is vestigial. (`link-request-p` was dead code and is gone; it
+18. `GATHER_SRFLX` in the launcher is vestigial. (`link-request-p` was dead code and is gone; it
     left with the command surface.)
-18. The FramebufferUpdateRequest filter is a magic-byte heuristic, and the RFB channel stays live in
+19. The FramebufferUpdateRequest filter is a magic-byte heuristic, and the RFB channel stays live in
     video-primary mode.
 
 ---

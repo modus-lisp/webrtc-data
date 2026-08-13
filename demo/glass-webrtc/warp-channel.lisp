@@ -110,36 +110,60 @@ deployed client has ever used — this changes nothing at all, which is the prop
   (or (ignore-errors (parse-integer (uiop:getenv "WARP_ROWS"))) 12)
   "Rows offered before the browser reports its own viewport, which it does on connect.")
 
+(defvar *warp-invoking-pubkey* nil
+  "The peer whose message is being applied, bound for the duration of CHANNEL-RECEIVE.
+
+A command reaches warp-monitor's handler with the OBJECT it acts on and the INVOKER's role, which
+is all warp's own authorization needs — but the desktop checks the rule again on its own side, and
+for that it needs the identity rather than the role.  There is exactly one place that identity
+exists at this depth, and this is how it gets down there: WARP-DOM's ON-MESSAGE runs synchronously
+inside CHANNEL-RECEIVE, on this thread, so a dynamic binding around the call is in scope for the
+whole invocation and for nothing else.")
+
 (defvar *warp-loaded* nil "T once :warp-dom and :warp-monitor are in the image.")
 (defvar *warp-projection* nil "The shared projection — one query, however many phones.")
 (defvar *warp-lock* (bt:make-lock "warp-gateway"))
 
 ;;; ---- the query --------------------------------------------------------------------------
 ;;; DESIGN.md: views subscribe to RESULT-SETS, not to objects they happen to enumerate.  So this is
-;;; a query returning the currently-enrolled terminals, even though its implementation is a hash
-;;; table that a file backs.
+;;; a query returning the currently-enrolled terminals — and now that the store is the DESKTOP's,
+;;; the implementation behind it is one line on a socket instead of one line on a hash table.  That
+;;; is the whole of what moving it cost this file, and it is the shape the projection was written
+;;; for: a query is a query wherever the rows come from.
 ;;;
-;;; SYNC-DEVICES FIRST, every time, for the same reason the DM surface does it: the FILE is the
-;;; source of truth and this process's memory is a cache of it.  A revoke performed from the warp
-;;; surface writes the file (see below), and this is what makes the gateway itself honour it on the
-;;; next pass without a restart — the mechanism the device store was designed around, used rather
-;;; than worked around.
+;;; THE DESKTOP RE-READS ITS OWN FILE, so a revoke performed anywhere — this panel, the DM surface,
+;;; a shell one-liner — is honoured on the next pass with no restart anywhere.  The mechanism the
+;;; store was designed around, used rather than worked around; it has simply moved one process over.
+;;;
+;;; A DESKTOP THAT CANNOT BE REACHED YIELDS NO ROWS, and there is nothing better available: an
+;;; unreachable service and an empty store are different facts, but a projection's contract is a
+;;; list.  What keeps that honest is that the difference is LOGGED here rather than silently
+;;; rendered as "no terminals are enrolled" — and that a phone which cannot reach the desktop is a
+;;; phone whose screen, audio and microphone are all coming from the same place.
+
+(defvar *warp-query-complained* nil)
 
 (defun warp-enrolments ()
   "The current result-set: enrolled terminals that have not lapsed, as domain objects."
-  (sync-devices)
-  (let ((now (%unix-now)) (rows '()))
-    (bt:with-lock-held (*devices-lock*)
-      (maphash (lambda (pk exp)
-                 (when (> exp now)
-                   (push (cons pk exp) rows)))
-               *devices*))
-    ;; a stable order, so the list does not reshuffle under a finger between passes (rule 6 depends
-    ;; on layouts not shifting) and so a re-sort is never mistaken for a change
-    (mapcar (lambda (r)
-              (make-instance (find-symbol "ENROLMENT" "WARP-MONITOR")
-                             :pubkey (car r) :expires (cdr r)))
-            (sort rows #'string< :key #'car))))
+  (multiple-value-bind (rows why)
+      (glass:admission-devices :host *glass-host* :port *admission-port*)
+    (cond
+      ((eq why :unreachable)
+       (unless *warp-query-complained*
+         (setf *warp-query-complained* t)
+         (format *error-output* "~&[warp] the desktop's admission service (~a:~a) is not answering~
+                                 ~% — the terminal list is empty because it cannot be asked~%"
+                 *glass-host* *admission-port*)
+         (finish-output *error-output*))
+       '())
+      (t
+       (setf *warp-query-complained* nil)
+       ;; a stable order, so the list does not reshuffle under a finger between passes (rule 6
+       ;; depends on layouts not shifting) and so a re-sort is never mistaken for a change
+       (mapcar (lambda (r)
+                 (make-instance (find-symbol "ENROLMENT" "WARP-MONITOR")
+                                :pubkey (car r) :expires (cdr r)))
+               (sort (copy-list rows) #'string< :key #'car))))))
 
 ;;; ---- who is asking ----------------------------------------------------------------------
 
@@ -147,9 +171,16 @@ deployed client has ever used — this changes nothing at all, which is the prop
   "The warp invoker for an authenticated peer.
 
 :ALLOWLIST FOR A CRYPTOGRAPHIC IDENTITY ON THE ALLOWLIST, :DEVICE FOR EVERYTHING ELSE.  This is
-AUTHORIZED-P — the same predicate the DM surface calls `admin` — and using it rather than anything
-else is the point of the exercise: `revoke` is one command with one authorization rule, and a
-second surface that computed its own answer would be the drift this architecture exists to prevent.
+the DESKTOP's allowlist, asked as a question — literally the predicate the DM surface calls
+`admin`, in the process that owns it — and asking it rather than answering it here is the point of
+the exercise: `revoke` is one command with one authorization rule, and a second surface that
+computed its own answer would be the drift this architecture exists to prevent.  It used to be a
+local AUTHORIZED-P over a local NOSTR_ALLOW, which was the same rule only for as long as the two
+copies of the list agreed.
+
+A DESKTOP THAT CANNOT BE REACHED MAKES EVERYBODY A GUEST, which is the safe direction: the invoker
+decides what a hold-menu offers, and offering `revoke` to somebody whose authority could not be
+checked is the one mistake here that has consequences.
 
 IT IS DELIBERATELY NOT THE SESSION'S `via`.  The session classifies a connection code / allowlist /
 device and takes the FIRST match, so an owner who happens to arrive holding a valid login code is
@@ -162,7 +193,8 @@ computed for a different one.
 
 So an enrolled guest is never offered `revoke`, and rule 6 refuses it at invocation if it asks
 anyway.  Menu filtering is courtesy; INVOKE is the enforcement point, in warp, once."
-  (if (authorized-p pubkey) :allowlist :device))
+  (if (glass:admission-allowed-p pubkey :host *glass-host* :port *admission-port*)
+      :allowlist :device))
 
 ;;; ---- loading, once, lazily ---------------------------------------------------------------
 ;;; At FIRST USE rather than at gateway start.  With the feature off this never runs at all, which
@@ -180,11 +212,24 @@ start, and the systems live in a sibling checkout that a given box may simply no
               (let ((*standard-output* (make-broadcast-stream)))
                 (asdf:load-system "warp-monitor")
                 (asdf:load-system "warp-dom")))
-            ;; The command's handler rewrites whatever WARP-MONITOR::*DEVICES-FILE* names, and its
-            ;; default is a path compiled into that file.  Point it at OURS, so the two cannot
-            ;; drift and so a revoke from this surface is a revoke of the terminals this gateway
-            ;; is actually enforcing.
-            (setf (symbol-value (find-symbol "*DEVICES-FILE*" "WARP-MONITOR")) *device-file*)
+            ;; REVOKE-IN-FILE is warp-monitor's seam, and it is aimed HERE.  It used to rewrite a
+            ;; file — this gateway's .glass-devices — because that is where the store was; the
+            ;; store is the desktop's now, and a panel that went on rewriting a local file would
+            ;; revoke a terminal nobody is enforcing.  So the one function that WRITES is replaced
+            ;; with the service call, and warp's own authorization (DEFINE-COMMAND-AUTHORIZATION
+            ;; revoke-terminal, :allowlist only) is joined by the desktop's, which checks the
+            ;; invoking pubkey again on its own side.  Replaced rather than edited in warp because
+            ;; the transport is what knows where its desktop is; warp-monitor stays a reader of
+            ;; rows and a namer of commands, which is what it is for.
+            ;;
+            ;; The pubkey is the OWNER's — the invoker whose authority the desktop is being asked
+            ;; to check — and there is exactly one place it can come from at this depth, so it is
+            ;; bound per invocation by WARP-ON-MESSAGE below.
+            (setf (fdefinition (find-symbol "REVOKE-IN-FILE" "WARP-MONITOR"))
+                  (lambda (pubkey)
+                    (glass:admission-revoke (or *warp-invoking-pubkey* "")
+                                            pubkey
+                                            :host *glass-host* :port *admission-port*)))
             (setf *warp-loaded* t))
         (error (e)
           (format *error-output* "~&[warp] not available: ~a~%" e)
@@ -262,7 +307,9 @@ the difference between a panel that says nothing and a desktop connection that b
   (handler-case
       (let ((st (or state (warp-open assoc sid pub))))
         (when st
-          (let ((text (if (stringp payload) payload (map 'string #'code-char (as-u8vec payload)))))
+          (let ((text (if (stringp payload) payload (map 'string #'code-char (as-u8vec payload))))
+                ;; who is invoking, for the desktop's own check on the far side of REVOKE-IN-FILE
+                (*warp-invoking-pubkey* pub))
             (funcall (find-symbol "CHANNEL-RECEIVE" "WARP-DOM") (car st) text)))
         st)
     (error (e)

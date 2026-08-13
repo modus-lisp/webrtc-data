@@ -26,7 +26,12 @@
 ;;;;      desktop also answered it would send two magic links per request.  The gateway's source is
 ;;;;      searched for the names that used to do that, and for the ones that must still be there.
 ;;;;
-;;;;   3. THE SERVICE IS THE PROTOCOL.  The calls the gateway makes are made here over TCP, against
+;;;;   3. ADMISSION GOES THROUGH THE SERVICE, AND THE GATEWAY KEEPS NO STORE.  A local fallback
+;;;;      would be a second writer to a file synchronised by mtime, which is the arrangement the
+;;;;      move exists to end.  Both halves are asserted from the source: the store's names are gone,
+;;;;      and the one decision left is a call.
+;;;;
+;;;;   4. THE SERVICE IS THE PROTOCOL.  The calls the gateway makes are made here over TCP, against
 ;;;;      a real glass admission service — including the case its failure policy turns on: with the
 ;;;;      desktop down the answer must be :UNREACHABLE and never a plain denial.
 ;;;;
@@ -120,6 +125,53 @@
                 "webrtc-serve-datachannel" "glass:make-audio-tap" "glass:make-mic-sender"
                 "(warp-sid-p sid)" "(payload-sid-p sid)" "(control-sid-p sid)"))
   (ok (format nil "still in gateway-nostr.lisp: ~a" kept) (search kept *gateway*)))
+
+;;; ==============================================================================
+(banner "the enrolment store left too — and nothing took its place here")
+;;; ==============================================================================
+
+(dolist (gone '("(defvar *devices*" "(defvar *devices-lock*" "(defun load-devices"
+                "(defun save-devices" "(defun sync-devices" "(defun enrol-device"
+                "(defun device-enrolled-p" "(defun authorized-p" "(defun %normalize-pubkey"
+                "(defun code-status" "(defparameter *device-file*" "(defparameter *allow*"
+                "glass-login:"))
+  (ok (format nil "gone from gateway-nostr.lisp: ~a…" gone) (null (search gone *gateway*))))
+(ok "…and login-token.lisp is no longer loaded by it — the mint went with the store"
+    (null (search "(load (merge-pathnames \"login-token.lisp\"" *gateway*)))
+(ok "  (the file itself stays: login-link.lisp mints from a shell and is unchanged)"
+    (probe-file (merge-pathnames "login-token.lisp" *here*)))
+
+(ok "the one decision left is a CALL: ASK-ADMISSION, over glass:ADMISSION-ADMIT"
+    (and (search "(defun ask-admission" *gateway*)
+         (search "(glass:admission-admit pubkey code" *gateway*)))
+(ok "and it is the ONLY admission decision in the file — no second path, no fallback store"
+    (= 1 (let ((n 0) (at 0))
+           (loop for i = (search "(ask-admission " *gateway* :start2 at)
+                 while i do (incf n) (setf at (1+ i)))
+           n)))
+(ok "IT FAILS CLOSED, and says so in a line that names the port, because a silent refusal
+        here gets diagnosed for an hour in the wrong process"
+    (and (search "FAIL CLOSED" *gateway*)
+         (search "ADMISSION UNREACHABLE" *gateway*)))
+(ok "the reasoning is written down beside it, not left to a commit message"
+    (search "THE DESKTOP IS ALREADY A HARD DEPENDENCY OF THIS PROCESS" *gateway*))
+(ok "…and the gateway reports the desktop's posture once at startup, so `nobody can connect'
+        has somewhere to be diagnosed from"
+    (search "(glass:admission-ping" *gateway*))
+(ok "the loopback port is the convention, one past the microphone's"
+    (and (search "GLASS_ADMISSION_PORT" *gateway*) (search "5915" *gateway*)))
+
+(banner "warp's device panel followed the store")
+(ok "its QUERY asks the desktop" (search "(glass:admission-devices" *warp*))
+(ok "its INVOKER asks the desktop's allowlist" (search "(glass:admission-allowed-p" *warp*))
+(ok "and its REVOKE is a service call, not a file write — a panel still rewriting a local
+        .glass-devices would be revoking terminals nobody enforces"
+    (and (search "(glass:admission-revoke" *warp*)
+         (null (search "*DEVICES-FILE*" *warp*))))
+(ok "none of the gateway's old store names survive in it either"
+    (and (null (search "(sync-devices)" *warp*))
+         (null (search "(authorized-p " *warp*))
+         (null (search "*devices-lock*" *warp*))))
 
 ;;; ==============================================================================
 (banner "the service, over a real socket, called the way the gateway calls it")
