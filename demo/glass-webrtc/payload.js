@@ -62,6 +62,29 @@ export async function init(api) {
   const tStart   = performance.now() - api.stamp();   // the SHELL's clock, so the log is one timeline
   const log      = (...a) => console.log('[glass-payload]', ...a);
 
+  // ---- ON-OPEN: register, AND catch up -----------------------------------------------------------
+  // Every channel is created by the shell, before this file exists — so by the time we listen, they
+  // are already open, and 'open' does not fire twice.  A plain addEventListener here is a handler
+  // that will never run: it is not a race, it is a certainty, and it fails silently as a control
+  // that stays disabled forever with nothing in the log.
+  //
+  // This is the same shape as the buffered RFB greeting: state that arrived before we did.  Bytes
+  // needed replaying; an edge needs re-deriving from the level, which is what READYSTATE is for.
+  //
+  // Shipped disabled and found by use: paste (on `ch`) and the quality ladder (on `ctrl`) were both
+  // dead in the first split build, while mic and speaker — which do not wait on a channel edge —
+  // worked.  Anything else that waits on an edge the shell may already have consumed belongs here.
+  // The catch-up is DEFERRED, and that is not caution — it is required.  These handlers close over
+  // controls declared further down (`qBtn`, `pasteBtn`), so calling FN synchronously here reaches
+  // them in their temporal dead zone and throws.  setTimeout(0) is a macrotask, so it runs after
+  // this function's body has finished no matter how many awaits are in it, which is exactly the
+  // guarantee "the event would have arrived later" already gave us.
+  const onOpen = (c, fn) => {
+    if (!c) return;
+    c.addEventListener('open', fn);
+    if (c.readyState === 'open') setTimeout(fn, 0);
+  };
+
   // ---- the ICE half of the liveness check ------------------------------------------------------
   // It lives HERE and not in the shell because it is a getStats reading, and getStats is polled by
   // pollPath below — but what it produces is the shell's `markAlive`, which is why that is the only
@@ -420,8 +443,8 @@ export async function init(api) {
       const rungLine = `rung = ${m.kbps} kbps (${m.target_kbs} KB/s, key qi ${m.key_qi}, resync ${m.key_secs}s)`;
       if (rungLine !== lastRungLine) { lastRungLine = rungLine; diag(rungLine); }
     });
-    ctrl.addEventListener('open', () => { diag('control channel OPEN'); setBtn(qBtn, qOn ? 'on' : 'off');
-                                          ctrl.send('{"get":1}'); });
+    onOpen(ctrl, () => { diag('control channel OPEN'); setBtn(qBtn, qOn ? 'on' : 'off');
+                         ctrl.send('{"get":1}'); });
     // The ladder is the box's to move, so with the control channel shut there is nothing this
     // button can do — faded, not struck, because the difference matters.
     ctrl.addEventListener('close', () => { diag('control channel CLOSE');
@@ -1306,8 +1329,8 @@ if (typeof window !== "undefined") window.makeWarpClient = makeWarpClient;
     dbgBtn.addEventListener('click', () => { dbgOn = !dbgOn; applyDbg(); });
     applyDbg();
 
-    ch.addEventListener('open', () => { diag('datachannel OPEN'); setStep(3);
-                                        setBtn(pasteBtn, 'idle'); });
+    onOpen(ch, () => { diag('datachannel OPEN'); setStep(3);
+                       setBtn(pasteBtn, 'idle'); });
     // The session is gone, so none of these can do anything — and "cannot" has to look different
     // from "off", or the row goes on inviting taps that will not land.
     ch.addEventListener('close', () => { diag('datachannel CLOSE');
