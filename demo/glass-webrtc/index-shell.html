@@ -15,6 +15,13 @@
   <title>glass over WebRTC · Nostr (NIP-07)</title>
   <style>
     html,body{margin:0;height:100%;background:#111;overflow:hidden}#screen{width:100vw;height:100vh}
+    /* HIDDEN UNTIL ASKED FOR.  These are the payload's debug surfaces, but they live in the
+       shell's markup, and the payload arrives seconds later over the data channel -- so
+       without this they are painted, and read as a flicker of green log text before the
+       payload's APPLYDBG() gets to hide them.  In the monolith that hiding ran in the same
+       script that painted the page, so the window did not exist.  The connection card is the
+       shell's own status surface; the hud is debug and starts off. */
+    #hud,#diag{display:none}
     #hud{position:fixed;top:0;left:0;right:0;z-index:12;font:11px/1.4 ui-monospace,Menlo,monospace;
          color:#7CFC9B;background:rgba(0,0,0,.72);padding:5px 8px;
          white-space:pre;pointer-events:none;text-shadow:0 0 2px #000}
