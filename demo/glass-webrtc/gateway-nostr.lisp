@@ -83,90 +83,40 @@
   "T iff PUBKEY (hex) is on the allowlist.  No allowlist => NIL (deny all)."
   (and pubkey *allow* (member (string-downcase pubkey) *allow* :test #'string=) t))
 
-;; ---- self-service link refresh: an allowlisted identity can DM the box (any short
-;; text containing "link") and get a fresh login link gift-wrapped back, so they don't
-;; need box shell access when a code expires.
-(defun link-request-p (payload)
-  "T iff PAYLOAD is a short plain-text DM asking for a link (not an SDP offer)."
-  (and (stringp payload) (<= (length payload) 64)
-       (search "link" (string-downcase payload))))
-
-;; ---- DM command surface ------------------------------------------------------
-;; The box has no HTTP and no console, but it does have an authenticated DM channel, so that is
-;; where administration lives.  Commands are short text DMs; the reply is plain text.
+;; ---- the DM command surface is NOT HERE ANY MORE -----------------------------
+;; `link', `devices', `revoke' and `help' used to be answered by this file.  They are answered by
+;; the DESKTOP now — glass's :glass/nostr system, src/nostr.lisp — for the same reason the audio
+;; mixer is the desktop's and not this file's: WHO MAY OPEN THIS DESKTOP is a property of the
+;; desktop, not of whichever wire somebody arrived on.  Three costs made it worth moving:
 ;;
-;;   link                 -> a fresh magic link          (allowlist or an enrolled device)
-;;   devices              -> list enrolled terminals     (allowlist ONLY)
-;;   revoke <prefix|all>  -> un-enrol one or all         (allowlist ONLY)
-;;   help                 -> this list
+;;   * THE DIAGNOSTIC CHANNEL DIED WITH THE THING BEING DIAGNOSED.  gw-keepalive.sh restarts this
+;;     process on every config change and respawns it on every crash, and a missing NOSTR_SEC is a
+;;     deliberate crashloop — so in exactly the situation where somebody would DM the box to ask
+;;     what is wrong, nothing was listening.  The desktop stays up for days.
+;;   * IT DID NOT SURVIVE A SECOND TRANSPORT.  The LAN gateway.lisp path, a native client, or a
+;;     second gateway would each have needed the box secret and its own copy of the enrolment
+;;     store: two writers to one file synchronised by mtime.
+;;   * warp WANTED IT.  warp-channel.lisp's device manager ran in here only because the data did.
 ;;
-;; Management is restricted to the allowlist on purpose: a device key is a bearer credential that
-;; could be lifted from a browser, and it must not be able to keep itself alive, revoke the others,
-;; or enumerate the fleet.  It can only ask for a link.
-(defun parse-command (payload)
-  "A short text DM -> (values VERB ARG), or NIL if it is not a command."
-  (when (and (stringp payload) (<= (length payload) 80))
-    (let* ((txt (string-trim '(#\Space #\Tab #\Newline #\Return) (string-downcase payload)))
-           (sp (position #\Space txt))
-           (verb (if sp (subseq txt 0 sp) txt))
-           (arg (and sp (string-trim '(#\Space) (subseq txt (1+ sp))))))
-      (cond ((zerop (length txt)) nil)
-            ((search "link" verb) (values :link nil))
-            ((string= verb "devices") (values :devices nil))
-            ((string= verb "revoke") (values :revoke arg))
-            ((or (string= verb "help") (string= verb "?")) (values :help nil))
-            (t nil)))))
+;; THIS IS A SWAP AND NOT AN ADDITION.  Both processes subscribe to the same box pubkey for the
+;; same kind, so if this file went on answering commands every DM would get TWO replies, from two
+;; processes, with two different tokens in them.  The halves are disjoint by construction: a
+;; command is a DM of 80 characters or fewer, and an SDP offer is thousands.  This file answers
+;; offers; the desktop answers commands; neither can see the other's traffic as its own.
+;;
+;; (LINK-REQUEST-P went with them.  It was dead code — nothing had called it since the command
+;; parser replaced it — and leaving a dead command matcher behind in the file that no longer has a
+;; command surface is exactly the kind of thing that reads as a live feature a year from now.)
 
 (defun %unix-now () (- (get-universal-time) (encode-universal-time 0 0 0 1 1 1970 0)))
 
-(defun describe-devices ()
-  "Human-readable listing of enrolled terminals."
-  (sync-devices)
-  (let ((now (%unix-now)) (rows '()))
-    (bt:with-lock-held (*devices-lock*)
-      (maphash (lambda (pk exp) (when (> exp now) (push (cons pk exp) rows))) *devices*))
-    (if (null rows)
-        "No terminals are enrolled."
-        (format nil "~a enrolled terminal~:p:~%~{~a~%~}~@
-                     Use \"revoke <first-8>\" or \"revoke all\"."
-                (length rows)
-                (mapcar (lambda (r)
-                          (let ((hrs (/ (- (cdr r) now) 3600.0)))
-                            (if (< hrs 1)
-                                (format nil "  ~a  expires in ~d min" (subseq (car r) 0 8)
-                                        (max 1 (round (* hrs 60))))
-                                (format nil "  ~a  expires in ~,1f h" (subseq (car r) 0 8) hrs))))
-                        (sort rows #'> :key #'cdr))))))
-
-(defun revoke-devices (arg)
-  "Un-enrol terminals matching ARG (an 8+ char pubkey prefix, or \"all\").  Returns a reply string."
-  (sync-devices)
-  (let ((killed '()))
-    (bt:with-lock-held (*devices-lock*)
-      (cond
-        ((and arg (string= arg "all"))
-         (maphash (lambda (pk exp) (declare (ignore exp)) (push pk killed)) *devices*)
-         (clrhash *devices*))
-        ((and arg (>= (length arg) 4))
-         (maphash (lambda (pk exp) (declare (ignore exp))
-                    (when (and (>= (length pk) (length arg))
-                               (string= arg (subseq pk 0 (length arg))))
-                      (push pk killed)))
-                  *devices*)
-         (dolist (pk killed) (remhash pk *devices*)))))
-    (save-devices)
-    (cond ((null arg) "Usage: revoke <first-8-of-pubkey> | revoke all")
-          ((null killed) (format nil "Nothing matched \"~a\"." arg))
-          (t (format nil "Revoked ~a terminal~:p:~%~{  ~a~%~}" (length killed)
-                     (mapcar (lambda (pk) (subseq pk 0 8)) killed))))))
 (defparameter *nsite-npub*
   (or (uiop:getenv "NSITE_NPUB")
       "npub1ajvjnhgcmdxkng22lzsh22qvl63es78gk6p9mwksepju974teguq4l4evc"))
-;; LOGIN_URL_BASE aims the link at a specific published build.  It must name a PATH (/k23.html), not
-;; a ?v= query: an nsite gateway resolves a request by path against the kind-15128 manifest, so a
-;; query string selects the same blob and the browser is free to keep serving its cached copy.
-(defparameter *link-base*
-  (or (uiop:getenv "LOGIN_URL_BASE") (format nil "https://~a.nsite.lol/" *nsite-npub*)))
+;; LOGIN_URL_BASE went with the `link' command: the only thing here that built a URL was the command
+;; that replied with one, and the desktop reads the same variable now (GLASS_LOGIN_URL_BASE, falling
+;; back to LOGIN_URL_BASE, so a launcher that already exports it needs no change).  What stays is the
+;; TTL, because the renewal token that rides back with every ANSWER is still minted here.
 (defparameter *link-ttl* (or (ignore-errors (parse-integer (uiop:getenv "LINK_TTL"))) 1800))
 
 ;; ---- enrolled devices ("remember this terminal") -----------------------------
@@ -786,6 +736,10 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
       (format t "@@ allowlist:  ~{~a~^, ~}~%" (mapcar (lambda (h) (subseq h 0 12)) *allow*))
       (format t "@@ allowlist:  (empty) — no NOSTR_ALLOW; only one-time codes admit clients.~%"))
   (format t "@@ login-link: sbcl --script login-link.lisp <npub|email> [ttl]  (DMs a code)~%")
+  ;; Said out loud, because "the box stopped answering `link'" is otherwise diagnosed here, in the
+  ;; process that no longer has the answer.  The DM surface is the DESKTOP's; this process answers
+  ;; offers and nothing else.
+  (format t "@@ commands:   answered by the DESKTOP (glass :glass/nostr), not by this process~%")
   ;; Printed ONLY when the channel is enabled, so a gateway that is not offering it logs exactly
   ;; what it logged before — the banner is the last place a "changes nothing" claim could leak.
   (when *warp-channel-enabled*
@@ -878,46 +832,17 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                        (when reply (cl-nostr.pool:pool-publish pool reply))
                        (format t "@@ answer gift-wrapped -> ~a...~%" (subseq phone-pub 0 8))
                        (finish-output))))))
-               ;; ---- command DMs ----
-               (t
-                (multiple-value-bind (verb arg) (parse-command payload)
-                  (when verb
-                    (let* ((admin (authorized-p phone-pub))     ; the box's own npub
-                           (dev   (device-enrolled-p phone-pub))
-                           (who   (subseq phone-pub 0 8))
-                           (reply
-                             (case verb
-                               (:link
-                                ;; the one command an enrolled device may also use
-                                (if (or admin dev)
-                                    (let ((token (glass-login:mint-token *box-secret* :ttl *link-ttl*)))
-                                      (format nil "Fresh glass login link (expires in ~a min):~%~%~a#box=~a&code=~a"
-                                              (max 1 (round *link-ttl* 60)) *link-base* box-npub token))
-                                    :denied))
-                               (:devices (if admin (describe-devices) :denied))
-                               (:revoke  (if admin (revoke-devices arg) :denied))
-                               (:help
-                                (if (or admin dev)
-                                    (format nil "Commands:~%  link~%~@[~a~]"
-                                            (and admin "  devices~%  revoke <first-8> | revoke all~%"))
-                                    :denied))
-                               (t nil))))
-                      (cond
-                        ((null reply) nil)
-                        ((eq reply :denied)
-                         (format t "~&@@ ~(~a~) DENIED ~a... (~:[not authorised~;device: management is allowlist-only~])~%"
-                                 verb who dev)
-                         (finish-output))
-                        (t
-                         (cl-nostr.pool:pool-publish
-                          ;; :AFTER — stamp the reply strictly later than the DM it answers.  We
-                          ;; often reply inside the same second, and the box's clock need not agree
-                          ;; with the phone's; either way the answer sorts above the question in the
-                          ;; recipient's client, which reads as the box talking to itself.
-                          pool (cl-nostr.nip59:build-giftwrap kp phone-pub reply :after rumor-at))
-                         (format t "~&@@ ~(~a~) from ~a... (~a) -> replied~%"
-                                 verb who (if admin "allowlist" "enrolled device"))
-                         (finish-output)))))))))))
+               ;; ---- anything that is not an offer ----
+               ;; A command DM lands here, and this file does NOTHING with it: the desktop's
+               ;; :glass/nostr bot is subscribed to the same box pubkey for the same kind and is
+               ;; the one that answers.  Replying here as well would send every `link' TWO magic
+               ;; links, minted by two processes, in two DMs — which is why removing this branch
+               ;; was a condition of adding that one and not a separate tidy-up.
+               ;;
+               ;; It stays a CLAUSE rather than becoming an absent one so the shape of the dispatch
+               ;; still says what happens to a DM that is not an offer: nothing, silently, which is
+               ;; also what happens to somebody's chatter and to a relay's backlog.
+               (t nil)))))
        (error (e) (format t "~&@@ signal error: ~a~%" e) (finish-output)))))
   (format t "@@ subscribed; waiting for gift-wrapped offers~%")
   (finish-output)

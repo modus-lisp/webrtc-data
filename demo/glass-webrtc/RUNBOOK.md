@@ -16,15 +16,22 @@ Two long-lived processes, and no inbound port on either.
 ```
 gw-keepalive.sh                       supervisor: re-sources config, respawns forever
   └─ sbcl … gateway-nostr.lisp        signalling + WebRTC + encode.  NO listening TCP port.
-       ├─ out: wss to 3 Nostr relays          (signalling)
+       ├─ out: wss to 3 Nostr relays          (OFFERS only — commands are the desktop's)
        ├─ out: UDP to STUN, and to coturn     (media)
-       └─ out: TCP to the desktop  :5903 RFB (twice) · :5913 audio · :5914 mic
+       └─ out: TCP to the desktop  :5903 RFB (twice) · :5913 audio · :5914 mic · :5915 admission
 
 sbcl … desktop-5903.lisp              the glass desktop.  NOT supervised by anything.
        ├─ 0.0.0.0:5903    RFB
        ├─ 127.0.0.1:5913  session audio mix out
-       └─ 127.0.0.1:5914  peer microphone in
+       ├─ 127.0.0.1:5914  peer microphone in
+       ├─ 127.0.0.1:5915  admission: who may open this desktop  (:glass/nostr)
+       └─ out: wss to 3 Nostr relays          (the DM command bot)
 ```
+
+**The identity, the enrolment store and the DM command surface are the DESKTOP's** (§2.1). They
+used to be the gateway's, which meant the box stopped answering DMs in exactly the situation you
+would DM it — the gateway restarts on every config change, respawns on every crash, and crashloops
+on a missing `NOSTR_SEC`. The desktop stays up for days.
 
 The browser is served as a static page from an **nsite** gateway (Nostr + Blossom), so there is no
 web server either. The consequence worth internalising: **nothing here needs a port forwarded, a
@@ -43,9 +50,16 @@ is rejected before the gateway sees it.
 Relays default to `relay.damus.io`, `nos.lol`, `relay.primal.net` (`NOSTR_RELAYS` overrides). Fan-out
 means one offer arrives three or more times; duplicates are dropped by wrap event id.
 
-### Commands
+### 2.1 Commands — answered by the desktop, not by the gateway
 
-A DM is treated as a command only if it is a string of **≤80 characters**. Four exist:
+**The four commands live in glass**, in `:glass/nostr` (`glass/src/nostr.lisp`), together with the
+enrolment store, the token mint and the allowlist. Both processes subscribe to the same box pubkey
+for kind 1059; they split the traffic by size, and the split is total: a command is a DM of **≤80
+characters** and an SDP offer is thousands. The gateway answers offers and says nothing else.
+
+That split is a **swap and not an addition**. If the gateway still answered `link` while the desktop
+also did, every request would get two magic links from two processes. `admission-test.lisp` asserts
+by reading the gateway's own source that its command surface is gone.
 
 | command | effect | who |
 |---|---|---|
@@ -54,8 +68,17 @@ A DM is treated as a command only if it is a string of **≤80 characters**. Fou
 | `revoke <prefix\|all>` | drop an enrolment | allowlist only |
 | `help` / `?` | usage | allowlist or device |
 
-A denied command produces **no reply at all**, only a local log line. That silence is why the browser
-has its own fallback (below).
+`devices` and `revoke` are allowlist-only **on purpose**: a device key is a bearer credential that
+can be lifted out of a browser, and it must not be able to keep itself alive, revoke the others, or
+enumerate the fleet.
+
+A denied command produces **no reply at all**, only a local log line — an answer would tell an
+unknown sender that the box is here, is listening, and understood them. That silence is why the
+browser has its own fallback (below).
+
+The desktop also ignores a command whose rumour is older than `*NOSTR-COMMAND-MAX-AGE*` (600 s).
+The gateway never had that guard, so restarting it could re-answer a `link` from hours ago in the
+relay backlog with a fresh live credential.
 
 ### Three ways in
 
@@ -261,12 +284,13 @@ the desktop has no supervisor at all.
 
 ### What is hardcoded to one installation
 
-In rough order of how badly it bites: the box secret (two files) and its derived pubkey (a third);
+In rough order of how badly it bites: the box secret (**three** places now — the gateway launcher,
+`login-link.lisp`, and the desktop launcher's `GLASS_NOSTR_SEC`) and its derived pubkey (a fourth);
 the site npub (**five** files); the TURN server, user and password (launcher *and* browser bundle,
 which needs a rebuild to change); `TURN_RELAY_PEER`; `ICE_LOCAL_IP`; `NOSTR_ALLOW`; the absolute paths
 in the launcher and in `desktop-5903.lisp` (including `mcclim-glass.asd`, which is *not* in
 `local-projects`, so that literal path is load-bearing); voice and ear model paths under `/mnt`;
-esbuild's path under one user's home; and the 5903/5913/5914 port convention, which is asserted in a
+esbuild's path under one user's home; and the 5903/5913/5914/5915 port convention, which is asserted in a
 docstring and enforced nowhere.
 
 ---
@@ -364,12 +388,14 @@ untested remainder is `sctp-send-string` itself, which already carries RFB and t
     pass. The `[rung]` log line is the one that tells the truth.
 12. `*video-pt*` and `*last-assoc*` are process globals mutated per session, despite comments saying
     otherwise — unsafe with overlapping sessions.
-13. `link` is matched by **substring**, so `blink` and `linkedin` both mint a login link.
-14. `revoke` accepts a 4-character prefix while advertising 8.
+13. `link` is matched by **substring**, so `blink` and `linkedin` both mint a login link. (Now in
+    `glass/src/nostr.lisp`, deliberately preserved: people have it in their message history.)
+14. `revoke` accepts a 4-character prefix while advertising 8. Also preserved, also in glass.
 15. The seen-wrap set is flushed **wholesale** at 4096 entries, briefly reopening the replay window.
 16. Control-channel JSON is hand-scraped and hand-formatted on the box; any format drift breaks it
     silently.
-17. `GATHER_SRFLX` in the launcher is vestigial, and `link-request-p` is dead code.
+17. `GATHER_SRFLX` in the launcher is vestigial. (`link-request-p` was dead code and is gone; it
+    left with the command surface.)
 18. The FramebufferUpdateRequest filter is a magic-byte heuristic, and the RFB channel stays live in
     video-primary mode.
 
