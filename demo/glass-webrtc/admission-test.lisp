@@ -161,6 +161,48 @@
 (ok "the loopback port is the convention, one past the microphone's"
     (and (search "GLASS_ADMISSION_PORT" *gateway*) (search "5915" *gateway*)))
 
+;;; ==============================================================================
+(banner "the allowlist top-up: one call, in one place, guarded")
+;;; ==============================================================================
+;;;
+;;; ADMIT-PEER declines to mint for an allowlist admission — "an owner has a signer and does not
+;;; need a bearer credential pushed at them".  True of the owner and false of the BROWSER: it signs
+;;; offers with a device key it keeps in localStorage, so an allowlist admission enrols an npub the
+;;; browser will never present again, and the terminal is back at the signer on the next cold load.
+;;; The gateway closes that by asking for a token the desktop would not volunteer.
+;;;
+;;; This is a supervised process — gw-keepalive.sh respawns it — so the shape of the addition
+;;; matters as much as the addition: one call, reachable only for :ALLOWLIST, wrapped, and unable
+;;; to make the answer worse than it was.
+
+(ok "the gateway asks for it — and asks the DESKTOP, which is where the mint lives"
+    (search "(glass:admission-mint pubkey" *gateway*))
+(ok "ONCE, and only inside ASK-ADMISSION — a second mint site is a second policy"
+    (let ((n 0) (at 0) (edge (search "(defun parse-offer" *gateway*)))
+      (loop for i = (search "(glass:admission-mint" *gateway* :start2 at)
+            while i do (incf n) (setf at (1+ i))
+                       (ok "  …and it is above PARSE-OFFER, i.e. inside ASK-ADMISSION" (< i edge)))
+      (= n 1)))
+(ok "REACHABLE ONLY FOR :ALLOWLIST — :code and :device keep the token ADMIT-PEER minted, and a
+        denial keeps its reason"
+    (search "(when (and (eq via :allowlist) (not (stringp token)))" *gateway*))
+(ok "GUARDED, so a new failure mode here is not a crashloop with a dead desktop behind it"
+    (let ((at (search "(glass:admission-mint pubkey" *gateway*)))
+      (and at (search "(ignore-errors" *gateway* :start2 (max 0 (- at 200)) :end2 at))))
+(ok "…and it can only ADD: TOKEN is replaced only when a string came back, so a refusal or an
+        unreachable desktop leaves the answer exactly as it is today"
+    (and (search "(when (stringp minted)" *gateway*)
+         (search "(values via (and (stringp token) token))" *gateway*)))
+
+;; The other half of "minimal": nothing downstream of it moved.  The envelope is built from the
+;; same variable, in the same place, under the same condition it always was.
+(dolist (kept '("(multiple-value-bind (via renewal) (ask-admission phone-pub code)"
+                "(when renewal (setf (gethash \"code\" ht) renewal))"
+                "(gethash \"ufrag\" ht)"))
+  (ok (format nil "the answer envelope is untouched: ~a" kept) (search kept *gateway*)))
+(ok "and the comment beside it no longer says the opposite of what the code does"
+    (null (search "An allowlisted owner is handed" *gateway*)))
+
 (banner "warp's device panel followed the store")
 (ok "its QUERY asks the desktop" (search "(glass:admission-devices" *warp*))
 (ok "its INVOKER asks the desktop's allowlist" (search "(glass:admission-allowed-p" *warp*))
@@ -209,7 +251,31 @@
   (ok "  …and renewed again, so an active terminal never needs a new link" (not (null token))))
 (multiple-value-bind (via token) (at glass:admission-admit *owner* nil)
   (ok "the owner is admitted `allowlist'" (eq :allowlist via))
-  (ok "  …with no token, exactly as the deployed gateway does it today" (null token)))
+  (ok "  …and the DESKTOP still volunteers no token for them, which is the rule the gateway
+        now tops up rather than the rule it changes — glass is untouched" (null token)))
+
+;;; ---- and the top-up itself, against the real service --------------------------
+;;; The gateway's second call for an allowlist admission, and then the property the whole design
+;;; rests on: A LOGIN TOKEN IS NOT BOUND TO A PUBKEY.  Minted on the owner's authority, spent by a
+;;; device key the desktop has never admitted — because the MAC is over "glass-login|nonce|exp" and
+;;; nothing else.  If that were false this change would silently do nothing: the browser would
+;;; store a credential it could not use and go on asking for the signer forever.
+
+(defparameter *newdev* "4444444444444444444444444444444444444444444444444444444444444444")
+(let ((minted (at glass:admission-mint *owner*)))
+  (ok "MINT, on the owner's authority: a real token, in the format the desktop verifies"
+      (and (stringp minted) (glass:verify-login-token minted)))
+  (multiple-value-bind (via) (at glass:admission-admit *newdev* minted)
+    (ok "A KEY THE DESKTOP HAS NEVER SEEN SPENDS IT, and is admitted `code'.
+        This is the bridge the browser crosses: it signed in as the owner and walks away with a
+        credential its OWN device key can present on the next load" (eq :code via)))
+  (multiple-value-bind (via) (at glass:admission-admit *newdev* nil)
+    (ok "  …and spending it ENROLLED that key, so the load after that needs no code either —
+        one signature, a durable terminal" (eq :device via))))
+(ok "a stranger cannot mint — the verb is allowlist-or-enrolled, and the gateway only ever
+        reaches it with a pubkey the desktop has just admitted"
+    (null (at glass:admission-mint *rando*)))
+(at glass:admission-revoke *owner* (subseq *newdev* 0 8))
 (multiple-value-bind (via why) (at glass:admission-admit *rando* nil)
   (ok "a stranger is refused" (null via))
   (ok "  …with a reason the gateway can log, so a locked-out person is diagnosable"

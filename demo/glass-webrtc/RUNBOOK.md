@@ -93,6 +93,37 @@ Checked in this order, **by the desktop**, and the first match wins:
 A code authorises *independently of the allowlist*, and any admitted connection enrols the caller as
 a device. One leaked link is therefore durable access until someone runs `revoke`.
 
+**The browser signs with a device key, not with your npub** — a secret it generates once and keeps
+in `localStorage`. That is what makes the allowlist row subtle: signing in through a NIP-07 signer
+authenticates as your *real* npub, so the enrolment it earns is granted to a pubkey the browser will
+never present again, and the terminal is back at the signer on the next cold load. So the gateway
+asks the desktop for a login code on an **allowlist** admission too (`ASK-ADMISSION`, one extra
+`mint` round trip, allowlist only) and puts it in the answer envelope. A login token is not bound to
+a pubkey — the MAC is over `glass-login|nonce|exp` and nothing else — so the browser spends it under
+its **own** device key on the next load, is admitted `code`, and *that* is what enrols the device.
+One signature buys a durable terminal.
+
+### Signing in, when a terminal has lapsed
+
+A denial is silent, so a browser whose enrolment expired cannot tell "refused" from "box
+unreachable" — it can only time out. When it does, the connection card says which failure it is
+(an expired link names the moment it died; an unenrolled one says so) and, **if `window.nostr`
+exists**, offers a **Sign in with Nostr** button.
+
+The signer is never touched without that tap. The page *reads* `window.nostr` to decide whether to
+draw the button — free, no approval sheet — and calls nothing on it until pressed. Pressing it sets
+a one-shot `glass-signin:<box>` flag in `sessionStorage` and reloads; `makeIdentity` consumes the
+flag, signs the offer through the signer, and the reload is the retry (the PeerConnection on the
+failed page has already gathered and offered). With no signer present the old message stands
+unchanged: DM `link` to the box.
+
+Both halves are tested together in `t/signin.sh` — the built page in a real headless Chromium, real
+gift wraps over a local relay, a box that runs glass's admission rules — including the assertion the
+whole thing exists for: **a load with the signer removed still connects**, and the one after that
+needs no code either. It ends with a negative control (the box with the top-up switched off) that
+shows the failure recurring, so a passing run is a measurement and not a coincidence. The gateway's
+own half is asserted from its *text*, in `admission-test.lisp`; that file may never be loaded.
+
 The gateway makes **one call per offer**:
 
 ```
@@ -160,7 +191,9 @@ The box npub and code live in the `#fragment`, which an nsite gateway never rece
 claims single-use is enforced by the gateway. It is not; the gateway's own comment is the truth.)
 
 Every successful answer carries a *fresh* token back, stored in `localStorage`, so an active terminal
-never needs a new link.
+never needs a new link. That now includes **allowlist** admissions, which the desktop declines to
+mint for and the gateway tops up — see §2.2 for why a signer's admission is the one that most needs
+it.
 
 TTLs disagree between call sites: 900 s from the CLI (`login-link.lisp`), 1800 s
 (`GLASS_LOGIN_TTL`, falling back to `LINK_TTL`) for the desktop's `link` DM and for the renewal that
@@ -172,6 +205,9 @@ rides back with each answer.
 offer  phone → box   {"sdp": "<full non-trickle SDP>", "code": "<token>"}
 answer box → phone   {"sdp": …, "ufrag": "<the OFFER's ice-ufrag>", "code": "<renewed token>"}
 ```
+
+`code` rides back on **all three** ways in now — the desktop mints it for `code` and `device`, the
+gateway tops it up for `allowlist` (§2.2).
 
 Signalling is **one-shot and non-trickle**: the browser gathers fully (capped at 10 s) and publishes
 once. There is no renegotiation path anywhere in the system — which is why the microphone transceiver

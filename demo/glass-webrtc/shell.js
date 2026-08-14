@@ -564,6 +564,29 @@ const deviceSecret = () => {
   } catch (_) { return generateSecretKey(); }
 };
 
+// ---- signing in: A TAP, AND NEVER OTHERWISE ----------------------------------------------------
+// A NIP-07 signer is not a fallback and must not be reached for as one.  Touching window.nostr pops
+// the signer's approval sheet, and doing that on a cold load — which is what "try the signer when
+// there is no code and no device" amounts to — is a prompt nobody asked for, on a page that has not
+// yet established there is anything wrong.  So the signer is offered as a BUTTON on the failure
+// screen and nowhere else, and THIS FLAG is the entire record of "somebody tapped it".
+//
+// sessionStorage because the retry is a RELOAD (see SCHEDULERECONNECT for why every retry in this
+// file is): it has to survive the navigation and it has to die with the tab.  CONSUMED on read, so
+// one tap is one attempt — a flag that stuck would turn a single tap into a signer prompt on every
+// subsequent load of that tab, which is the thing it exists to prevent.
+const SIGNIN_KEY = 'glass-signin:' + boxArg;
+const askSignIn = () => { try { sessionStorage.setItem(SIGNIN_KEY, '1'); } catch (_) {} };
+const takeSignIn = () => {
+  let w = false;
+  try { w = sessionStorage.getItem(SIGNIN_KEY) === '1'; sessionStorage.removeItem(SIGNIN_KEY); }
+  catch (_) {}
+  return w;
+};
+// Reading the PROPERTY is free — an extension injects an object, and no sheet appears until one of
+// its methods is called.  So this is the whole of what the failure screen is allowed to ask.
+const haveSigner = () => { try { return Boolean(window.nostr); } catch (_) { return false; } };
+
 // ---- reconnect ---------------------------------------------------------------------------------
 const reconnKey = () => 'glass-reconn:' + boxArg;
 const reconnAttempts = () => { try { return +(sessionStorage.getItem(reconnKey()) || 0) || 0; }
@@ -898,7 +921,28 @@ async function requestFreshCode(pool, sk) {
   });
 }
 
+const noCredential = msg => { const e = new Error(msg); e.noCredential = true; return e; };
+
 async function makeIdentity() {
+  // THE SIGNER GOES FIRST ONLY WHEN IT WAS ASKED FOR, and TAKESIGNIN is what asking looks like —
+  // set by the button on the failure screen, consumed here.  Ordered before the device branch on
+  // purpose: the case this exists for is a device key that IS present and IS stale, so a signer
+  // that only ran when there was no device key would never run at all.
+  if (haveSigner() && takeSignIn()) {
+    const signer = window.nostr;
+    if (!signer.nip44)
+      throw noCredential('Your Nostr signer cannot do NIP-44 encryption, which this box requires.');
+    const pub = await signer.getPublicKey();
+    // The stale credential is NOT sent along.  A dead code makes the box's admission answer
+    // `expired' before it falls through to the allowlist, which is a denial reason in the log for
+    // a login that in fact succeeded — and the offer is being signed as somebody the allowlist
+    // knows, so the code was never going to be what admitted it.
+    code = '';
+    diag('signing in with the NIP-07 signer (asked for by hand)');
+    return { pub, mode: 'nip07',
+             wrapOffer: (payload) => giftWrap07(signer, pub, payload),
+             unwrap: (ev) => giftUnwrap07(signer, ev) };
+  }
   // hasDevice(), not deviceSecret(): the latter MINTS a key when none exists, and a brand-new key is
   // by definition not enrolled — we would sign a well-formed offer the box then refuses.
   if (code || hasDevice()) {
@@ -910,30 +954,79 @@ async function makeIdentity() {
                         catch { return null; } },
     };
   }
-  const signer = window.nostr;
-  if (!signer || !signer.nip44)
-    throw new Error('No login code, no enrolled device, and no NIP-07 signer — open the one-time link from your DM, or use a Nostr signer.');
-  const pub = await signer.getPublicKey();
-  return { pub, mode: 'nip07',
-           wrapOffer: (payload) => giftWrap07(signer, pub, payload),
-           unwrap: (ev) => giftUnwrap07(signer, ev) };
+  // …and with neither, this does NOT quietly reach for window.nostr.  It used to, and that was the
+  // one place in the file that prompted a signer nobody had touched.  The failure screen offers it
+  // instead, which costs one tap and buys the guarantee.
+  throw noCredential('No login code and no enrolled device.');
 }
 
 (async () => {
   let id;
-  const showNoCredential = () => {
+  // ---- the failure screen, and the one thing that can be done about it -------------------------
+  // Three ways to arrive here and they are all the same fact — nothing this browser holds will get
+  // it in.  A denied offer is answered with SILENCE by design (the box will not confirm to an
+  // unknown sender that it is listening), so "refused" and "unreachable" are indistinguishable from
+  // here and the screen must not claim to know which.  What it CAN do is offer the credential the
+  // page has not used: a signer, if one is present, on a tap.
+  let noCredEl = null, noCredBtn = null, signerLooks = 0;
+  const showNoCredential = (why) => {
     const when = codeExp(code) ? new Date(codeExp(code)) : null;
-    setConnRaw(code ? 'This link has expired' : 'This terminal is not enrolled');
-    connMsg.insertAdjacentHTML('afterend',
-      '<div style="max-width:22em;font-size:13px;line-height:1.5;opacity:.75;margin-top:2px">' +
+    setConnRaw(why || (code ? 'This link has expired' : 'This terminal is not enrolled'));
+    // Rendered fresh each time rather than appended: the watchdog and SCHEDULERECONNECT can both
+    // reach this, and a card that grew a second copy of its own advice would read as a bug.
+    if (noCredEl) noCredEl.remove();
+    if (noCredBtn) noCredBtn.remove();
+    noCredEl = document.createElement('div');
+    noCredEl.id = 'nocred';
+    noCredEl.style.cssText = 'max-width:22em;font-size:13px;line-height:1.5;opacity:.75;margin-top:2px';
+    const signer = haveSigner();
+    noCredEl.innerHTML =
       (when ? 'It was valid until ' + when.toLocaleString() + '.<br>' : '') +
-      'DM <b>link</b> to the box for a new one.</div>');
+      (signer ? 'Sign in with your Nostr key to enrol this browser again, or DM <b>link</b> to the box for a new one.'
+              : 'DM <b>link</b> to the box for a new one.');
+    connMsg.insertAdjacentElement('afterend', noCredEl);
+    if (signer) {
+      const btn = noCredBtn = document.createElement('button');
+      btn.type = 'button';
+      btn.id = 'signin';
+      btn.textContent = 'Sign in with Nostr';
+      btn.style.cssText = 'margin-top:10px;align-self:flex-start;pointer-events:auto;' +
+        'touch-action:manipulation;-webkit-tap-highlight-color:transparent;' +
+        'border:1px solid rgba(124,252,155,.55);background:transparent;color:#7CFC9B;' +
+        'border-radius:11px;padding:8px 14px;font:600 13px/1 -apple-system,system-ui,sans-serif';
+      // THE ONLY PLACE THE SIGNER IS EVER ASKED FOR.  Not even here does this handler call it: it
+      // records the tap and reloads, and MAKEIDENTITY does the asking on the way back up.  A reload
+      // is the retry this file already uses everywhere (SCHEDULERECONNECT says why), and it is the
+      // only honest one — the PeerConnection on this page has already gathered, offered and failed.
+      btn.addEventListener('click', e => {
+        e.stopPropagation();
+        askSignIn();
+        diag('sign-in requested by hand — reloading to offer as the signer');
+        setConnRaw('Signing in…');
+        btn.disabled = true;
+        clearReconnAttempts();
+        location.reload();
+      });
+      noCredEl.insertAdjacentElement('afterend', btn);
+    } else if (signerLooks++ < 6) {
+      // An extension injects window.nostr on its own schedule, and this screen can be painted on
+      // the first turn of the event loop (no code, no device).  Absent-at-render is therefore not
+      // absent, and the difference is a button that never appears — so look again for three
+      // seconds.  This does NOT call the signer; it reads a property, which is free.
+      setTimeout(() => { if (haveSigner()) showNoCredential(why); }, 500);
+    }
     failConn();
-    diag('no usable credential' + (when ? ' (expired ' + when.toISOString() + ')' : ''));
+    diag('no usable credential' + (when ? ' (expired ' + when.toISOString() + ')' : '') +
+         (signer ? ' — offering the signer' : ' — no signer to offer'));
   };
-  if (!code && !hasDevice() && !window.nostr) { showNoCredential(); return; }
   window.__showNoCredential = showNoCredential;
-  try { id = await makeIdentity(); } catch (e) { setStatus(e.message); return; }
+  try { id = await makeIdentity(); }
+  catch (e) {
+    // A signer that was tapped and then declined lands here too, and it must land on the SAME
+    // screen — otherwise the one action the page offered leaves it with no way to offer it again.
+    showNoCredential(e.noCredential ? undefined : ('Sign-in failed: ' + e.message));
+    return;
+  }
   const pool = new SimplePool();
 
   // REPLAY: this filter has no since/limit, so relays hand us every gift wrap ever addressed to this
@@ -1005,7 +1098,11 @@ async function makeIdentity() {
   setStatus('offer sent — waiting for the box');
   window.__answerWatchdog = setTimeout(async () => {
     if (pc.remoteDescription) return;
-    if (!hasDevice()) return window.__showNoCredential();
+    // A `link' DM is signed with the DEVICE key and is answered for an enrolled device or an
+    // allowlisted owner — so after a signed-in offer went unanswered there is nothing left for it
+    // to prove, and fifteen seconds spent finding that out is fifteen seconds the screen spends
+    // lying about what it is waiting for.
+    if (!hasDevice() || id.mode === 'nip07') return window.__showNoCredential();
     diag('no answer — asking the box for a fresh code');
     setConnRaw('Renewing access…');
     const fresh = await requestFreshCode(pool, deviceSecret());

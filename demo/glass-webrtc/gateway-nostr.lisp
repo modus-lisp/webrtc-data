@@ -224,6 +224,42 @@ port, because a silent refusal here would be diagnosed for an hour in the wrong 
               (glass:endpoint-string :host *admission-host* :port *admission-port*)
               (subseq pubkey 0 8))
       (finish-output))
+    ;; ---- and one top-up, for the allowlist only ------------------------------------------------
+    ;; ADMIT-PEER mints a renewal for :code and :device and deliberately not for :allowlist — "an
+    ;; owner has a signer and does not need a bearer credential pushed at them".  That is true of
+    ;; the OWNER and false of the BROWSER they are sitting in front of, and the gap is what sends
+    ;; somebody back to their signer on every cold load:
+    ;;
+    ;;   the browser signs offers with a DEVICE key it generates and keeps in localStorage; the
+    ;;   signer signs as the owner's real npub.  An allowlist admission therefore enrols the NPUB
+    ;;   — which the browser will never present again, because the next load has no signer in it
+    ;;   unless somebody taps for one.  The device key stays unenrolled, the enrolment it needed
+    ;;   was granted to a pubkey it does not hold, and the whole exchange leaves it exactly where
+    ;;   it started.
+    ;;
+    ;; A login token closes it because IT IS NOT BOUND TO A PUBKEY: the MAC is over
+    ;; "glass-login|nonce|exp" and nothing else (glass's %TOKEN-MAC), so it is a bearer credential
+    ;; the browser can present under its OWN device key on the next load — where it is admitted
+    ;; :code and the device key is enrolled for *ENROLMENT-TTL*, renewed by use from then on.  So
+    ;; one signature buys a durable terminal, which is what signing in is supposed to mean.
+    ;;
+    ;; MINTED ON THE PEER'S AUTHORITY and not the device's, because the peer's pubkey is the only
+    ;; one this process has ever seen — the device key is never on the wire — and `mint' is
+    ;; allowlist-or-enrolled, which an admitted allowlist peer is by construction.
+    ;;
+    ;; GUARDED, and NIL-safe: ADMISSION-MINT never signals and answers NIL when refused or
+    ;; unreachable, IGNORE-ERRORS covers the rest, and a NIL leaves TOKEN exactly as ADMIT-PEER
+    ;; left it — i.e. today's behaviour.  This is a supervised process; a new failure mode here is
+    ;; a crashloop, not a missing feature.  It costs one extra loopback round trip on allowlist
+    ;; admissions only, which are the owner's own logins and rare.
+    (when (and (eq via :allowlist) (not (stringp token)))
+      (let ((minted (ignore-errors
+                     (glass:admission-mint pubkey :host *admission-host* :port *admission-port*))))
+        (when (stringp minted)
+          (setf token minted)
+          (format t "~&@@ allowlist ~a... — minted a device credential to ride the answer~%"
+                  (subseq pubkey 0 8))
+          (finish-output))))
     (values via (and (stringp token) token))))
 
 (defun parse-offer (payload)
@@ -844,8 +880,11 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                             ;; exchange that already proved who they are — no new message type and
                             ;; no new crypto — and the token was MINTED BY THE DESKTOP, in the same
                             ;; call that admitted them, because the desktop holds the store the
-                            ;; credential is a credential against.  An allowlisted owner is handed
-                            ;; none, exactly as before: RENEWAL is simply NIL for them.
+                            ;; credential is a credential against.  An allowlisted owner gets one
+                            ;; too, on a second call ASK-ADMISSION makes for exactly that case and
+                            ;; explains there — the browser they signed in from holds a device key,
+                            ;; not their npub, and without a bearer code it would be back at the
+                            ;; signer on the next load.
                             ;; ALWAYS an envelope, and it carries the OFFER'S ICE UFRAG back.  A
                             ;; gift-wrapped answer lives on the relays forever, and the phone's
                             ;; subscription has no since/limit — so on the next connection the relays
