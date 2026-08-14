@@ -214,9 +214,9 @@ export async function init(api) {
        THE SECOND WARP APP, ON THE SAME CHANNEL.  Everything above is the device manager; this is
        warp-files, and the only reason it needs a stylesheet of its own is that it NESTS.  The
        client creates one .container per open column, inside #filesRows, and names it in
-       data-container — so Miller columns are `display:flex` on the parent and a fixed width on the
+       data-container — so Miller columns are 'display:flex' on the parent and a fixed width on the
        child, and the horizontal scroll is the browser's own.  There is no layout on the wire and
-       there never was: the server sends `in` and `after` and this file decides what a column is.
+       there never was: the server sends 'in' and 'after' and this file decides what a column is.
        Class names come from warp/dom/client.js, same as the panel above: .v .l .stale on a row,
        .t .c on a menu item, and .container / .opaque / .cap / .dim for what nesting added. */
     #filesPanel{position:fixed;left:10px;right:10px;top:52px;bottom:150px;z-index:23;display:none;
