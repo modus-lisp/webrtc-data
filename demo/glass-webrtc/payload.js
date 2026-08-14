@@ -1564,8 +1564,14 @@ if (typeof window !== "undefined") window.makeWarpClient = makeWarpClient;
     document.body.appendChild(dbgBtn);
     let dbgOn = false;                              // debug overlay hidden by default; ≡ toggles it
     const applyDbg = () => {
-      const d = dbgOn ? '' : 'none';
-      hud.style.display = d; api.ui.diagEl.style.display = d; copyBtn.style.display = d;
+      // 'block', NOT '': the shell hides #hud/#diag in ITS stylesheet so they cannot flash before
+      // this file arrives, and clearing the inline style hands the decision straight back to that
+      // rule.  Showing therefore has to NAME a display, or the toggle silently does nothing --
+      // which is exactly what it did between the flicker fix and this one.  copyBtn keeps '',
+      // because no stylesheet rule hides it and its natural display is the right one.
+      const d = dbgOn ? 'block' : 'none';
+      hud.style.display = d; api.ui.diagEl.style.display = d;
+      copyBtn.style.display = dbgOn ? '' : 'none';
       document.body.classList.toggle('dbg', dbgOn);   // moves the link pill clear of the hud
       setBtn(dbgBtn, dbgOn ? 'on' : 'off');
       // debug view and the clean connecting overlay are mutually exclusive: showing debug hides the
