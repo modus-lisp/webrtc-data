@@ -140,6 +140,13 @@ read, evaluated, or so much as looked at."
 (load (merge-pathnames "warp-channel.lisp" *here*))
 (setf *warp-channel-enabled* t)                    ; WARP_CHANNEL, without an env round trip
 
+;;; A peer's state is a LINK now, not a channel: one stream may carry several apps, so reaching a
+;;; particular one goes through the mux.  NIL is the device manager — the app with no name.
+(defun chan-of (state &optional app)
+  (let ((cell (assoc app (funcall (find-symbol "MUX-CHANNELS" "WARP-DOM") (warp-link-mux state))
+                     :test #'equal)))
+    (cdr cell)))
+
 ;;; ===========================================================================================
 (format t "~&== the gate: with the feature off, nothing here is reachable ==~%")
 ;;; ===========================================================================================
@@ -245,17 +252,17 @@ read, evaluated, or so much as looked at."
 (ok "the guest opened its own channel" (not (null *guest-ch*)))
 (ok "over the SAME projection — rule 8's shared half"
     (eq (funcall (find-symbol "CONSUMER-PROJECTION" "WARP")
-                 (funcall (find-symbol "CHANNEL-CONSUMER" "WARP-DOM") (car *owner-ch*)))
+                 (funcall (find-symbol "CHANNEL-CONSUMER" "WARP-DOM") (chan-of *owner-ch*)))
         (funcall (find-symbol "CONSUMER-PROJECTION" "WARP")
-                 (funcall (find-symbol "CHANNEL-CONSUMER" "WARP-DOM") (car *guest-ch*)))))
+                 (funcall (find-symbol "CHANNEL-CONSUMER" "WARP-DOM") (chan-of *guest-ch*)))))
 (ok "with different invokers, taken from their pubkeys"
     (and (eq :allowlist (funcall (find-symbol "CONSUMER-INVOKER" "WARP")
-                                 (funcall (find-symbol "CHANNEL-CONSUMER" "WARP-DOM") (car *owner-ch*))))
+                                 (funcall (find-symbol "CHANNEL-CONSUMER" "WARP-DOM") (chan-of *owner-ch*))))
          (eq :device (funcall (find-symbol "CONSUMER-INVOKER" "WARP")
-                              (funcall (find-symbol "CHANNEL-CONSUMER" "WARP-DOM") (car *guest-ch*))))))
+                              (funcall (find-symbol "CHANNEL-CONSUMER" "WARP-DOM") (chan-of *guest-ch*))))))
 
 (defun menu-of (state)
-  (let* ((c (funcall (find-symbol "CHANNEL-CONSUMER" "WARP-DOM") (car state)))
+  (let* ((c (funcall (find-symbol "CHANNEL-CONSUMER" "WARP-DOM") (chan-of state)))
          (m (funcall (find-symbol "CONSUMER-MENU" "WARP") c)))
     (mapcar (lambda (it) (first (funcall (find-symbol "PRESENT" "WARP") it
                                          (find-symbol "MENU-ITEM" "WARP")
@@ -271,6 +278,98 @@ read, evaluated, or so much as looked at."
   (format t "     owner: ~{~a~^, ~}~%     guest: ~{~a~^, ~}~%" o g)
   (ok "the owner's hold-menu offers revoke" (member "revoke" o :test #'string=))
   (ok "the guest's does not" (not (member "revoke" g :test #'string=))))
+
+;;; ===========================================================================================
+(format t "~&== a second APP on the same stream: off unless asked, and refused when off ==~%")
+;;; ===========================================================================================
+;;; The multiplex, from the gateway's side.  What is being claimed is narrow and is the whole of
+;;; what this file can claim: an app id routes to the right projection, an app this box does not
+;;; serve is DROPPED rather than mistaken for the default one, and the device manager's channel is
+;;; not touched by either.  That the frames then render as columns is warp/t/two-apps.sh's, in a
+;;; browser, because it is a claim about a browser.
+
+(ok "with WARP_FILES unset the file browser is not an app this box has"
+    (and (null *warp-files-enabled*) (null (warp-app "files"))))
+(let ((before (length (funcall (find-symbol "MUX-CHANNELS" "WARP-DOM") (warp-link-mux *owner-ch*)))))
+  (warp-on-message *owner-ch* :fake-assoc +warp-stream-id+
+                   "{\"t\":\"viewport\",\"rows\":9,\"a\":\"files\"}" *owner-npub*)
+  (ok "so a phone asking for it opens nothing, and is not silently given the device manager"
+      (= before (length (funcall (find-symbol "MUX-CHANNELS" "WARP-DOM")
+                                 (warp-link-mux *owner-ch*)))))
+  (ok "and the device manager's own consumer is untouched by the refusal"
+      (= 10 (funcall (find-symbol "DOM-ROWS" "WARP-DOM")
+                     (funcall (find-symbol "CHANNEL-CONSUMER" "WARP-DOM") (chan-of *owner-ch*))))))
+(ok "an app id nobody has ever served is the same refusal, not a crash"
+    (null (warp-app "no-such-app")))
+
+(format t "~&   -- and with WARP_FILES set, the same peer gets a second consumer --~%")
+;;; The fixture root is in /tmp and the env var is what the gateway would read.  If :warp-files
+;;; will not load — it drags warren, gesso, scribe and pigment — this SKIPS rather than fails: the
+;;; claim is about the routing, and a box without the sibling checkout is the case the guard is for.
+(require :sb-posix)
+(defparameter *files-root* "/tmp/warp-channel-files-fixture/")
+(ensure-directories-exist (merge-pathnames "sub/" *files-root*))
+(with-open-file (s (merge-pathnames "one.txt" *files-root*) :direction :output
+                                                            :if-exists :supersede)
+  (write-string "hello" s))
+(sb-posix:putenv (format nil "WARP_FILES_ROOT=~a" *files-root*))
+(setf *warp-files-enabled* t)
+
+;;; A FRESH PEER, and that is not a convenience: MUX-REFUSED remembers a refusal for the life of a
+;;; link, so *OWNER-CH* — which asked while the app was off — will never be given it.  That is the
+;;; behaviour we want on a gateway (an app that is not served must not cost a load attempt per
+;;; message) and it means enabling one takes a restart, which it already did.
+(defvar *both-ch* nil)
+(if (not (warp-files-ensure-loaded))
+    (format t "~&  skip  :warp-files is not loadable in this image — routing untested~%")
+    (progn
+      ;; THE WIRE IS CLEARED BEFORE THE CHANNELS EXIST, not after: each of these consumers sends
+      ;; its first fill on its first tick, and clearing later throws away whichever one was quick.
+      (setf *wire* '())
+      (setf *both-ch* (warp-on-message nil :fake-assoc +warp-stream-id+
+                                       "{\"t\":\"viewport\",\"rows\":9,\"scroll\":0}" *owner-npub*))
+      (warp-on-message *both-ch* :fake-assoc +warp-stream-id+
+                       "{\"t\":\"viewport\",\"rows\":9,\"scroll\":0,\"a\":\"files\"}" *owner-npub*)
+      (ok "one link, two channels: the app with no name and the one that has one"
+          (and (chan-of *both-ch*) (chan-of *both-ch* "files")
+               (not (eq (chan-of *both-ch*) (chan-of *both-ch* "files")))))
+      (when (and (chan-of *both-ch*) (chan-of *both-ch* "files"))
+        (ok "on its own projection — a different query, not a different view of one"
+            (not (eq (funcall (find-symbol "CONSUMER-PROJECTION" "WARP")
+                              (funcall (find-symbol "CHANNEL-CONSUMER" "WARP-DOM")
+                                       (chan-of *both-ch*)))
+                     (funcall (find-symbol "CONSUMER-PROJECTION" "WARP")
+                              (funcall (find-symbol "CHANNEL-CONSUMER" "WARP-DOM")
+                                       (chan-of *both-ch* "files"))))))
+        ;; asked of the QUERY rather than of the cache, so this does not depend on whether the
+        ;; channel's clock has taken a pass yet
+        (ok "rooted where WARP_FILES_ROOT said, which is the only thing that variable does"
+            (let ((rows (funcall (funcall (find-symbol "PROJECTION-ROWS-FN" "WARP")
+                                          *warp-files-projection*))))
+              (equal (truename *files-root*)
+                     (funcall (find-symbol "BROWSER-ROOT" "WARP-FILES")
+                              (funcall (find-symbol "COLUMN-BROWSER" "WARP-FILES")
+                                       (funcall (find-symbol "ROW-COLUMN" "WARP-FILES")
+                                                (first rows)))))))
+        (ok "and with the same invoker, because it is the same authenticated peer"
+            (eq :allowlist (funcall (find-symbol "CONSUMER-INVOKER" "WARP")
+                                    (funcall (find-symbol "CHANNEL-CONSUMER" "WARP-DOM")
+                                             (chan-of *both-ch* "files")))))
+        (sleep 1.2)
+        (let ((labelled (remove-if-not (lambda (m) (search "\"a\":\"files\"" (cdr m))) *wire*))
+              (plain (remove-if (lambda (m) (search "\"a\":" (cdr m))) *wire*)))
+          (ok "the file browser's frames are labelled and the device manager's are not"
+              (and labelled plain))
+          (ok "and both went out on the ONE stream id — no second channel was needed"
+              (every (lambda (m) (eql +warp-stream-id+ (car m))) *wire*))
+          (when labelled
+            (format t "     ~a~%"
+                    (subseq (cdr (first labelled)) 0 (min 120 (length (cdr (first labelled)))))))
+          (ok "the labelled ones carry the columns in `cs`, which is what makes them nest"
+              (and labelled (every (lambda (m) (search "\"cs\":[\"col:" (cdr m))) labelled)))))
+      (ok "closing the link closes every app on it, and is still safe twice"
+          (and (null (warp-close *both-ch*)) (null (warp-close *both-ch*))))))
+(setf *warp-files-enabled* nil)
 
 ;;; ===========================================================================================
 (format t "~&== rule 6: the guest's out-of-band revoke is refused at INVOCATION ==~%")
@@ -315,10 +414,15 @@ read, evaluated, or so much as looked at."
 ;;; ===========================================================================================
 
 (defun errs (state)
-  (getf (funcall (find-symbol "CHANNEL-STATS" "WARP-DOM") (car state)) :send-errors))
+  (getf (funcall (find-symbol "CHANNEL-STATS" "WARP-DOM") (chan-of state)) :send-errors))
 
 (setf *assoc-state* :aborted)
 (setf *wire* '())
+;; LET THE REVOKE LAND FIRST.  What makes the rewrite below something the channels want to send is
+;; that they have already been told the revoked terminal is gone — so if the :gone has not been
+;; delivered yet, re-adding it diffs to nothing and the aborted link is never touched.  That was an
+;; unstated timing assumption and it held until something slower ran before it.
+(sleep 0.8)
 (write-fixture)                                   ; give both channels something to want to send
 (sleep 1.2)
 (ok "an aborted association is not written to"
@@ -331,7 +435,7 @@ read, evaluated, or so much as looked at."
 (ok "the failure is counted on a channel rather than raised into a session thread"
     (plusp (+ (errs *owner-ch*) (errs *guest-ch*))))
 (ok "and both channels are still ticking rather than having unwound"
-    (and (car *owner-ch*) (car *guest-ch*)))
+    (and (chan-of *owner-ch*) (chan-of *guest-ch*)))
 (setf *assoc-state* :established)
 
 ;;; ===========================================================================================
@@ -345,10 +449,10 @@ read, evaluated, or so much as looked at."
 (ok "and closing it again is still not an error" (null (warp-close *owner-ch*)))
 (ok "the consumer was unseated; the projection outlives the session"
     (and *warp-projection*
-         (not (member (funcall (find-symbol "CHANNEL-CONSUMER" "WARP-DOM") (car *owner-ch*))
+         (not (member (funcall (find-symbol "CHANNEL-CONSUMER" "WARP-DOM") (chan-of *owner-ch*))
                       (funcall (find-symbol "PROJECTION-CONSUMERS" "WARP") *warp-projection*)))))
 (ok "the OTHER peer is undisturbed by its neighbour leaving"
-    (member (funcall (find-symbol "CHANNEL-CONSUMER" "WARP-DOM") (car *guest-ch*))
+    (member (funcall (find-symbol "CHANNEL-CONSUMER" "WARP-DOM") (chan-of *guest-ch*))
             (funcall (find-symbol "PROJECTION-CONSUMERS" "WARP") *warp-projection*)))
 
 (format t "~&== a message that is not a message ==~%")

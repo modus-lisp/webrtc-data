@@ -66,6 +66,41 @@
 ;;;; only way it can: a message arrives on 102.  That is the same discipline `control` already
 ;;;; uses, and it is what makes "the client never opened it" and "the client does not have it"
 ;;;; indistinguishable and equally free.
+;;;;
+;;;; ==============================================================================================
+;;;; TWO APPS ON IT, AND WHY NOT A SECOND CHANNEL
+;;;; ==============================================================================================
+;;;;
+;;;; There is a second warp app now — warp-files, a Miller-column file browser — and one stream to
+;;;; put it on.  The two ways to do that are a channel of its own and a projection id multiplexed
+;;;; onto this one, and on paper the channel is the simpler of the two.  It is not available:
+;;;;
+;;;;   * EVERY DATA CHANNEL HAS TO EXIST BEFORE THE OFFER.  Signalling here is one-shot and
+;;;;     non-trickle and nothing in this system renegotiates, so all four channels are created in
+;;;;     shell.js before `createOffer`.  The payload may not create one — it says so at the top of
+;;;;     payload.js, in the same breath as "it may not assume it is first".
+;;;;   * shell.js IS ON NSITE.  So a fifth channel is a publish under a new tag, which invalidates
+;;;;     every login link minted against the old one (§8.9), needs the desktop restarted for
+;;;;     LOGIN_URL_BASE (§8.8), and is the whole cost §9 exists to avoid.  A projection id costs a
+;;;;     file copy and this restart.
+;;;;   * AND IT IS WHAT A THIRD APP WOULD WANT ANYWAY.  Stream ids are a fixed resource negotiated
+;;;;     once; app ids are not.
+;;;;
+;;;; So: a client message may carry `a`, the app it is for, and a frame carries `a` back.  THE
+;;;; DEVICE MANAGER IS THE APP WITH NO NAME — a message with no `a` routes to it and its frames go
+;;;; back unlabelled, so every byte on this channel is what it was before any of this, and a phone
+;;;; holding an older payload is a phone that asks for one app and gets it.
+;;;;
+;;;; The routing itself is NOT in this file.  WARP-DOM:MAKE-MUX is one app id -> one channel, driven
+;;;; over a fake transport in warp/t/channel.lisp and over a real browser in warp/t/two-apps.sh,
+;;;; because the discipline that governs everything here is that a gateway is a thing we may not
+;;;; run.  What is left below is what genuinely cannot be tested from outside: which apps this box
+;;;; serves, and where each one's rows come from.
+;;;;
+;;;; gateway-nostr.lisp IS UNCHANGED BY ANY OF IT.  Its state for this channel was already an opaque
+;;;; value it gets from WARP-ON-MESSAGE and hands back to WARP-CLOSE; that value is now a link with
+;;;; a mux in it instead of a single channel, and neither the dispatch clause nor the close nor the
+;;;; banner had a reason to know.
 
 (in-package #:webrtc-data)
 
@@ -123,6 +158,82 @@ whole invocation and for nothing else.")
 (defvar *warp-loaded* nil "T once :warp-dom and :warp-monitor are in the image.")
 (defvar *warp-projection* nil "The shared projection — one query, however many phones.")
 (defvar *warp-lock* (bt:make-lock "warp-gateway"))
+
+;;; ---- the second app: the file browser ----------------------------------------------------
+;;;
+;;; OFF UNLESS ASKED, like everything else here, and for a sharper reason than the channel itself:
+;;; :warp-files depends on warren, which drags gesso, scribe and pigment into this image.  That is
+;;; a fine dependency for an optional client system and an absurd one to take on a box whose owner
+;;; only ever wanted the terminal list, so the load happens at the FIRST MESSAGE NAMING THE APP —
+;;; not at gateway start, and never at all with WARP_FILES unset.
+;;;
+;;; A FAILED LOAD IS REMEMBERED.  The device-manager load retries on every message, which is cheap
+;;; when the systems are simply absent; a half-second of ASDF per message is not, so this one
+;;; records that it failed and answers from the record.  The phone's panel then says the box is not
+;;; serving the file browser, which is exactly what has happened.
+
+(defparameter *warp-files-enabled* (and (uiop:getenv "WARP_FILES") t)
+  "Whether this gateway serves the file browser at all.  Off unless WARP_FILES is set.")
+
+(defvar *warp-files-loaded* nil "T, NIL, or :FAILED once the load has been tried and lost.")
+(defvar *warp-files-projection* nil
+  "The shared projection — ONE browser for the whole box, which is rule 8 read exactly: the column
+stack is an argument to the query, so it is shared, and two phones looking at the files drill in
+together.  A second, private one would be a second projection, and nothing here asks for that.")
+
+(defun warp-files-ensure-loaded ()
+  "Load :warp-files/dom, once.  Returns T on success.  Never signals: an app that will not load is
+an app this box does not serve, not a gateway that stops serving the desktop."
+  (case *warp-files-loaded*
+    ((t) t)
+    (:failed nil)
+    (t (handler-case
+           (progn
+             (handler-bind ((warning #'muffle-warning))
+               (let ((*standard-output* (make-broadcast-stream)))
+                 (asdf:load-system "warp-files/dom")))
+             (setf *warp-files-loaded* t))
+         (error (e)
+           (setf *warp-files-loaded* :failed)
+           (format *error-output* "~&[warp] the file browser is not available: ~a~%" e)
+           (finish-output *error-output*)
+           nil)))))
+
+(defun warp-files-projection ()
+  "The file browser's shared projection, rooted where WARP-FILES:DEFAULT-ROOT says.
+
+WHERE IT OPENS IS A DEFAULT AND NOT A CONFINEMENT, and pretending otherwise would be theatre: the
+desktop next door has a terminal in its root menu, so anything that can reach this panel can already
+reach a shell.  What the default is for is that `/` is useless to open at, and $HOME is where a
+person's files are — the same answer warren's pixel browser gives, which is rule 9's two facets of
+one app agreeing about something small.  WARP_FILES_ROOT overrides it."
+  (bt:with-lock-held (*warp-lock*)
+    (or *warp-files-projection*
+        (setf *warp-files-projection*
+              (funcall (find-symbol "BROWSE-PROJECTION" "WARP-FILES")
+                       (funcall (find-symbol "MAKE-BROWSER" "WARP-FILES")))))))
+
+;;; ---- which apps this box serves ------------------------------------------------------------
+;;; One function, because the answer depends on what has managed to load and that is only knowable
+;;; at the moment somebody asks.  NIL is the device manager: the app with no name, the one a client
+;;; that has never heard of any of this is talking to.
+
+(defun warp-app (id)
+  "The spec for app ID — a plist of :PROJECTION :VIEW :ATTACH — or NIL if this box does not serve it.
+NIL for an unknown id is the whole of the refusal: MUX-RECEIVE drops the message and the phone's
+panel says nobody answered, which is the honest report."
+  (cond
+    ((null id)
+     (list :projection (warp-projection)
+           :view (find-symbol "MONITOR-VIEW" "WARP-MONITOR")))
+    ((and (equal id "files") *warp-files-enabled* (warp-files-ensure-loaded))
+     (list :projection (warp-files-projection)
+           :view (find-symbol "FILES-VIEW" "WARP-FILES")
+           ;; the file browser's consumer class is its own — a Miller layout mixed in FRONT of
+           ;; DOM-CONSUMER — and OPEN-CHANNEL takes the function that makes one rather than knowing
+           ;; about it
+           :attach (fdefinition (find-symbol "ATTACH-DOM" "WARP-FILES-DOM"))))
+    (t nil)))
 
 ;;; ---- the query --------------------------------------------------------------------------
 ;;; DESIGN.md: views subscribe to RESULT-SETS, not to objects they happen to enumerate.  So this is
@@ -255,22 +366,36 @@ cost one file check between them, each with its own stream, budget, scroll, menu
 
 ;;; ---- the three calls a session makes ------------------------------------------------------
 
-(defun warp-open (assoc sid pub)
-  "Seat this peer as a warp consumer.  Returns a channel, or NIL if warp is not available — in
-which case the peer's messages are dropped and its panel shows no answer, which is the honest
-report of a box that does not have this."
-  (when (warp-ensure-loaded)
-    (handler-case
-        (let* ((invoker (warp-invoker-for pub))
-               (closed nil)
-               (ch (funcall (find-symbol "OPEN-CHANNEL" "WARP-DOM")
-                            (warp-projection)
-                            :view (find-symbol "MONITOR-VIEW" "WARP-MONITOR")
+;;; ONE PEER'S SHARE OF THE STREAM.  A class rather than a cons because it grew a third field and
+;;; will grow a fourth, and because a class migrates its live instances if this file is ever
+;;; redefined under a running image — which is the only way anything here is ever going to change
+;;; on a box that is carrying somebody's session.
+(defclass warp-link ()
+  ((mux :initform nil :accessor warp-link-mux
+        :documentation "WARP-DOM's app id -> channel router, one per peer.")
+   (closed :initform nil :accessor warp-link-closed
+           :documentation "Set by WARP-CLOSE before the clocks stop.  Every app's send lambda reads
+it, because they all share one association: when the session goes, all of them stop, and the flag is
+per LINK rather than per channel for exactly that reason."))
+  (:documentation "One peer's warp channel: however many apps it opened, over the one stream."))
+
+(defun warp-open (link assoc sid pub app)
+  "Seat this peer as a consumer of APP.  Returns a channel, or NIL if this box does not serve that
+app — in which case the peer's messages for it are dropped and its panel shows no answer, which is
+the honest report of a box that does not have this."
+  (let ((spec (handler-case (warp-app app) (error () nil))))
+    (when spec
+      (handler-case
+          (let* ((invoker (warp-invoker-for pub))
+                 (ch (apply (find-symbol "OPEN-CHANNEL" "WARP-DOM")
+                            (getf spec :projection)
+                            :view (getf spec :view)
+                            :app app
                             :rows *warp-rows*
                             :budget *warp-budget*
                             :invoker invoker
                             :hz *warp-hz*
-                            :name (if pub (subseq pub 0 8) "peer")
+                            :name (format nil "~a~@[/~a~]" (if pub (subseq pub 0 8) "peer") app)
                             :log (lambda (m)
                                    (format *error-output* "~&[warp] ~a~%" m)
                                    (finish-output *error-output*))
@@ -280,52 +405,66 @@ report of a box that does not have this."
                             ;; refusing early turns a hung sender into a counted send error, which
                             ;; is what the channel is built to absorb.
                             :send (lambda (frame)
-                                    (when (or closed
+                                    (when (or (warp-link-closed link)
                                               (eq (getf (sctp-stats assoc) :state) :aborted))
                                       (error "warp: association is gone"))
-                                    (sctp-send-string assoc sid frame)))))
-          (format *error-output* "~&[warp] channel open for ~a... as ~(~a~) (~a B/pass at ~a Hz)~%"
-                  (if pub (subseq pub 0 8) "peer") invoker *warp-budget* *warp-hz*)
+                                    (sctp-send-string assoc sid frame))
+                            (let ((attach (getf spec :attach)))
+                              (when attach (list :attach attach))))))
+            (format *error-output*
+                    "~&[warp] channel open for ~a... app ~a as ~(~a~) (~a B/pass at ~a Hz)~%"
+                    (if pub (subseq pub 0 8) "peer") (or app "devices") invoker
+                    *warp-budget* *warp-hz*)
+            (finish-output *error-output*)
+            ch)
+        (error (e)
+          (format *error-output* "~&[warp] could not open ~a: ~a~%" (or app "devices") e)
           (finish-output *error-output*)
-          ;; the flag the send lambda reads, handed back so CLOSE can set it
-          (cons ch (lambda () (setf closed t))))
-      (error (e)
-        (format *error-output* "~&[warp] could not open: ~a~%" e)
-        (finish-output *error-output*)
-        nil))))
+          nil)))))
 
 (defun warp-on-message (state assoc sid payload pub)
-  "One message on the warp stream.  Opens the channel if this is the first one — a negotiated
-channel has no handshake, so the first message IS the open — and hands the rest to warp.
+  "One message on the warp stream.  Opens this peer's link if this is the first one — a negotiated
+channel has no handshake, so the first message IS the open — and hands the rest to the mux, which
+routes it to the app the message names and opens THAT the first time it is named.
 
-Returns the (possibly new) channel state, which the caller keeps.  NEVER SIGNALS.
+Returns the (possibly new) link, which the caller keeps and hands back to WARP-CLOSE.  It is opaque
+to the caller and always was, which is why gateway-nostr.lisp needed no line for any of this.
+
+NEVER SIGNALS.
 
 THE FEATURE GATE IS HERE, not in WARP-SID-P: with the channel off these bytes are dropped on the
 floor rather than falling through to the RFB stream.  See WARP-SID-P for why that distinction is
 the difference between a panel that says nothing and a desktop connection that breaks."
   (unless *warp-channel-enabled* (return-from warp-on-message nil))
   (handler-case
-      (let ((st (or state (warp-open assoc sid pub))))
-        (when st
+      (let ((link state))
+        (when (and (null link) (warp-ensure-loaded))
+          (setf link (make-instance 'warp-link))
+          (setf (warp-link-mux link)
+                (funcall (find-symbol "MAKE-MUX" "WARP-DOM")
+                         (lambda (app) (warp-open link assoc sid pub app)))))
+        (when link
           (let ((text (if (stringp payload) payload (map 'string #'code-char (as-u8vec payload))))
                 ;; who is invoking, for the desktop's own check on the far side of REVOKE-IN-FILE
                 (*warp-invoking-pubkey* pub))
-            (funcall (find-symbol "CHANNEL-RECEIVE" "WARP-DOM") (car st) text)))
-        st)
+            (funcall (find-symbol "MUX-RECEIVE" "WARP-DOM") (warp-link-mux link) text)))
+        link)
     (error (e)
       (format *error-output* "~&[warp] message: ~a~%" e)
       (finish-output *error-output*)
       state)))
 
 (defun warp-close (state)
-  "Unseat this peer.  Called from the session's unwind path, so it may not signal and may be
-called with nothing to close."
+  "Unseat this peer, on every app it opened.  Called from the session's unwind path, so it may not
+signal and may be called with nothing to close."
   (when state
-    (ignore-errors (funcall (cdr state)))          ; stop the sender before stopping the clock
+    (ignore-errors (setf (warp-link-closed state) t))   ; stop the senders before the clocks
     (ignore-errors
-     (let ((stats (funcall (find-symbol "CHANNEL-STATS" "WARP-DOM") (car state))))
-       (format *error-output* "~&[warp] channel closed — ~a frames, ~a B, ~a in~%"
-               (getf stats :frames) (getf stats :bytes) (getf stats :received))
+     (dolist (cell (funcall (find-symbol "MUX-CHANNELS" "WARP-DOM") (warp-link-mux state)))
+       (let ((stats (funcall (find-symbol "CHANNEL-STATS" "WARP-DOM") (cdr cell))))
+         (format *error-output* "~&[warp] channel closed — app ~a, ~a frames, ~a B, ~a in~%"
+                 (or (car cell) "devices")
+                 (getf stats :frames) (getf stats :bytes) (getf stats :received)))
        (finish-output *error-output*)))
-    (ignore-errors (funcall (find-symbol "CHANNEL-CLOSE" "WARP-DOM") (car state))))
+    (ignore-errors (funcall (find-symbol "MUX-CLOSE" "WARP-DOM") (warp-link-mux state))))
   nil)

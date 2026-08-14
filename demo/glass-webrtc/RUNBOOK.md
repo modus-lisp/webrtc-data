@@ -348,7 +348,7 @@ docstring and enforced nowhere.
 
 ---
 
-## 7. The warp channel — the terminal list, on the connection you already have
+## 7. The warp channel — the terminal list and the file browser, on the connection you already have
 
 **Off unless `WARP_CHANNEL` is set.** With it unset the warp systems are never loaded, no projection
 is built, no thread is started, nothing is sent, and the startup banner does not mention it. That is
@@ -378,10 +378,45 @@ somebody whose authority could not be checked is the one mistake here with conse
 
 | file | what it is |
 |---|---|
-| `warp-channel.lisp` | the whole gateway side: stream id, invoker, query, open/message/close |
-| `gateway-nostr.lisp` | **29 added lines** — a `load`, a `let` binding, one `cond` clause, one close, one banner line |
-| `index-nostr.html` | the ▤ panel, plus `warp/dom/client.js` embedded verbatim |
-| `warp/dom/channel.lisp` | everything testable: the clock, the lock, the non-signalling send, the close |
+| `warp-channel.lisp` | the whole gateway side: stream id, invoker, the app registry, open/message/close |
+| `gateway-nostr.lisp` | **29 added lines**, and none of them added since — a `load`, a `let` binding, one `cond` clause, one close, one banner line |
+| `payload.js` | the ▤ and 🗀 panels, plus `warp/dom/client.js` embedded verbatim |
+| `index-nostr.html` | the pre-split monolith: the ▤ panel, and the same embedded client |
+| `warp/dom/channel.lisp` | everything testable: the clock, the lock, the non-signalling send, the close, and the mux |
+
+### 7.1 Two apps on it, and why not a second channel
+
+There is a second warp app — **`warp-files`**, a Miller-column file browser (🗀 on the phone,
+above ▤). It shares stream 102 rather than getting one of its own, and that was forced rather than
+preferred:
+
+* **every data channel has to exist before the offer.** Signalling is one-shot and non-trickle and
+  nothing here renegotiates, so all four are created in `shell.js`. The payload may not create one.
+* **`shell.js` is on nsite.** A fifth channel is a publish under a new tag, which kills every login
+  link minted against the old one (§8.9) and needs the desktop restarted for `LOGIN_URL_BASE`
+  (§8.8). A projection id costs a file copy and a gateway restart.
+* and an app id is what a *third* app would want anyway; stream ids are negotiated once.
+
+So a client message may carry `a`, the app it is for, and a frame carries `a` back. **The device
+manager is the app with no name** — no `a` routes to it, its frames go back unlabelled, and a phone
+holding an older `payload.js` asks for one app and gets byte-for-byte what it always got. The
+routing itself is `warp-dom`'s (`make-mux`), not this gateway's, for the usual reason: it can be
+driven by a fake transport, and a gateway cannot be run.
+
+**The file browser is off unless `WARP_FILES` is set**, separately from `WARP_CHANNEL`, because
+`:warp-files` drags warren → gesso, scribe, pigment into this image. It loads at the **first message
+naming it**, never at start, and a failed load is remembered rather than retried per message. An app
+this box does not serve is *dropped*: the panel says "no answer — this box is not serving the file
+browser", which is a different and more useful claim than an empty tree.
+
+**Where it opens is a default, not a confinement.** This desktop has a terminal in its root menu, so
+anything that reaches the panel already reaches a shell; confining the browser would be theatre. The
+default is `$HOME` — the same place warren's pixel browser opens — and `WARP_FILES_ROOT` overrides
+it. Deleting is a different question and is still fenced to `warp-files:*writable-root*`.
+
+**The startup banner names the channel, not the apps.** Whether `WARP_FILES` took is visible in the
+log the first time somebody opens the panel: `[warp] channel open for ab12cd34... app files as
+allowlist`.
 
 **Authorization.** The invoker is `:allowlist` iff `authorized-p` says so, and `:device` otherwise —
 so an allowlisted owner is offered `revoke` and an enrolled guest is not. It is deliberately **not**
@@ -398,15 +433,21 @@ watching a desktop. The budget bounds the first fill and the rare change.
 that terminal's next admission — with no restart anywhere, and with the desktop checking the
 invoking pubkey against its own allowlist a second time, after warp's rule 6 already did.
 
-**Environment.** `WARP_CHANNEL=1` to enable; `WARP_BUDGET`, `WARP_HZ`, `WARP_ROWS` to tune. warp must
-be checked out beside `webrtc-data` and reachable through `CL_SOURCE_REGISTRY`; if it is not, the
-load fails inside a handler, one line goes to the log, and the panel shows "no answer".
+**Environment.** `WARP_CHANNEL=1` to enable the channel; `WARP_BUDGET`, `WARP_HZ`, `WARP_ROWS` to
+tune it; `WARP_FILES=1` to serve the file browser as well, and `WARP_FILES_ROOT` to say where it
+opens (default `$HOME`). warp must be checked out beside `webrtc-data` and reachable through
+`CL_SOURCE_REGISTRY`; if it is not, the load fails inside a handler, one line goes to the log, and
+the panel shows "no answer".
 
 **Tests, none of which start a gateway.** `demo/glass-webrtc/warp-channel-test.lisp` lifts the
 gateway's own names for *where the desktop is* out of its *text*, starts a real glass admission
-service on a /tmp fixture, and runs `warp-channel.lisp` against a stubbed SCTP; `warp/t/channel.lisp` drives the channel module over a
-fake transport; `warp/t/panel.sh` drives the panel's actual bytes in headless Chromium. The
-untested remainder is `sctp-send-string` itself, which already carries RFB and the control channel.
+service on a /tmp fixture, and runs `warp-channel.lisp` against a stubbed SCTP — including the app
+registry: an app that is off is refused rather than given the default, and with `WARP_FILES` set one
+link carries two channels on two projections. `warp/t/channel.lisp` drives the channel module and
+the mux over a fake transport; `warp/t/panel.sh` and `warp/t/two-apps.sh` drive the panels' actual
+bytes in headless Chromium, the second one asserting that the file browser renders as real nested
+columns while the device manager's DOM is unchanged. The untested remainder is `sctp-send-string`
+itself, which already carries RFB and the control channel.
 
 ---
 
@@ -483,7 +524,7 @@ and the half that can, does.
 | | contents | where |
 |---|---|---|
 | **shell** | nostr-tools, the PeerConnection and all four channels, credentials, the progress screen, the pill, the desktop-name display | nsite, ~36 KB over the wire (was 97 KB) |
-| **payload** | noVNC, the trackpad, the modifier row, paste, the quality ladder, the warp panel, the getStats poll | the box, 71 KB gzipped on stream 104 |
+| **payload** | noVNC, the trackpad, the modifier row, paste, the quality ladder, **both warp panels** (▤ terminals, 🗀 files), the getStats poll | the box, 71 KB gzipped on stream 104 |
 
 **The desktop is visible before the payload arrives.** In `VIDEO_PRIMARY` the picture is VP8/RTP
 into a `<video>`, which is the browser's job end to end; noVNC is only there for input coordinates

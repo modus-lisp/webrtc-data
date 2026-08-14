@@ -210,6 +210,57 @@ export async function init(api) {
     #warpMenu li .c{margin-left:auto;color:#8a949c;font-size:10px}
     #warpNote{padding:8px 12px;color:#8a949c;flex:0 0 auto;
       border-top:1px solid rgba(255,255,255,.08)}
+    /* ==== BEGIN the file browser's stylesheet — lifted by warp/t/two-apps.py ==================
+       THE SECOND WARP APP, ON THE SAME CHANNEL.  Everything above is the device manager; this is
+       warp-files, and the only reason it needs a stylesheet of its own is that it NESTS.  The
+       client creates one .container per open column, inside #filesRows, and names it in
+       data-container — so Miller columns are `display:flex` on the parent and a fixed width on the
+       child, and the horizontal scroll is the browser's own.  There is no layout on the wire and
+       there never was: the server sends `in` and `after` and this file decides what a column is.
+       Class names come from warp/dom/client.js, same as the panel above: .v .l .stale on a row,
+       .t .c on a menu item, and .container / .opaque / .cap / .dim for what nesting added. */
+    #filesPanel{position:fixed;left:10px;right:10px;top:52px;bottom:150px;z-index:23;display:none;
+      flex-direction:column;background:rgba(8,10,14,.93);border:1px solid rgba(255,255,255,.12);
+      border-radius:12px;overflow:hidden;
+      font:12px/1.35 ui-monospace,SFMono-Regular,Menlo,monospace;color:#dce4ec}
+    #filesHead{display:flex;justify-content:space-between;align-items:baseline;gap:10px;
+      padding:9px 12px;border-bottom:1px solid rgba(255,255,255,.1);color:#8a949c;flex:0 0 auto}
+    #filesHead b{color:#dce4ec;font-weight:600;letter-spacing:.04em}
+    #filesBody{flex:1 1 auto;position:relative;overflow:hidden}
+    #filesRows{display:flex;align-items:stretch;height:100%;overflow-x:auto;overflow-y:hidden;
+      -webkit-overflow-scrolling:touch}
+    #filesRows .container{list-style:none;margin:0;padding:0;flex:0 0 186px;height:100%;
+      overflow-y:auto;-webkit-overflow-scrolling:touch;border-right:1px solid rgba(255,255,255,.09)}
+    #filesRows li{display:flex;align-items:baseline;gap:8px;padding:7px 10px;background:#161a20;
+      border-bottom:1px solid #0c0e12;border-left:3px solid transparent;
+      touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+    /* the column HEADER is the first row of every container, which is a fact about the projection
+       (row 0 is the header) and needs no class from the client to be styled as one */
+    #filesRows .container li:first-child{background:#0f1319;color:#8a949c;position:sticky;top:0;
+      border-bottom:1px solid rgba(255,255,255,.12);letter-spacing:.03em}
+    #filesRows li.selected{background:#26303c;border-left-color:#5abe82}
+    #filesRows li .v{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    #filesRows li .l{margin-left:auto;color:#6a747c;font-size:10px;flex:0 0 auto}
+    #filesRows li .stale{display:none}         /* per row it is noise; the header carries the age */
+    /* AN OPAQUE NODE IS A HOLE AND IS DRAWN AS ONE.  Dashed, captioned, and deliberately not
+       row-shaped: the app said what this region is and this client cannot show it, so the honest
+       drawing is a labelled placeholder rather than something that looks like content. */
+    #filesRows .opaque{display:block;background:#12161c;border:1px dashed rgba(255,255,255,.28);
+      border-left:1px dashed rgba(255,255,255,.28);margin:8px;padding:14px 12px;border-radius:8px}
+    #filesRows .opaque .cap{display:block;color:#dce4ec;margin-bottom:6px;word-break:break-word}
+    #filesRows .opaque .dim{display:block;color:#8a949c;font-size:10px}
+    #filesRows .opaque::after{content:'not shown here — this surface cannot blit';display:block;
+      margin-top:8px;color:#5a646c;font-size:10px;font-style:italic}
+    #filesMenu{list-style:none;margin:0;padding:0;position:absolute;left:12px;right:12px;top:8px;
+      box-shadow:0 10px 30px #000c;border-radius:9px;overflow:hidden}
+    #filesMenu:empty{display:none}
+    #filesMenu li{padding:12px 13px;background:#222c38;border-left:3px solid #dce4ec;
+      border-bottom:1px solid #0c0e12;display:flex;gap:10px;touch-action:manipulation}
+    #filesMenu li.destructive{background:#3a1c1c;border-left-color:#f04646;color:#ffb0b0}
+    #filesMenu li .c{margin-left:auto;color:#8a949c;font-size:10px}
+    #filesNote{padding:8px 12px;color:#8a949c;flex:0 0 auto;
+      border-top:1px solid rgba(255,255,255,.08)}
+    /* ==== END the file browser's stylesheet ================================================== */
 `;
   document.head.appendChild(style);
 
@@ -484,18 +535,31 @@ export async function init(api) {
 //
 //   on a row       selected | warn | bad     and cells .v (value) .l (label) .stale (as-of)
 //   on a menu item destructive              and cells .t (label)  .c (cost class)
+//   on an opaque node  opaque               and cells .cap (the caption) .dim (its size)
+//   on a container container                and data-container="<the name the wire used>"
 //
 // GESTURES ARE SCOPED TO A ROOT ELEMENT, which is the one thing the standalone page did not need
 // and the panel absolutely does: a listener on `document` inside a remote-desktop client would eat
 // the pointer events the trackpad lives on.  ATTACHGESTURES(root) listens on root only.
+//
+// ONE LINK MAY CARRY SEVERAL PROJECTIONS.  A frame names the app it belongs to in `a`, and this
+// client applies only the frames addressed to the app it was made for — OPTS.APP, which is null for
+// the host's default one.  That is how a phone shows the device manager and the file browser at the
+// same time over the one negotiated data channel it was able to open before the offer.
 
 "use strict";
 function makeWarpClient(opts) {
   const rowsEl = opts.rows;
   const menuEl = opts.menu;
-  const send   = opts.send;                 // (object) -> void.  The whole of the transport.
+  const out    = opts.send;                 // (object) -> void.  The whole of the transport.
   const onStat = opts.onStat || function () {};
   const ROWS   = opts.viewportRows || 14;   // what this viewport can show; reported to the server
+  const APP    = opts.app == null ? null : opts.app;   // which projection this client is a surface for
+
+  // Every message we send carries the app, so the host can route it back to the right consumer.  A
+  // client of the default app stamps nothing, which is what keeps a one-app link byte-for-byte what
+  // it was before any of this existed.
+  function send(o) { if (APP != null) o.a = APP; return out(o); }
 
   // key -> {key, node, in, after}.  This is the client's ENTIRE model.  The server holds the
   // memory of what we have been told; we hold the nodes it named and the anchor each one was given.
@@ -521,8 +585,69 @@ function makeWarpClient(opts) {
   let gen = 0, frames = 0, bytes = 0, deltas = 0;
   let scroll = 0;
 
+  // ---- containers: the wire has always named one, and only "rows" was ever real ----------------
+  //
+  // A delta's `in` is the NAME of the container the node belongs to.  Two of those names are the
+  // encoding's own and the HOST owns an element for each: "rows" and "menu:<key>".  Every other
+  // name is the APP's — "col:/tmp/foo/", "preview" — and a container for it is created here on
+  // demand, inside the rows element, and removed when its last child leaves.  Until a client
+  // nested, this function was `name === "rows" ? rowsEl : menuEl` and every app container in
+  // existence rendered into the hold-menu, silently, because no app had ever named one.
+  //
+  // WHERE A CONTAINER GOES IS NOT DERIVABLE FROM THE DELTAS, and that is the whole reason `cs`
+  // exists.  `after` orders siblings WITHIN a container and says nothing at all across them, and a
+  // pass emits within a priority band in reverse layout order — so the rightmost Miller column's
+  // rows arrive FIRST, and ordering containers by first appearance would draw the columns right to
+  // left.  So the frame carries `cs`: the app's containers, in layout order, as state rather than
+  // as an event.  It is the same obligation rule 4 already puts on an anchor, one level up: never
+  // put a thing in a position you invented.
+  //
+  // Containers do not nest in containers.  `in` is a flat name and a frame says nothing about a
+  // container's own parent, so `cs` is a sequence, not a tree — Miller columns want exactly that,
+  // and a client that wanted a tree would need the wire to say so.
+  const containers = new Map();     // name -> element, for the app's containers only
+  let order = [];                   // `cs`, as the server last stated it
+
   function container(name) {
-    return name === "rows" ? rowsEl : menuEl;
+    if (name == null || name === "rows") return rowsEl;
+    if (name.lastIndexOf("menu:", 0) === 0) return menuEl;
+    let el = containers.get(name);
+    if (!el) {
+      el = document.createElement("ul");
+      el.className = "container";
+      el.dataset.container = name;
+      containers.set(name, el);
+      orderContainers();
+    }
+    return el;
+  }
+
+  // The app's containers, in the order the server last stated.  One left-to-right pass with
+  // insertBefore: a container already in its place is not touched, so re-stating an unchanged
+  // order costs nothing and moves nothing.  A container we hold that `cs` does not mention keeps
+  // its relative place at the end rather than being guessed at.
+  function orderContainers() {
+    if (!containers.size || !rowsEl) return;
+    const seq = order.filter((n) => containers.has(n));
+    for (const n of containers.keys()) if (seq.indexOf(n) < 0) seq.push(n);
+    let prev = null;
+    for (const n of seq) {
+      const el = containers.get(n);
+      const want = prev ? prev.nextSibling : rowsEl.firstChild;
+      if (el !== want) rowsEl.insertBefore(el, want);
+      prev = el;
+    }
+  }
+
+  // A container is the app's claim that a group EXISTS, and the only evidence it still does is that
+  // something is in it.  Emptied — the column closed, the preview cleared — it goes, so the host's
+  // stylesheet never has to reason about a box with nothing in it.  Anything else the client made
+  // is left alone: a node parked waiting for its anchor is out of the document, and dropping the
+  // container it named would be inventing an answer to a question nobody asked.
+  function dropIfEmpty(el) {
+    if (!el || !el.dataset || !el.dataset.container || el.firstChild) return;
+    containers.delete(el.dataset.container);
+    el.remove();
   }
 
   // The four kinds, and nothing else.  Note what is NOT here: no re-render, no keyed list diff, no
@@ -554,8 +679,10 @@ function makeWarpClient(opts) {
       }
       case "gone": {
         if (!rec) return;
+        const from = rec.node.parentNode;
         rec.node.remove();
         nodes.delete(d.key);
+        dropIfEmpty(from);
         break;
       }
     }
@@ -566,6 +693,7 @@ function makeWarpClient(opts) {
   function place(rec) {
     const parent = container(rec.in);
     if (!parent) return;
+    const from = rec.node.parentNode;         // where it was, so an emptied container can go
     if (rec.after == null) {
       if (rec.node.parentNode !== parent || parent.firstChild !== rec.node) {
         parent.insertBefore(rec.node, parent.firstChild);
@@ -577,12 +705,14 @@ function makeWarpClient(opts) {
         if (!w) waiting.set(rec.after, w = []);
         if (!w.includes(rec)) w.push(rec);
         if (rec.node.parentNode) rec.node.remove();
+        if (from !== parent) dropIfEmpty(from);
         return;
       }
       if (rec.node.parentNode !== parent || rec.node.previousSibling !== a.node) {
         parent.insertBefore(rec.node, a.node.nextSibling);
       }
     }
+    if (from && from !== parent) dropIfEmpty(from);
     const w = waiting.get(rec.key);               // anything that was waiting on us can go in now
     if (w) { waiting.delete(rec.key); for (const r of w) place(r); }
   }
@@ -594,6 +724,18 @@ function makeWarpClient(opts) {
       li.innerHTML = "";
       li.append(cell("t", cells[0]));
       if (cells[1]) li.append(cell("c", cells[1]));
+    } else if (cells[2] === "opaque") {
+      // AN OPAQUE NODE IS A HOLE, AND THE CAPTION IS THE WHOLE OF WHAT WE GET (DESIGN.md rule 9).
+      // The app offers this region as pixels; this client cannot blit and is not going to be given
+      // a way to — the wire is JSON cells, "binary payloads" is an open design question, and
+      // sneaking the bytes through here would answer it by accident.  What arrives is a caption the
+      // app chose and a size, so what we draw is a labelled placeholder saying what is not shown.
+      // It is not a row and must not look like one, which is why it gets its own class and cells.
+      li.className = "opaque";
+      li.innerHTML = "";
+      li.append(cell("cap", cells[0]));
+      if (cells[1]) li.append(cell("dim", cells[1]));
+      if (d.as_of) { li.append(cell("stale", "as of " + d.as_of)); }
     } else {
       li.className = (d.state && d.state.selected) ? "selected " + trend(cells[2]) : trend(cells[2]);
       li.innerHTML = "";
@@ -613,13 +755,22 @@ function makeWarpClient(opts) {
   // One frame, as it arrived on whatever the link is.  Takes the raw string so the byte count is
   // the real one; a host that already parsed it can pass the object instead.
   function apply(data) {
-    let frame = data;
-    if (typeof data === "string") { bytes += data.length; try { frame = JSON.parse(data); } catch (_) { return null; } }
+    let frame = data, raw = null;
+    if (typeof data === "string") { raw = data; try { frame = JSON.parse(data); } catch (_) { return null; } }
+    if (!frame) return null;
+    // A frame addressed to another projection on this link is not ours to apply, and not ours to
+    // count either: BYTES is what THIS surface cost, which is the number a panel reports and the
+    // number a budget is checked against.
+    if ((frame.a == null ? null : frame.a) !== APP) return null;
+    if (raw !== null) bytes += raw.length;
     frames++;
-    if (!frame || !frame.deltas) return null;
+    if (!frame.deltas) return null;
     // rule 4: snapshot chunks carry a generation, and anything older than the newest is discarded.
     if (frame.gen < gen) return frame;
     if (frame.gen > gen) { gen = frame.gen; }
+    // The container order comes FIRST, so a container created by the deltas below already knows
+    // where it belongs and no column is ever briefly drawn in the wrong place.
+    if (frame.cs) { order = frame.cs; orderContainers(); }
     for (const d of frame.deltas) { deltas++; applyDelta(d); }
     onStat(stats());
     return frame;
@@ -632,12 +783,15 @@ function makeWarpClient(opts) {
   function reset() {
     for (const r of nodes.values()) r.node.remove();
     nodes.clear(); waiting.clear();
+    for (const el of containers.values()) el.remove();
+    containers.clear(); order = [];
     rowsEl.innerHTML = ""; if (menuEl) menuEl.innerHTML = "";
     gen = 0; deltas = 0;
   }
 
   function stats() {
-    return {gen, frames, bytes, deltas, nodes: nodes.size, parked: waiting.size, scroll};
+    return {gen, frames, bytes, deltas, nodes: nodes.size, parked: waiting.size, scroll,
+            containers: containers.size};
   }
 
   // ---- gestures: recognized HERE, sent as semantics.  Rule 5's vocabulary is closed and this
@@ -706,8 +860,16 @@ function makeWarpClient(opts) {
     hold: (k) => send({t: "gesture", g: "hold", key: k}),
     cmd: (name, key, confirmed) => send({t: "cmd", name, key, confirmed: !!confirmed}),
     viewport: (rows, sc) => send({t: "viewport", rows, scroll: sc}),
-    keys: () => [...rowsEl.children].map((li) => li.dataset.key),
+    // every row this client holds, in document order — which for a flat app is the rows element's
+    // own children and for a nesting one reads across its containers, left to right
+    keys: () => [...rowsEl.querySelectorAll("li[data-key]")].map((li) => li.dataset.key),
     menu: () => (menuEl ? [...menuEl.children].map((li) => li.dataset.key) : []),
+    // the nesting as it was RENDERED: container name -> the keys in it, in document order.  A test
+    // that checks this is checking the DOM, not the client's own idea of the DOM.
+    containers: () => [...rowsEl.children]
+      .filter((el) => el.dataset && el.dataset.container)
+      .map((el) => [el.dataset.container,
+                    [...el.children].map((li) => li.dataset.key)]),
     // the anchor chain as the client believes it, so a test can check the DOM against the WIRE
     // rather than against the client's own idea of the DOM
     anchors: () => Object.fromEntries([...nodes].map(([k, r]) => [k, r.after])),
@@ -818,6 +980,91 @@ if (typeof window !== "undefined") window.makeWarpClient = makeWarpClient;
       }
     });
     window.addEventListener('resize', () => { if (warpOn) warp.viewport(warpFit(), 0); });
+
+    // ==== BEGIN the file browser — lifted by warp/t/two-apps.py ===============================
+    //
+    // --- 🗀 warp's client two, on the SAME data channel as the device manager ------------------
+    //
+    // TWO APPS, ONE CHANNEL, AND THE CHANNEL IS NOT NEGOTIABLE.  Signalling here is one-shot and
+    // non-trickle and nothing in this system renegotiates, so every data channel had to exist
+    // before the offer — which happened in the shell, on nsite, minutes ago.  A second app
+    // therefore cannot have a channel of its own without publishing a new shell under a new tag
+    // and re-minting every login link that points at the old one.  So it shares stream 102 and the
+    // frames say which projection they belong to: `a` on the way down, `a` on the way back up,
+    // absent for the device manager because absent is what it has always sent.
+    //
+    // Two makeWarpClient instances, two panels, one send.  Each parses the frame and drops what is
+    // not addressed to it, which costs one JSON.parse per app per frame at 4 Hz — and buys a client
+    // that does not know the other exists.  Neither instance shares anything else: separate node
+    // maps, separate viewports, separate scroll, separate menus.
+    //
+    // WHAT IS DIFFERENT FROM THE PANEL ABOVE is entirely that this app NESTS.  Its rows arrive in
+    // containers the client creates on demand — one per open column, named `col:<path>` — so
+    // #filesRows is a flex row of .container elements rather than a list, and the stylesheet is
+    // where a Miller column becomes 186 pixels wide.  The server sends no geometry whatsoever.
+    const filesPanel = document.createElement('div');
+    filesPanel.id = 'filesPanel';
+    filesPanel.innerHTML =
+      '<div id="filesHead"><b>files</b><span id="filesStat">—</span></div>' +
+      '<div id="filesBody"><div id="filesRows"></div><ul id="filesMenu"></ul></div>' +
+      '<div id="filesNote"></div>';
+    document.body.appendChild(filesPanel);
+    const filesStat = filesPanel.querySelector('#filesStat');
+    const filesNote = filesPanel.querySelector('#filesNote');
+    const filesRowsEl = filesPanel.querySelector('#filesRows');
+
+    // The slice is per COLUMN here, not per list: the browser says how many rows one column can
+    // show and gets that many of every column.  Same report, same units (rows), different shape of
+    // working set — depth x rows instead of rows.
+    const filesFit = () => Math.max(4, Math.floor((filesRowsEl.clientHeight || 360) / 29));
+
+    const files = makeWarpClient({
+      app: 'files',                       // the label on this app's frames, both ways
+      rows: filesRowsEl,
+      menu: filesPanel.querySelector('#filesMenu'),
+      viewportRows: 12,
+      send: warpSend,                     // one link, and it is the panel above's
+      onStat: s => {
+        filesStat.textContent = s.containers + (s.containers === 1 ? ' column · ' : ' columns · ') +
+                                s.nodes + ' rows · ' + s.bytes + ' B';
+        if (s.deltas) filesNote.textContent = '';
+      }
+    });
+    files.attachGestures(filesPanel);
+    // A SECOND listener rather than a change to the one above: the two panels are independent
+    // additions to this file and each one wires its own client to the channel the shell made.
+    warpCh.addEventListener('message', e => files.apply(e.data));
+    warpCh.addEventListener('close', () => {
+      files.reset(); filesSpoke = false;
+      filesStat.textContent = '—'; filesNote.textContent = 'channel closed';
+    });
+
+    let filesOn = false, filesSpoke = false;
+    const filesBtn = mkToggle('🗀', 14, 'files');
+    filesBtn.style.left = '14px'; filesBtn.style.right = 'auto'; filesBtn.style.bottom = '142px';
+    filesBtn.addEventListener('click', () => {
+      filesOn = !filesOn;
+      filesPanel.style.display = filesOn ? 'flex' : 'none';
+      setBtn(filesBtn, filesOn ? 'on' : 'off');
+      if (!filesOn) return;
+      files.viewport(filesFit(), 0);
+      if (!filesSpoke) {
+        filesSpoke = true;
+        filesNote.textContent = 'asking the box…';
+        diag('warp files: hello on stream 102');
+        // A box serving the device manager and not the file browser is an ordinary state — the app
+        // is opt-in on the gateway — so this says which thing is missing rather than showing an
+        // empty tree, which would read as "your home directory is empty".
+        setTimeout(() => {
+          if (filesOn && files.stats().frames === 0) {
+            filesNote.textContent = 'no answer — this box is not serving the file browser';
+            diag('warp files: no answer from the box');
+          }
+        }, 5000);
+      }
+    });
+    window.addEventListener('resize', () => { if (filesOn) files.viewport(filesFit(), 0); });
+    // ==== END the file browser ================================================================
 
     const XK = { Enter:0xff0d, Backspace:0xff08, Tab:0xff09, Escape:0xff1b,
                  ArrowLeft:0xff51, ArrowUp:0xff52, ArrowRight:0xff53, ArrowDown:0xff54,
