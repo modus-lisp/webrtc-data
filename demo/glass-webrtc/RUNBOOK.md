@@ -399,8 +399,9 @@ streams 0 and 100 — the only two any deployed client uses — the dispatch is 
 
 **What it is.** `revoke` and the enrolment list already exist as a command set on a type, with a
 real authorization rule, reachable only over DM. This gives that same set a second surface — a ▤
-button on the phone that opens a list of enrolled terminals, where a hold offers the applicable
-commands and a tap invokes one. Same command, same authorization predicate, written once.
+panel on the phone listing the enrolled terminals, where a hold offers the applicable commands and a
+tap invokes one. Same command, same authorization predicate, written once. It is reached from the ⊞
+menu (§7.2).
 
 **Where it runs.** *Inside the gateway*, but over the **desktop's** store: the query is
 `glass:admission-devices`, the invoker is `glass:admission-allowed-p`, and warp-monitor's
@@ -416,14 +417,14 @@ somebody whose authority could not be checked is the one mistake here with conse
 |---|---|
 | `warp-channel.lisp` | the whole gateway side: stream id, invoker, the app registry, open/message/close |
 | `gateway-nostr.lisp` | **29 added lines**, and none of them added since — a `load`, a `let` binding, one `cond` clause, one close, one banner line |
-| `payload.js` | the ▤ and 🗀 panels, plus `warp/dom/client.js` embedded verbatim |
+| `payload.js` | the ▤ and 🗀 panels, the ⊞ menu they are reached from, plus `warp/dom/client.js` embedded verbatim |
 | `index-nostr.html` | the pre-split monolith: the ▤ panel, and the same embedded client |
 | `warp/dom/channel.lisp` | everything testable: the clock, the lock, the non-signalling send, the close, and the mux |
 
 ### 7.1 Two apps on it, and why not a second channel
 
-There is a second warp app — **`warp-files`**, a Miller-column file browser (🗀 on the phone,
-above ▤). It shares stream 102 rather than getting one of its own, and that was forced rather than
+There is a second warp app — **`warp-files`**, a Miller-column file browser (🗀 on the phone).
+It shares stream 102 rather than getting one of its own, and that was forced rather than
 preferred:
 
 * **every data channel has to exist before the offer.** Signalling is one-shot and non-trickle and
@@ -475,6 +476,46 @@ opens (default `$HOME`). warp must be checked out beside `webrtc-data` and reach
 `CL_SOURCE_REGISTRY`; if it is not, the load fails inside a handler, one line goes to the log, and
 the panel shows "no answer".
 
+### 7.2 The ⊞ menu — one button for the rich apps, and one entry per known thing
+
+Two apps had buttons and a third had nowhere to go: the right-hand row is five wide and a sixth runs
+off a 375 px phone, which is why 🗀 had already stacked up the left edge above ▤ and ≡. **The rich
+apps — the ones that open a panel over the desktop — are now behind one ⊞ button**, at `left:14px;
+bottom:78px` where ▤ used to be. `≡` and the input controls (paste, mic, speaker, quality) did not
+move: those are things you do to the session, not places you go. Adding a third app is a
+`richApps.push` and nothing else.
+
+**One entry is one known thing.** There is deliberately no "open the best surface for this app"
+entry. The facets of an app are not ranked — `warp-files`' DOM columns are not a degraded picture of
+warren's pixel browser, they are a different projection of the same store, and warp's rule 9 is that
+the *consumer* chooses. An entry that means the columns today and the pixels tomorrow is an entry
+nobody can learn, and choosing on the user's behalf is the surface picking the encoder.
+
+**What it can honestly list, and the discovery gap behind it.** *Nothing on the wire says which apps
+a box serves.* `WARP_FILES` gates the file browser separately, `warp-app` returns `NIL` for one this
+box does not have, `mux-receive` drops the message, and no frame ever comes back — silence, which
+from the phone is indistinguishable from a slow box. **There is no discovery message, and the menu
+does not invent one**: a probe at menu-open would put bytes on a channel the panel is careful to
+keep silent until it is asked, and would load warren → gesso, scribe, pigment into the gateway
+because somebody glanced at a list.
+
+So the menu lists **what this client can ask for**, which is all it knows before it asks, and then
+**remembers the answer**. An app that was opened and never answered stays in the list, struck
+through and captioned *"not served by this box"* — a fact this client earned, told before the next
+tap rather than after it. It is not removed: a client that asked and heard nothing may not claim the
+app was never there. What matters is that it stops being an *offer* the moment it stops being one.
+The memory is per-link and resets on channel close, alongside the nodes and for the same reason.
+
+**One button, one meaning.** ⊞ puts away whatever rich panel is up, and if none is up, offers the
+list. So closing always lands on the desktop, and switching apps is close-then-pick. Exactly one
+rich panel is ever open — not a rule about screen space (both are fixed to the same rectangle) but
+about what the button means. The list is modal: a backdrop at `z-index:32` sits over every button in
+the page including `≡` at 31, with the menu at 33 and ⊞ itself lifted to 34 so the button you tapped
+is still the way out.
+
+**It is payload-only.** No `shell.js`, no `index-shell.html`, no new `api` member — so it ships as a
+`cp` of `payload.js` (§9), with no nsite publish and no new tag.
+
 **Tests, none of which start a gateway.** `demo/glass-webrtc/warp-channel-test.lisp` lifts the
 gateway's own names for *where the desktop is* out of its *text*, starts a real glass admission
 service on a /tmp fixture, and runs `warp-channel.lisp` against a stubbed SCTP — including the app
@@ -482,8 +523,11 @@ registry: an app that is off is refused rather than given the default, and with 
 link carries two channels on two projections. `warp/t/channel.lisp` drives the channel module and
 the mux over a fake transport; `warp/t/panel.sh` and `warp/t/two-apps.sh` drive the panels' actual
 bytes in headless Chromium, the second one asserting that the file browser renders as real nested
-columns while the device manager's DOM is unchanged. The untested remainder is `sctp-send-string`
-itself, which already carries RFB and the control channel.
+columns while the device manager's DOM is unchanged. `two-apps.sh` also drives the ⊞ menu itself —
+that the row carries one button, that opening the list sends nothing, that each entry opens its own
+panel and never two at once, that a shut menu holds no entries, and that an app whose frames are
+dropped at the transport ends up struck through and unpickable. The untested remainder is
+`sctp-send-string` itself, which already carries RFB and the control channel.
 
 ---
 
@@ -560,7 +604,7 @@ and the half that can, does.
 | | contents | where |
 |---|---|---|
 | **shell** | nostr-tools, the PeerConnection and all four channels, credentials, the progress screen, the pill, the desktop-name display | nsite, ~36 KB over the wire (was 97 KB) |
-| **payload** | noVNC, the trackpad, the modifier row, paste, the quality ladder, **both warp panels** (▤ terminals, 🗀 files), the getStats poll | the box, 71 KB gzipped on stream 104 |
+| **payload** | noVNC, the trackpad, the modifier row, paste, the quality ladder, **both warp panels** (▤ terminals, 🗀 files) behind the **⊞ menu**, the getStats poll | the box, 71 KB gzipped on stream 104 |
 
 **The desktop is visible before the payload arrives.** In `VIDEO_PRIMARY` the picture is VP8/RTP
 into a `<video>`, which is the browser's job end to end; noVNC is only there for input coordinates

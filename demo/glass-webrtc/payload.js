@@ -261,6 +261,40 @@ export async function init(api) {
     #filesNote{padding:8px 12px;color:#8a949c;flex:0 0 auto;
       border-top:1px solid rgba(255,255,255,.08)}
     /* ==== END the file browser's stylesheet ================================================== */
+    /* ==== BEGIN the app menu's stylesheet — lifted by warp/t/two-apps.py ======================
+       ONE BUTTON, AND A LIST OF THE RICH APPS BEHIND IT.  The menu is modal on purpose: the
+       backdrop sits above every button in the page (including ≡ at 31) so that while the list is
+       up the only things that can be tapped are an entry and the way out.  A menu you can tap
+       through is a menu that leaves you unsure whether the tap picked something.
+       It is NOT the panels' hold-menu — that one is drawn by warp/dom/client.js from what the
+       server sent and is a different thing entirely.  This one is the page's own furniture and
+       never touches the wire. */
+    #appsBackdrop{position:fixed;inset:0;z-index:32;display:none;background:rgba(0,0,0,.42)}
+    /* bottom:142 — clear of ⊞ itself, which sits at 78 above ≡ at 14.  The menu opens UPWARD from
+       the button that summoned it, which is the direction there is room in on a portrait phone and
+       the direction that keeps the thumb off the list it is choosing from. */
+    #appsMenu{position:fixed;left:14px;bottom:142px;z-index:33;display:none;flex-direction:column;
+      min-width:236px;max-width:calc(100vw - 28px);background:rgba(8,10,14,.96);
+      border:1px solid rgba(255,255,255,.14);border-radius:12px;overflow:hidden;
+      box-shadow:0 12px 34px #000c;
+      font:13px/1.3 ui-monospace,SFMono-Regular,Menlo,monospace;color:#dce4ec}
+    #appsMenu .ttl{padding:8px 13px;color:#8a949c;font-size:10px;letter-spacing:.09em;
+      border-bottom:1px solid rgba(255,255,255,.1)}
+    #appsMenu button{display:flex;align-items:baseline;gap:11px;width:100%;padding:14px 13px;
+      background:none;border:0;border-bottom:1px solid rgba(255,255,255,.07);color:inherit;
+      font:inherit;text-align:left;cursor:pointer;
+      touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+    #appsMenu button:last-child{border-bottom:0}
+    #appsMenu .ag{font-size:18px;width:20px;flex:0 0 auto;text-align:center}
+    #appsMenu .an{flex:1 1 auto}
+    /* AN APP THAT DID NOT ANSWER IS STILL LISTED, and is told about rather than quietly dropped:
+       struck through, dimmed, and captioned with why.  The point of the caption is that it is
+       there BEFORE the tap — the bad version of this menu is the one you pick from and only then
+       find out.  See the ⊞ block for why the client cannot know any earlier than that. */
+    #appsMenu button[disabled]{color:#5a646c;cursor:default}
+    #appsMenu button[disabled] .an{text-decoration:line-through}
+    #appsMenu .aw{flex:0 0 auto;color:#8a949c;font-size:10px;font-style:italic}
+    /* ==== END the app menu's stylesheet ======================================================= */
 `;
   document.head.appendChild(style);
 
@@ -879,6 +913,114 @@ function makeWarpClient(opts) {
 if (typeof window !== "undefined") window.makeWarpClient = makeWarpClient;
     // ==== END warp/dom/client.js ====
 
+    // ==== BEGIN the app menu — lifted by warp/t/two-apps.py ===================================
+    //
+    // --- ⊞ one button for the rich apps, and a menu that says which ones there are -------------
+    //
+    // TWO WARP APPS HAD BUTTONS AND MORE ARE COMING, and the row is out of room: the right-hand
+    // row is five wide and a sixth runs off a 375px phone, which is why the second app already had
+    // to stack up the LEFT edge above ≡.  A third would be looking for space rather than for a
+    // place, and that is the shape of a problem that does not get better by being solved once
+    // more.  So the RICH APPS — the ones that open a panel over the desktop — come off the row
+    // entirely and go behind one button.  The debug toggle and the input controls (paste, mic,
+    // speaker, quality) are untouched: they are things you do to the session, not places you go.
+    //
+    // ONE ENTRY IS ONE KNOWN THING.  There is deliberately no "open the best surface for this app"
+    // entry.  The facets of an app are not RANKED — warp-files' DOM columns are not a degraded
+    // picture of warren's pixel browser, they are a different projection of the same store, and
+    // DESIGN.md rule 9 is explicit that the consumer chooses.  An entry that means the columns
+    // today and the pixels tomorrow is an entry nobody can learn, and picking on the user's behalf
+    // is the surface choosing the encoder, which is the thing rule 9 exists to stop.  So: one
+    // entry, one facet, named — and a menu that conveys intent instead of guessing at it.
+    //
+    // WHAT IT CAN HONESTLY LIST.  Which apps a box serves is decided by WARP_FILES and by whether
+    // :warp-files loads, and NOTHING ON THE WIRE ANNOUNCES IT: warp-app drops an app this box does
+    // not serve and the frames simply never come.  There is no discovery message, and this is not
+    // the place to invent one — a probe at menu-open would put bytes on a channel this panel is
+    // careful to keep silent until it is asked, and would load warren, gesso, scribe and pigment
+    // into the gateway because somebody glanced at a list.
+    //
+    // So the menu lists what this client can ASK FOR, which is all it knows before it asks, and
+    // then it REMEMBERS THE ANSWER.  An app that was opened and never answered stays in the list,
+    // struck through and captioned "not served by this box": a fact this client earned, told
+    // before the next tap rather than after it.  Removing the entry would be a stronger claim than
+    // the evidence supports ("there is no such app") and would make it vanish with no account of
+    // why.  What matters is that it stops being an OFFER the moment it stops being one.
+    //
+    // The memory is per-link and resets on channel close, alongside the nodes and for the same
+    // reason: the box on the other end of a reconnect is entitled to say something different.
+    const richApps = [];        // {id, glyph, name, served, show(on)} — pushed by each app below
+    const appsBackdrop = document.createElement('div');
+    appsBackdrop.id = 'appsBackdrop';
+    const appsMenu = document.createElement('div');
+    appsMenu.id = 'appsMenu';
+    document.body.append(appsBackdrop, appsMenu);
+
+    const appsBtn = mkToggle('⊞', 14, 'apps');
+    appsBtn.style.left = '14px'; appsBtn.style.right = 'auto'; appsBtn.style.bottom = '78px';
+
+    let appOpen = null, appsMenuOn = false;
+
+    // EXACTLY ONE RICH PANEL IS EVER UP.  Not a rule about screen space — both panels are fixed to
+    // the same rectangle and would simply stack — but about what the button means.  It is showing
+    // you one app; closing puts you back on the desktop rather than into the other one.
+    const showApp = a => {
+      for (const b of richApps) if (b !== a) b.show(false);
+      appOpen = a || null;
+      if (a) a.show(true);
+      setBtn(appsBtn, a ? 'on' : 'off');
+    };
+    // Rebuilt on every open rather than kept in step, because it is four elements and the thing it
+    // reports — whether an app answered — changes underneath it.
+    const drawApps = () => {
+      appsMenu.textContent = '';
+      const ttl = document.createElement('div');
+      ttl.className = 'ttl'; ttl.textContent = 'APPS';
+      appsMenu.appendChild(ttl);
+      for (const a of richApps) {
+        const b = document.createElement('button');
+        b.dataset.app = a.id;
+        b.setAttribute('aria-label', a.name);
+        const g = document.createElement('span'); g.className = 'ag'; g.textContent = a.glyph;
+        const n = document.createElement('span'); n.className = 'an'; n.textContent = a.name;
+        b.append(g, n);
+        if (a.served === false) {
+          b.disabled = true;
+          const w = document.createElement('span');
+          w.className = 'aw'; w.textContent = 'not served by this box';
+          b.appendChild(w);
+        } else {
+          b.addEventListener('click', () => { setAppsMenu(false); showApp(a); });
+        }
+        appsMenu.appendChild(b);
+      }
+    };
+    const setAppsMenu = on => {
+      appsMenuOn = on;
+      // Built on open and TORN DOWN on close, rather than left hidden: a shut menu holding live
+      // entries is a set of click handlers on elements nobody can see, which is how a stale offer
+      // gets taken.  Four elements; rebuilding them is not a cost worth keeping state for.
+      if (on) drawApps(); else appsMenu.textContent = '';
+      appsMenu.style.display = on ? 'flex' : 'none';
+      appsBackdrop.style.display = on ? 'block' : 'none';
+      // ⊞ RIDES ABOVE THE BACKDROP while the list is up.  It is the thing you tapped and the thing
+      // that puts the list away again, and a modal layer that dims the affordance it belongs to
+      // reads as "this button is now unavailable" — the opposite of what it is.
+      appsBtn.style.zIndex = on ? '34' : '';
+      setBtn(appsBtn, (on || appOpen) ? 'on' : 'off');
+    };
+    appsBackdrop.addEventListener('click', () => setAppsMenu(false));
+    // ONE BUTTON, ONE MEANING: put away whatever rich surface is up, and if none is up, offer the
+    // list.  So closing always lands on the desktop, and switching apps is close-then-pick rather
+    // than a menu that opens over a live panel and has to decide what the panel underneath it is
+    // doing while you read it.
+    appsBtn.addEventListener('click', () => {
+      if (appsMenuOn) { setAppsMenu(false); return; }
+      if (appOpen) { showApp(null); return; }
+      setAppsMenu(true);
+    });
+    // ==== END the app menu ====================================================================
+
     // --- ▤ the device manager: warp, on a third data channel ---------------------------------
     //
     // The box keeps a set of enrolled terminals and already administers them over gift-wrapped
@@ -944,41 +1086,46 @@ if (typeof window !== "undefined") window.makeWarpClient = makeWarpClient;
     // nodes would leave rows on screen that the new stream can never mention and therefore never
     // remove.  Forget them; the reconnect will say what is true.
     warpCh.addEventListener('close', () => {
-      warp.reset(); warpSpoke = false;
+      warp.reset(); warpSpoke = false; warpApp.served = null;
       warpStat.textContent = '—'; warpNote.textContent = 'channel closed';
       diag('warp channel CLOSE');
     });
 
     let warpOn = false, warpSpoke = false;
-    const warpBtn = mkToggle('▤', 14, 'enrolled terminals');
-    // Above the ≡, not beside the 📋: the right-hand row is five buttons wide already and a sixth
-    // runs off a 375px phone.  It also groups correctly — ≡ and ▤ are both things you go and look
-    // at, and the right-hand row is things you do to the desktop.
-    warpBtn.style.left = '14px'; warpBtn.style.right = 'auto'; warpBtn.style.bottom = '78px';
-    warpBtn.addEventListener('click', () => {
-      warpOn = !warpOn;
-      warpPanel.style.display = warpOn ? 'flex' : 'none';
-      setBtn(warpBtn, warpOn ? 'on' : 'off');
-      if (!warpOn) return;
-      // The FIRST open is what puts the first byte on this channel, which is what tells the box a
-      // warp consumer exists at all — a negotiated channel has no handshake, so the hello IS the
-      // open.  Every later open just re-reports the viewport, which may have changed with rotation.
-      warp.viewport(warpFit(), 0);
-      if (!warpSpoke) {
-        warpSpoke = true;
-        warpNote.textContent = 'asking the box…';
-        diag('warp channel: hello on stream 102');
-        // A box without the warp channel — an older build, or one started without WARP_CHANNEL —
-        // simply never answers.  Say so rather than showing an empty list, which is what "no
-        // terminals are enrolled" looks like and is a different and much more alarming claim.
-        setTimeout(() => {
-          if (warpOn && warp.stats().frames === 0) {
-            warpNote.textContent = 'no answer — this box is not serving the terminal list';
-            diag('warp channel: no answer from the box');
-          }
-        }, 5000);
+    // ▤ IS AN ENTRY IN THE ⊞ MENU, not a button on the row any more, and that is the whole of what
+    // changed here.  What opening does is unchanged down to the order of the sends — the viewport
+    // report, the first-open hello, the no-answer timeout that names which thing is missing — and
+    // so is every byte on the wire, every element in the panel and every authorization decision,
+    // all of which are the box's.  This is a rearrangement of how the panel is REACHED.
+    const warpApp = {
+      id: 'devices', glyph: '▤', name: 'enrolled terminals', served: null,
+      show: on => {
+        warpOn = on;
+        warpPanel.style.display = on ? 'flex' : 'none';
+        if (!on) return;
+        // The FIRST open is what puts the first byte on this channel, which is what tells the box a
+        // warp consumer exists at all — a negotiated channel has no handshake, so the hello IS the
+        // open.  Every later open just re-reports the viewport, which may have changed with rotation.
+        warp.viewport(warpFit(), 0);
+        if (!warpSpoke) {
+          warpSpoke = true;
+          warpNote.textContent = 'asking the box…';
+          diag('warp channel: hello on stream 102');
+          // A box without the warp channel — an older build, or one started without WARP_CHANNEL —
+          // simply never answers.  Say so rather than showing an empty list, which is what "no
+          // terminals are enrolled" looks like and is a different and much more alarming claim.
+          // The menu is told too, so the next tap is spent somewhere that can answer.
+          setTimeout(() => {
+            if (warpOn && warp.stats().frames === 0) {
+              warpNote.textContent = 'no answer — this box is not serving the terminal list';
+              warpApp.served = false;
+              diag('warp channel: no answer from the box');
+            }
+          }, 5000);
+        }
       }
-    });
+    };
+    richApps.push(warpApp);
     window.addEventListener('resize', () => { if (warpOn) warp.viewport(warpFit(), 0); });
 
     // ==== BEGIN the file browser — lifted by warp/t/two-apps.py ===============================
@@ -1035,34 +1182,40 @@ if (typeof window !== "undefined") window.makeWarpClient = makeWarpClient;
     // additions to this file and each one wires its own client to the channel the shell made.
     warpCh.addEventListener('message', e => files.apply(e.data));
     warpCh.addEventListener('close', () => {
-      files.reset(); filesSpoke = false;
+      files.reset(); filesSpoke = false; filesApp.served = null;
       filesStat.textContent = '—'; filesNote.textContent = 'channel closed';
     });
 
     let filesOn = false, filesSpoke = false;
-    const filesBtn = mkToggle('🗀', 14, 'files');
-    filesBtn.style.left = '14px'; filesBtn.style.right = 'auto'; filesBtn.style.bottom = '142px';
-    filesBtn.addEventListener('click', () => {
-      filesOn = !filesOn;
-      filesPanel.style.display = filesOn ? 'flex' : 'none';
-      setBtn(filesBtn, filesOn ? 'on' : 'off');
-      if (!filesOn) return;
-      files.viewport(filesFit(), 0);
-      if (!filesSpoke) {
-        filesSpoke = true;
-        filesNote.textContent = 'asking the box…';
-        diag('warp files: hello on stream 102');
-        // A box serving the device manager and not the file browser is an ordinary state — the app
-        // is opt-in on the gateway — so this says which thing is missing rather than showing an
-        // empty tree, which would read as "your home directory is empty".
-        setTimeout(() => {
-          if (filesOn && files.stats().frames === 0) {
-            filesNote.textContent = 'no answer — this box is not serving the file browser';
-            diag('warp files: no answer from the box');
-          }
-        }, 5000);
+    // THE SECOND ENTRY, and the reason the ⊞ menu is a registry rather than two special cases: a
+    // third app is a `richApps.push` and nothing else — no glyph hunting for a free 60 pixels, no
+    // decision about which corner it stacks in.
+    const filesApp = {
+      id: 'files', glyph: '🗀', name: 'files', served: null,
+      show: on => {
+        filesOn = on;
+        filesPanel.style.display = on ? 'flex' : 'none';
+        if (!on) return;
+        files.viewport(filesFit(), 0);
+        if (!filesSpoke) {
+          filesSpoke = true;
+          filesNote.textContent = 'asking the box…';
+          diag('warp files: hello on stream 102');
+          // A box serving the device manager and not the file browser is an ordinary state — the app
+          // is opt-in on the gateway — so this says which thing is missing rather than showing an
+          // empty tree, which would read as "your home directory is empty".  WARP_FILES gates this
+          // app on its own, so this is the ONLY way the menu can ever learn about it.
+          setTimeout(() => {
+            if (filesOn && files.stats().frames === 0) {
+              filesNote.textContent = 'no answer — this box is not serving the file browser';
+              filesApp.served = false;
+              diag('warp files: no answer from the box');
+            }
+          }, 5000);
+        }
       }
-    });
+    };
+    richApps.push(filesApp);
     window.addEventListener('resize', () => { if (filesOn) files.viewport(filesFit(), 0); });
     // ==== END the file browser ================================================================
 
