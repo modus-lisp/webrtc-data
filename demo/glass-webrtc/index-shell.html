@@ -103,6 +103,12 @@
        that lights the dot and forgets to explain itself. */
     #linkstat:not([data-state="live"]){background:rgba(0,0,0,.8);box-shadow:0 1px 10px rgba(0,0,0,.5)}
     #linkstat:not([data-state="live"]) .txt{max-width:290px;opacity:1}
+    /* A dot that appears with no label is a mystery light.  On the FIRST healthy connection in
+       a browser it says what it is for a few seconds and then shrinks to the dot, using the
+       transitions already here.  Once taught, never again -- the point of the dot is that a
+       working link should be almost invisible. */
+    #linkstat[data-intro] .txt{max-width:290px;opacity:1}
+    #linkstat[data-intro]{background:rgba(0,0,0,.8);box-shadow:0 1px 10px rgba(0,0,0,.5)}
     #linkstat[data-state="checking"] .dot{background:#ffd479;opacity:1}
     #linkstat[data-state="stalled"]{color:#ffe3bb}
     #linkstat[data-state="stalled"] .dot{background:#ffb03a;opacity:1;animation:linkpulse 1.1s ease-in-out infinite}

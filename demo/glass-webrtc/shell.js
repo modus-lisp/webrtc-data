@@ -189,6 +189,21 @@ const LINK_TEXT = {
   reconnecting: 'Reconnecting…',
 };
 let linkState = 'live', linkSaidLive = false, linkArmed = false;
+// The dot introduces itself ONCE per browser.  It is the only thing on screen that appears without
+// having been asked for, and an unexplained indicator is worse than none: the viewer cannot tell a
+// status light from a fault.  Shown on the first HEALTHY link (not the first paint), because that is
+// the moment it means something, then collapsed to the dot it will be from then on.
+const INTRO_KEY = 'glass-linkintro';
+function introduceLink() {
+  try { if (localStorage.getItem(INTRO_KEY)) return; } catch (_) { return; }
+  linkTxt.textContent = 'connection ok — this dot watches it';
+  linkEl.dataset.intro = '1';
+  setTimeout(() => {
+    delete linkEl.dataset.intro;
+    if (linkState === 'live') linkTxt.textContent = LINK_TEXT.live || 'live';
+  }, 4200);
+  try { localStorage.setItem(INTRO_KEY, '1'); } catch (_) {}
+}
 // ONE function writes the status and it writes BOTH surfaces — the pill and, while the full-screen
 // overlay is up, the overlay's message line.  The two cannot drift into different vocabularies for
 // the same condition because there is only one place either of them is set.
@@ -198,8 +213,12 @@ function setLink(state, text) {
   linkState = state;
   linkEl.dataset.state = state;
   if (linkTxt.textContent !== label) linkTxt.textContent = label;
-  linkEl.hidden = !connHidden;
-  if (!connHidden && state !== 'live') setConnRaw(label);
+  // The pill shows once the card is gone -- OR whenever the card is not the thing reporting, which
+  // is now the reconnect case.  Without this the reconnect had no surface at all: card suppressed,
+  // pill still hidden behind CONNHIDDEN.
+  linkEl.hidden = !(connHidden || state === 'reconnecting');
+  if (state === 'live' && connHidden) introduceLink();
+  if (!connHidden && state !== 'live' && state !== 'reconnecting') setConnRaw(label);
 }
 
 // ---- the video element: THE DESKTOP, before anything else has loaded ---------------------------
@@ -613,8 +632,14 @@ function scheduleReconnect(why) {
   setReconnAttempts(n + 1);
   const delay = Math.min(30000, 1000 * Math.pow(2, n));
   const label = 'Reconnecting…' + (n ? ' (attempt ' + (n + 1) + ')' : '');
-  connEl.style.display = ''; connEl.style.opacity = '';
-  connHidden = false;
+  // THE CARD DOES NOT COME BACK.  It used to: connHidden went false and the four-step panel was
+  // re-staged over a desktop the viewer could still see, for a reconnect that usually takes a
+  // second.  The card is a FIRST-TIME ceremony -- four steps, each explaining a stage you have
+  // never seen -- and a reconnect is not a first time.  The pill already says the same thing in a
+  // corner, which is why it exists.
+  //
+  // It is still escalated on the way OUT: giving up (above) re-stages the card, because at that
+  // point the connection genuinely is not happening and a dot is too quiet for that.
   setLink('reconnecting', label);
   diag('reconnect in ' + delay + 'ms — ' + why + ' (attempt ' + (n + 1) + ')');
   // A RELOAD, so there is nothing to leak: every peer connection, interval, listener and decoder in
