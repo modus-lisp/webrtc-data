@@ -573,6 +573,22 @@ const pastTs = () => nowSec() - Math.floor(Math.random() * 172800);
 const hex = u8 => [...u8].map(b => b.toString(16).padStart(2, '0')).join('');
 const unhex = h => new Uint8Array(h.match(/../g).map(x => parseInt(x, 16)));
 const DEV_KEY = 'glass-device:' + boxArg;
+// The last time the box ADMITTED us, which is the only direct evidence an enrolment exists.
+// The client cannot ask: a denial is answered with silence by design, so the alternative is
+// offering into the dark and concluding by timeout — half a minute of nothing before the page
+// can even offer the signer.  An answer proves enrolment at that instant; enrolments last
+// DEVICE_TTL and are renewed by use, so an older stamp means almost certainly lapsed.
+// ALMOST: this only decides whether to OFFER the signer early, never whether to try.
+const OK_KEY = 'glass-lastok:' + boxArg;
+const DEVICE_TTL_MS = 24 * 3600 * 1000;   // the box's default; a hint, not a contract
+const markAdmitted = () => { try { localStorage.setItem(OK_KEY, String(Date.now())); } catch (_) {} };
+const staleEnrolment = () => {
+  try {
+    if (!hasDevice()) return false;              // nothing to be stale
+    const t = +(localStorage.getItem(OK_KEY) || 0);
+    return !t || (Date.now() - t) > DEVICE_TTL_MS;
+  } catch (_) { return false; }
+};
 const hasDevice = () => { try { const h = localStorage.getItem(DEV_KEY); return !!h && h.length === 64; }
                           catch (_) { return false; } };
 const deviceSecret = () => {
@@ -1064,6 +1080,20 @@ async function makeIdentity() {
   };
   window.__showNoCredential = showNoCredential;
 
+  // OFFER EARLY WHEN THE ENROLMENT IS PRESUMED DEAD.  The attempt still goes out — the guess can
+  // be wrong, and a working link must never be pre-empted by a prediction — but the signer is
+  // offered beside it instead of half a minute later.  The old order made the page LOOK broken
+  // for thirty seconds before admitting it knew nothing new, and it knew this at load.
+  if (staleEnrolment() && !codeAlive(code)) {
+    diag('enrolment looks lapsed (no admission within DEVICE_TTL) — offering the signer now');
+    // pc.remoteDescription, not the ANSWERED flag: that is declared below this point, so reading it
+    // here works only because the timer outlives the module body.  Depending on that is how the
+    // onOpen bug happened.  The peer connection exists already and its remote description is set
+    // by exactly the event this is asking about.
+    setTimeout(() => { if (!pc.remoteDescription && haveSigner())
+                         showNoCredential('This browser may need to sign in again'); }, 900);
+  }
+
   // ---- TAP TO OPEN, when and only when a CODE would be spent ------------------------------------
   // A login code is one-time: redeeming it trades it for an enrolment, so a successful tap also
   // means nobody else got there first.  That property is only worth having if the code cannot be
@@ -1143,6 +1173,7 @@ async function makeIdentity() {
               diag(`ignored a replayed answer (ufrag ${env.ufrag || 'none'}, want ${myUfrag || 'pending'})`);
               return;
             }
+            markAdmitted();   // an answer IS the admission; nothing else proves it
             if (env.code) { storeCode(env.code); code = env.code; diag('credential renewed'); }
             answer = env.sdp;
           }
