@@ -595,6 +595,10 @@ const deviceSecret = () => {
 // one tap is one attempt — a flag that stuck would turn a single tap into a signer prompt on every
 // subsequent load of that tab, which is the thing it exists to prevent.
 const SIGNIN_KEY = 'glass-signin:' + boxArg;
+// PEEK, not take: the waiting loop above must be able to ask whether a sign-in was requested
+// without spending the request, or a slow signer would consume the flag and then not be there.
+const signInAsked = () => { try { return Boolean(sessionStorage.getItem(SIGNIN_KEY)); }
+                            catch (_) { return false; } };
 const askSignIn = () => { try { sessionStorage.setItem(SIGNIN_KEY, '1'); } catch (_) {} };
 const takeSignIn = () => {
   let w = false;
@@ -953,6 +957,20 @@ async function makeIdentity() {
   // set by the button on the failure screen, consumed here.  Ordered before the device branch on
   // purpose: the case this exists for is a device key that IS present and IS stale, so a signer
   // that only ran when there was no device key would never run at all.
+  // WAIT FOR THE SIGNER, when one was asked for.  An iOS signer extension (nostash) injects
+  // window.nostr AFTER this module runs, so a bare check here is a race this side loses every
+  // time: the flag stays unconsumed, we fall through to the stale code, fail, offer the button
+  // again, and reload into the identical race.  The failure card below already polls for exactly
+  // this reason (SIGNERLOOKS) -- that knowledge just never reached the branch that needs it.
+  //
+  // Bounded, and only on the path that ASKED: the ordinary load must not wait on an extension
+  // that is not coming.
+  if (signInAsked() && !haveSigner()) {
+    diag('sign-in asked for — waiting for the signer to appear');
+    for (let i = 0; i < 20 && !haveSigner(); i++) await new Promise(r => setTimeout(r, 150));
+    if (!haveSigner())
+      throw noCredential('Your Nostr signer did not appear. Open it once, then try again.');
+  }
   if (haveSigner() && takeSignIn()) {
     const signer = window.nostr;
     if (!signer.nip44)
