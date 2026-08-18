@@ -1110,8 +1110,29 @@ async function makeIdentity() {
   // like a fresh one.  So we correlate: the box echoes back the ice-ufrag of the offer it is
   // answering, and that is minted per PeerConnection.  Ours or it is not our answer.
   let answered = false, myUfrag = null;
-  pool.subscribeMany(relays, [{ kinds: [1059], '#p': [id.pub] }], {
-    onevent: async (ev) => {
+  // ---- DO NOT DECRYPT THE BACKLOG -------------------------------------------------------------
+  // Relays hand a new subscription every stored event matching the filter, and this filter matches
+  // EVERY gift wrap ever sent to this key.  With a device key that costs nothing: unwrapping is
+  // local, and the old answers are discarded on their ufrag.  With a NIP-07 signer it costs TWO
+  // PERMISSION PROMPTS EACH (seal, then rumor) — a hundred taps before the one that matters.
+  //
+  // And a wrap cannot be judged without decrypting it: NIP-59 backdates created_at by up to two
+  // days ON PURPOSE, so recency is exactly what the envelope is designed to hide.  The only honest
+  // signal is EOSE — stored before it, live after it — and our answer is necessarily live, because
+  // we subscribe here and publish the offer below.
+  //
+  // So the backlog is HELD, not decrypted.  If the live path produces an answer nobody ever pays
+  // for it.  If it does not, we drain what we kept, newest first, and the old cost returns only in
+  // the case that was already failing.  SINCE bounds what we are handed to the backdating window.
+  const backlog = [];
+  let live = false;
+  const drainBacklog = () => {
+    if (answered || !backlog.length) return;
+    diag(`no live answer — decrypting ${backlog.length} held wrap(s)`);
+    const held = backlog.splice(0).reverse();
+    for (const ev of held) onWrap(ev);
+  };
+  const onWrap = async (ev) => {
       if (answered) return;
       try {
         let answer = await id.unwrap(ev);
@@ -1137,8 +1158,16 @@ async function makeIdentity() {
           setStatus('answer received — establishing WebRTC…');
         }
       } catch (_) { /* not for us / not from the box */ }
-    },
-  });
+  };
+  pool.subscribeMany(relays,
+    [{ kinds: [1059], '#p': [id.pub], since: Math.floor(Date.now() / 1000) - 2 * 86400 }], {
+      onevent: ev => { if (live) onWrap(ev); else backlog.push(ev); },
+      // A relay that never says EOSE would otherwise hold the backlog forever, so the timeout is
+      // the real gate and EOSE is the fast one.
+      oneose: () => { live = true; },
+    });
+  setTimeout(() => { live = true; }, 4000);
+  setTimeout(drainBacklog, 12000);
 
   // Audio starts MUTED both ways.  A sendrecv transceiver with no track still negotiates the
   // m=audio line, and replaceTrack() attaches the real mic later without renegotiation (which our
