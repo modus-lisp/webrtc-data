@@ -84,7 +84,8 @@ relay backlog with a fresh live credential.
 
 Checked in this order, **by the desktop**, and the first match wins:
 
-1. **code** — a valid unexpired login token in the offer envelope. Valid for its own TTL.
+1. **code** — a valid unexpired login token in the offer envelope, **redeemable by one key**
+   (below). Valid for its own TTL, `GLASS_LOGIN_TTL` (`LINK_TTL`), default **600 s**.
 2. **allowlist** — `NOSTR_ALLOW` (`GLASS_NOSTR_ALLOW` overrides). Permanent.
 3. **device** — a browser enrolled after arriving on a valid code. `DEVICE_TTL`
    (`GLASS_DEVICE_TTL`), default 24 h, **renewed on every connection**, persisted to
@@ -92,6 +93,13 @@ Checked in this order, **by the desktop**, and the first match wins:
 
 A code authorises *independently of the allowlist*, and any admitted connection enrols the caller as
 a device. One leaked link is therefore durable access until someone runs `revoke`.
+
+**Redemption is not contingent on need.** An offer that carries a live code spends it, even when the
+caller was already enrolled or allowlisted and would have been admitted anyway — `code` is first in
+the list above and that ordering is now a *requirement*, not an accident. The client sends the code
+whenever it has one; the box must burn it whenever it is sent one. The obvious optimisation ("we
+already have an enrolment, skip the code") would leave a tapped link live in a DM for the rest of
+its TTL, and nothing would fail.
 
 **The browser signs with a device key, not with your npub** — a secret it generates once and keeps
 in `localStorage`. That is what makes the allowlist row subtle: signing in through a NIP-07 signer
@@ -101,7 +109,9 @@ asks the desktop for a login code on an **allowlist** admission too (`ASK-ADMISS
 `mint` round trip, allowlist only) and puts it in the answer envelope. A login token is not bound to
 a pubkey — the MAC is over `glass-login|nonce|exp` and nothing else — so the browser spends it under
 its **own** device key on the next load, is admitted `code`, and *that* is what enrols the device.
-One signature buys a durable terminal.
+One signature buys a durable terminal. (Single use is a *store* binding, not a property of the
+token, which is exactly what keeps this working: the code is minted for one identity and redeemed by
+another, on purpose.)
 
 ### Signing in, when a terminal has lapsed
 
@@ -165,11 +175,15 @@ glass-admit/1 ok box=<64hex> allow=1 devices=2 ttl=86400
 | verb | asks | answers |
 |---|---|---|
 | `ping` | is there a desktop, and what is its posture | `box` `allow` `devices` `ttl` |
-| `admit pub= code=` | may this peer connect (decides + enrols + mints) | `via` `code` `token` `devices` |
+| `admit pub= code=` | may this peer connect (decides + **redeems** + enrols + mints) | `via` `code` `token` `devices` |
 | `allowed pub=` | is this pubkey on the allowlist | `allowed=1\|0` |
 | `devices` | the enrolments (the shared warp query) | `rows=N` + `<pubkey> <expiry>` |
 | `revoke pub= arg=` | un-enrol, on `pub`'s authority — **allowlist only** | `rows=N` + revoked keys |
-| `mint pub= [ttl=]` | a login token, on `pub`'s authority | `token` |
+| `mint pub= [for=] [ttl=]` | a login token, on `pub`'s authority. `for=` makes it a **link** (short TTL, supersedes that recipient's outstanding codes); no `for=` is a **top-up** (renewal TTL, supersedes nothing) | `token` `ttl` `for` `superseded` |
+
+`code=` / `reason=` on an `admit` is one of `absent` `bad` `expired` `superseded` `spent` `ok` — six
+distinct reasons, and the last two are the ones worth reading: `superseded` is routine (they tapped
+an older link), `spent` is not (somebody else redeemed theirs).
 
 **Three statuses and not two.** `deny` is an answer; `err`, or no connection at all, is the absence
 of one. The client half returns `:UNREACHABLE` distinctly, and that distinction is the only reason
@@ -187,17 +201,90 @@ mac = HMAC-SHA256(box-secret, "glass-login|" nonce "|" exp)
 
 The box npub and code live in the `#fragment`, which an nsite gateway never receives.
 
-**Codes are reusable until they expire** — there is no spent-nonce set. (`login-token.lisp`'s header
-claims single-use is enforced by the gateway. It is not; the gateway's own comment is the truth.)
+#### A code is redeemed once, by one key
+
+**A successful redemption means nobody else used that code.** That is the point: it turns
+interception from undetectable into *detected* — if your tap works, you were first.
+
+It is a **binding**, not a burn. The store maps `nonce → the pubkey that redeemed it`, in the
+desktop (`glass/src/nostr.lisp`), and every transition happens inside one mutex:
+
+| presenting key | result | `reason=` |
+|---|---|---|
+| first to present it | bound to that key, enrolled, admitted | `via=code` |
+| **same** key again | admitted again, idempotently | `via=code` |
+| **different** key | **refused**, and logged loudly | `spent` |
+
+The retry has to keep working or this feature strands people: signalling is one-shot and
+non-trickle over three relays with no renegotiation, so a lost answer means the phone **re-offers
+with the same code**, and relay fan-out delivers one offer several times regardless. A strict
+once-and-never-again refuses the honest retry, and the failure looks exactly like the leak.
+
+`reason=spent` is the only signal this system has that an interception *happened*, so the desktop
+prints it in full (`@@ LOGIN CODE ALREADY REDEEMED …`, naming both key prefixes). The first key is
+the one that is enrolled; `revoke <prefix>` if it was not you.
+
+#### A code nobody taps is superseded by the next one
+
+Single use says nothing about the commonest shape there is — *ask for a link, tap nothing, ask
+again* — which leaves every unused link armed until its TTL runs out. So **minting supersedes**: a
+link minted *for* a recipient invalidates that recipient's earlier **outstanding** codes, in the
+same critical section that mints it. At most one live link per person exists, and it is always the
+most recent. Tapping an older one is refused with `reason=superseded`, which is *not* the leak alarm
+— it means "ask for a fresh one", and the `link` reply says so in words.
+
+Deliberately narrow, because the wider rule has a trap in it:
+
+* **Only :outstanding rows are superseded.** A code the person already redeemed is a terminal they
+  are sitting in front of; a later link must never reach back and log them out of it.
+* **An admission burns nothing but the code it was handed.** "They are already logged in, kill their
+  outstanding links" would kill a laptop's fresh link the moment the phone reconnects — failing
+  exactly the way an intercepted code fails, which is the one distinction worth preserving.
+* **A renewal supersedes nothing**, because it has no recipient. It is minted with a fresh random
+  nonce and no `for`, so it never joins a supersede group and can never cancel itself.
+
+The store is `<GLASS_DEVICE_FILE>.codes` (default `~/.glass-devices.codes`), **derived** from the
+enrolment file rather than configured separately so that redirecting one redirects both — a test
+that repoints `GLASS_DEVICE_FILE` at `/tmp` cannot touch the live spent set by forgetting a second
+variable. One line per code, positional, `-` for a field that does not apply:
+
+```
+<nonce-hex> <state> <expiry> <recipient|-> <redeemed-by|-> <minted-at> <settled-at>
+```
+
+`state` is `outstanding` / `redeemed` / `superseded` — kept as distinct reasons rather than collapsed
+to a boolean, because the failure screen must eventually tell "already used" (investigate) from
+"expired" (unremarkable). Expiry is the fourth end and is not a state: an expired row is **pruned**
+at the code's own expiry, the same instant the MAC check starts refusing it, so the file stays a
+handful of lines. `GLASS_CODE_FILE` overrides the path.
+
+#### Two TTLs, because a link and a renewal have opposite jobs
+
+These were one parameter (`*LOGIN-TTL*`, 1800 s) doing both, which is why neither could be tuned.
+
+| | what it is | default | env |
+|---|---|---|---|
+| **link** | a credential *in transit* through a DM. Its TTL is the only bound on a leaked link. | **600 s** | `GLASS_LOGIN_TTL`, `LINK_TTL` |
+| **renewal** | a credential *at rest* in `localStorage`, which must survive to that browser's next load. | 1800 s | `GLASS_RENEWAL_TTL` |
+
+Ten minutes for a link covers the human path — the DM lands, the phone is face down in another room,
+they walk over, unlock, open, tap, and then tap again through the client's tap-to-open gate — and
+deletes the twenty-five minutes of slack that made a screenshot of a DM a working key. Relay latency
+is seconds and is not what sets the floor. Five is defensible and it is one environment variable, but
+a too-short link fails the ordinary case and its failure is indistinguishable at the far end from the
+ones that matter. The renewal is **unchanged**: shortening it makes nothing safer (it sits in the
+same storage as the device key it falls back to) and only quietly demotes `code` admissions to
+`device` ones.
 
 Every successful answer carries a *fresh* token back, stored in `localStorage`, so an active terminal
-never needs a new link. That now includes **allowlist** admissions, which the desktop declines to
-mint for and the gateway tops up — see §2.2 for why a signer's admission is the one that most needs
-it.
+never needs a new link. That includes **allowlist** admissions, which the desktop declines to mint
+for and the gateway tops up — see §2.2 for why a signer's admission is the one that most needs it.
+The top-up is `mint pub=…` with **no** `for=`, so it gets the renewal TTL and supersedes nothing;
+`mint pub=… for=…` is the *link* form and does both.
 
-TTLs disagree between call sites: 900 s from the CLI (`login-link.lisp`), 1800 s
-(`GLASS_LOGIN_TTL`, falling back to `LINK_TTL`) for the desktop's `link` DM and for the renewal that
-rides back with each answer.
+The CLI (`login-link.lisp`) is the one minter that runs **out of band**, in its own process with no
+reach into the desktop's store — so a link it mints is still redeemed exactly once (recorded at
+redemption) but supersedes nothing. Prefer the `link` DM or `mint … for=` when that matters.
 
 ### Message formats
 
@@ -538,8 +625,12 @@ dropped at the transport ends up struck through and unpickable. The untested rem
 1. **The box identity falls back to a committed placeholder** when `NOSTR_SEC` is unset, and that
    secret is the login-token HMAC key. `DEPLOY.md` claims nothing in the repo contains a key; that is
    true only of the *site* key.
-2. **Login codes are reusable until expiry** — no spent-nonce set, contradicting `login-token.lisp`'s
-   own header.
+2. ~~**Login codes are reusable until expiry**~~ — **fixed.** A code is now redeemed once, by one
+   key, and superseded by the next link minted for the same recipient; see §2. What is *left* of it:
+   a code is a bearer credential for its 10-minute window, and the box cannot tell an interceptor who
+   redeems it *first* from the intended recipient — it can only tell you that it happened, when the
+   real recipient's tap is refused. The store is last-writer-wins on a whole-file rewrite, so two
+   desktops sharing one `GLASS_DEVICE_FILE` would still race; one desktop owns it, as before.
 3. **Any admitted connection enrols a 24 h device that renews itself**, so one leaked link is durable
    access until revoked.
 4. **The TURN long-term credential is published** in the browser bundle. Inherent to browser TURN

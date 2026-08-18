@@ -49,7 +49,10 @@
         (t (string-downcase s))))
 
 (let* ((arg (second sb-ext:*posix-argv*))
-       (ttl (or (ignore-errors (parse-integer (or (third sb-ext:*posix-argv*) ""))) 900)))
+       ;; 600 s, matching GLASS:*LOGIN-TTL* — a LINK is a credential in transit and its TTL is the
+       ;; only bound on a leaked one.  These used to disagree (900 here, 1800 there) with nothing
+       ;; saying which was meant.  Still overridable as the second argument.
+       (ttl (or (ignore-errors (parse-integer (or (third sb-ext:*posix-argv*) ""))) 600)))
   (unless arg
     (format *error-output* "usage: login-link <npub | 64-hex | name@domain> [ttl-seconds]~%")
     (sb-ext:exit :code 1))

@@ -5,11 +5,33 @@
 ;;;;   token = <nonce-hex> "." <exp-unix> "." <mac-hex>
 ;;;;   mac   = HMAC-SHA256( box-secret-bytes, "glass-login|" nonce "|" exp )
 ;;;;
-;;;; Whoever holds the box secret (the gateway, and the login-link minter) can verify a
-;;;; token's MAC + expiry with no shared state.  SINGLE-USE is enforced separately by the
-;;;; gateway, which remembers spent nonces until they expire.  The token is delivered to a
-;;;; user inside a gift-wrapped DM (only that npub can read it), so holding a valid code is
-;;;; the proof of identity — no browser signer needed.
+;;;; Whoever holds the box secret can verify a token's MAC + expiry with no shared state.
+;;;; The token is delivered to a user inside a gift-wrapped DM (only that npub can read it),
+;;;; so holding a valid code is the proof of identity — no browser signer needed.
+;;;;
+;;;; SINGLE USE IS NOT IN THE TOKEN AND NEVER WAS.  An older version of this header claimed
+;;;; the GATEWAY remembered spent nonces.  It never did, and the gateway's own comment said
+;;;; the opposite — two files disagreeing about whether a credential could be replayed.  The
+;;;; feature the doc described has since been written, and it lives in the DESKTOP, not here:
+;;;; glass/src/nostr.lisp keeps a login-code store beside its enrolments and decides, in one
+;;;; critical section, what becomes of every code:
+;;;;
+;;;;   redeemed    bound to the FIRST pubkey that presented it.  That key may re-present it
+;;;;               as often as it likes (the phone re-offers after a lost answer, and relay
+;;;;               fan-out delivers one offer several times); ANY OTHER key is refused, and
+;;;;               loudly, because a code goes to exactly one npub and two holders is a leak.
+;;;;   superseded  a newer link was minted for the same recipient.
+;;;;   expired     the MAC check refuses it and the row is pruned.
+;;;;
+;;;; NONE OF THAT IS VISIBLE IN THE WIRE FORMAT, which is frozen: the MAC is over
+;;;; "glass-login|nonce|exp" and nothing else, so a token minted by this file still verifies
+;;;; there and every link ever issued keeps working.  The bindings are the STORE's.
+;;;;
+;;;; SO A CODE MINTED HERE IS SINGLE-USE BUT SUPERSEDES NOTHING.  This file mints in whatever
+;;;; process loads it — the login-link CLI, out of band — and cannot reach the desktop's store
+;;;; to record a recipient.  It is still redeemed exactly once (the desktop records it at
+;;;; redemption).  A surface that wants "this link replaces the last one I sent you" has to
+;;;; ask the desktop instead: the `link' DM command, or `glass-admit/1 mint pub=… for=…'.
 
 (defpackage #:glass-login
   (:use #:cl)
@@ -52,8 +74,11 @@
 
 (defun verify-token (secret token)
   "Verify TOKEN's MAC and expiry against box SECRET.  Returns (values OK NONCE EXP):
-OK is T only if the MAC checks out AND the code has not expired.  (Single-use is the
-caller's job — key a spent-set on NONCE.)"
+OK is T only if the MAC checks out AND the code has not expired.
+
+CRYPTOGRAPHY ONLY.  OK means `this box minted it and it has not expired', which is strictly
+weaker than `this key may use it'.  Whether it has already been traded, and to whom, is the
+desktop's login-code store — see the header, and GLASS:ADMIT-PEER."
   (when (stringp token)
     (let ((dots (loop for i from 0 for c across token when (char= c #\.) collect i)))
       (when (= (length dots) 2)
