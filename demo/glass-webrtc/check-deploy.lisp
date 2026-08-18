@@ -11,14 +11,19 @@
 ;;;;
 ;;;;   sbcl --script check-deploy.lisp [/path/to/nsite-index.html]
 ;;;;
-;;;; Read-only: it publishes nothing and needs no secret.
+;;;; Read-only: it publishes nothing and needs no secret.  Every hop below is one call into
+;;;; CL-NOSTR.NSITE's resolve half — the same functions any client reading this site would use,
+;;;; which is the point: if they answer here, a reader gets the same answer.
 
 (load (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))
 (handler-bind ((warning #'muffle-warning))
   (let ((*standard-output* (make-broadcast-stream)))
-    (asdf:load-system :cl-nostr)
-    (asdf:load-system :dexador)
-    (asdf:load-system :ironclad)))
+    (asdf:load-system :cl-nostr)))
+
+(defpackage :chk (:use :cl)
+  (:local-nicknames (:u :cl-nostr.util) (:pool :cl-nostr.pool)
+                    (:blossom :cl-nostr.blossom) (:nsite :cl-nostr.nsite)))
+(in-package :chk)
 
 (defparameter *site-npub*
   (or (uiop:getenv "NSITE_NPUB")
@@ -35,35 +40,14 @@
   (with-open-file (s path :element-type '(unsigned-byte 8))
     (let ((buf (make-array (file-length s) :element-type '(unsigned-byte 8))))
       (read-sequence buf s)
-      (string-downcase (ironclad:byte-array-to-hex-string (ironclad:digest-sequence :sha256 buf))))))
+      (u:bytes->hex (u:sha256 buf)))))
 
 (defun %short (s &optional (n 16)) (if (and s (> (length s) n)) (subseq s 0 n) s))
 
-(defun %http-head (url)
-  "(values status sha256-of-body) — NIL status on any failure."
-  (handler-case
-      (multiple-value-bind (body status) (dex:get url :force-binary t :read-timeout 25)
-        (values status
-                (string-downcase (ironclad:byte-array-to-hex-string
-                                  (ironclad:digest-sequence :sha256 body)))))
-    (error (e) (values nil (princ-to-string e)))))
-
-(defun %collect (relays filter &key (secs 7))
-  (let ((pool (cl-nostr.pool:make-pool relays)) (rows '()))
-    (sleep 3)                           ; the pool connects asynchronously — see DEPLOY.md
-    (cl-nostr.pool:pool-subscribe
-     pool (list filter)
-     :on-event (lambda (ev relay) (declare (ignore relay))
-                 (pushnew ev rows :key #'cl-nostr.event:event-id :test #'equal)))
-    (sleep secs)
-    rows))
-
-(defun %tag-value (ev name)
-  (let ((tg (find name (cl-nostr.event:event-tags ev) :key #'first :test #'equal)))
-    (and tg (second tg))))
-
-(let* ((pk (string-downcase (cl-nostr.util:bytes->hex (cl-nostr.bech32:npub-decode *site-npub*))))
-       (want (and *build* (probe-file *build*) (%sha256-file *build*))))
+(let* ((pk (cl-nostr.bech32:pubkey-hex *site-npub*))
+       (want (and *build* (probe-file *build*) (%sha256-file *build*)))
+       ;; One pool for every relay question below, rather than four.
+       (pool (pool:make-pool *relays*)))
   (format t "~&site  ~a~%      ~a~%" *site-npub* pk)
 
   ;; ---- 1. build -------------------------------------------------------------
@@ -72,44 +56,43 @@
       (format t "~%[build]   (no local build given — pass a path to nsite-index.html to compare)~%"))
 
   ;; ---- 2. Blossom -----------------------------------------------------------
+  ;; BLOSSOM-DOWNLOAD hashes the body and compares: a mirror serving the wrong bytes under the
+  ;; right hash is a distinct failure from a mirror that does not have it, and says so.
   (when want
     (format t "~%[blossom]~%")
     (dolist (host *blossom*)
-      (multiple-value-bind (status got) (%http-head (format nil "~a/~a" host want))
-        (format t "   ~a~30t~@[http ~a~]~@[ ~a~]~a~%" host status
-                (and status (%short got))
-                (cond ((null status) " unreachable")
-                      ((equal got want) "  MATCH")
+      (let ((fetch (blossom:blossom-download host want :timeout 25)))
+        (format t "   ~a~30t~@[http ~a~]~@[ ~a~]~a~%" host
+                (blossom:fetch-status fetch)
+                (%short (blossom:fetch-sha256 fetch))
+                (cond ((blossom:fetch-ok-p fetch) "  MATCH")
+                      ((null (blossom:fetch-sha256 fetch)) " unreachable")
                       (t "  *** WRONG BODY ***"))))))
 
   ;; ---- 3. relays ------------------------------------------------------------
   ;; Both kinds are checked: 15128 is what publish.lisp writes; 34128 is the legacy per-path form
   ;; some tools emit.  Either may be what a given gateway reads.
   (format t "~%[relays]  what the site advertises, and what the manifests point at~%")
-  (let ((lists (%collect *relays* (cl-nostr.filter:make-filter
-                                  :kinds '(10002 10063) :authors (list pk) :limit 4))))
-    (dolist (ev lists)
-      (format t "   kind ~a:~{ ~a~}~%" (cl-nostr.event:event-kind ev)
-              (loop for tg in (cl-nostr.event:event-tags ev)
-                    when (and (>= (length tg) 2) (member (first tg) '("r" "server") :test #'equal))
-                      collect (second tg)))))
-  (let ((manifests (%collect *relays* (cl-nostr.filter:make-filter
-                                      :kinds '(15128) :authors (list pk) :limit 4))))
+  (format t "   kind 10002:~{ ~a~}~%" (nsite:nsite-relays pool pk))
+  ;; MANIFESTS, plural: 15128 is replaceable so the relays should agree, and when one is still
+  ;; serving last week's manifest that disagreement is the whole diagnosis.
+  (let ((manifests (nsite:nsite-fetch-manifests pool pk :timeout 7)))
+    (format t "   kind 10063:~{ ~a~}~%"
+            (nsite:nsite-servers pool pk :manifest (first manifests)))
     (if (null manifests)
         (format t "   kind 15128: NONE FOUND — nothing was published, or not to these relays~%")
-        (dolist (ev manifests)
-          (format t "   kind 15128  created_at ~a~%" (cl-nostr.event:event-created-at ev))
-          (loop for tg in (cl-nostr.event:event-tags ev)
-                when (and (>= (length tg) 3) (equal (first tg) "path"))
-                  do (format t "      ~a -> ~a~a~%" (second tg) (%short (third tg))
-                             (if (and want (equal (third tg) want)) "  MATCH" ""))))))
-  (let ((legacy (%collect *relays* (cl-nostr.filter:make-filter
-                                   :kinds '(34128) :authors (list pk) :limit 20))))
+        (dolist (manifest manifests)
+          (format t "   kind 15128  created_at ~a~%" (cl-nostr.event:event-created-at manifest))
+          (loop for (path . hash) in (nsite:manifest-paths manifest)
+                do (format t "      ~a -> ~a~a~%" path (%short hash)
+                           (if (and want (equal hash want)) "  MATCH" ""))))))
+  (let ((legacy (nsite:nsite-fetch-legacy pool pk :timeout 7 :limit 20)))
     (when legacy
-      (format t "   kind 34128 (legacy per-path): ~a event(s)~%" (length legacy))
-      (dolist (ev (sort legacy #'string< :key (lambda (e) (or (%tag-value e "d") ""))))
-        (format t "      ~a -> ~a~a~%" (%tag-value ev "d") (%short (%tag-value ev "x"))
-                (if (and want (equal (%tag-value ev "x") want)) "  MATCH" "")))))
+      (format t "   kind 34128 (legacy per-path): ~a pointer(s)~%" (length legacy))
+      (dolist (pointer (sort (copy-list legacy) #'string< :key #'car))
+        (format t "      ~a -> ~a~a~%" (car pointer) (%short (cdr pointer))
+                (if (and want (equal (cdr pointer) want)) "  MATCH" "")))))
+  (pool:close-pool pool)
 
   ;; ---- 4. gateway -----------------------------------------------------------
   ;; The hop that has actually broken in practice: the relays hold the new manifest and the gateway
@@ -122,9 +105,17 @@
   (format t "~%[gateway]~%")
   (dolist (host '("nsite.run" "nsite.lol"))
     (dolist (path (list (format nil "/~a.html" (or (uiop:getenv "SITE_VERSION") "index")) "/index.html" "/"))
-      (multiple-value-bind (status got) (%http-head (format nil "https://~a.~a~a" *site-npub* host path))
-        (format t "   ~a~12t~a~34thttp ~a  ~a~a~%" host path status (%short got)
+      (let ((fetch (nsite:nsite-gateway-fetch *site-npub* path
+                                              :gateway host :expect want :timeout 25)))
+        (format t "   ~a~12t~a~34thttp ~a  ~a~a~%" host path
+                (blossom:fetch-status fetch)
+                (%short (or (blossom:fetch-sha256 fetch) (blossom:fetch-error fetch)))
                 (cond ((null want) "")
-                      ((equal got want) "  MATCH — this gateway is current")
+                      ((blossom:fetch-ok-p fetch) "  MATCH — this gateway is current")
+                      ;; nothing came back at all: this gateway is unreadable, which is a
+                      ;; different fault from serving the wrong build, and naming the wrong
+                      ;; one is exactly the mistake this script exists to prevent.
+                      ((null (blossom:fetch-sha256 fetch))
+                       "  *** NO ANSWER — could not read this gateway ***")
                       (t "  *** STALE — serving an older build ***"))))))
   (format t "~%"))

@@ -250,14 +250,24 @@ printed `[done]` and the blob hash either way. Two publishes (`k22a`, `k24a`) we
 `k23` survived on timing luck. That is the failure mode behind "I published it and the phone still
 has the old page".
 
-Fixed in `publish.lisp` (backup alongside as `publish.lisp.bak-*`): a 3 s wait after `make-pool`,
-and `:on-ok` logging so each relay's verdict is printed:
+First fixed in `publish.lisp` with a 3 s wait after `make-pool` plus `:on-ok` logging. **That was a
+guess with better odds, not a fix** — a sleep only makes the race less likely, and the deeper cause
+is worse than a slow socket: `websocket-driver` catches its own write errors and closes the socket,
+so a send on a dead connection is swallowed with nothing signalled to the caller at all.
+
+Now fixed properly, in the library. `cl-nostr.pool:pool-publish-sync` **waits for each relay's `OK`
+reply** — the only evidence an event was published — re-sends to any relay still quiet after a few
+seconds (reconnecting it first; a re-send is free because relays deduplicate by event id), and
+returns one `relay-ack` per relay. `publish.lisp` just prints them:
 
 ```
 [manifest] wss://nos.lol accepted=T
 [manifest] wss://relay.primal.net accepted=T
 [manifest] wss://user.kindpag.es accepted=NIL blocked: the event doesn't match the allowed filters
 ```
+
+There is no `sleep` in `publish.lisp` any more, and a relay that never connected now gets a line of
+its own (`accepted=NIL never connected`) rather than silently not appearing.
 
 A relay that blocks by policy is fine; **zero `accepted=T` lines means nothing was published**,
 regardless of what the script prints afterwards.

@@ -14,6 +14,12 @@
 ;;;;
 ;;;; and the script refuses to run if neither is present, rather than falling back to anything.
 ;;;; That is what lets this file live in the repo at all.
+;;;;
+;;;; Everything that used to be hand-rolled here — bounding each upload, fanning out across the
+;;;; Blossom servers, waiting for the relays instead of guessing, publishing the kind-10002 and
+;;;; kind-10063 discovery lists — now lives in CL-NOSTR.NSITE:NSITE-PUBLISH, which reports what
+;;;; every server and every relay did.  This file is the site's policy: which key, which servers,
+;;;; which paths, and what to tell the operator.
 
 (defun %trim (s) (string-trim '(#\Space #\Tab #\Newline #\Return) (or s "")))
 
@@ -53,40 +59,52 @@
 (defun read-bytes (p)
   (with-open-file (s p :element-type '(unsigned-byte 8))
     (let ((v (make-array (file-length s) :element-type '(unsigned-byte 8)))) (read-sequence v s) v)))
+
+(defun %short (s &optional (n 16)) (if (and s (> (length s) n)) (subseq s 0 n) s))
+
 (let* ((kp (cl-nostr.keys:keypair-from-secret *site*))
-       (bytes (read-bytes *path*)) (hash nil))
+       (bytes (read-bytes *path*)))
   (format t "~&bundle: ~a bytes~%" (length bytes))
-  (dolist (srv *blossom*)
-    (handler-case
-        ;; BOUND EACH UPLOAD.  blossom-upload takes no timeout and one of these servers reliably
-        ;; hangs rather than refusing — a publish sat on a single POST for twenty minutes and never
-        ;; reached the manifest, so the blob was live and nothing pointed at it.  One success is
-        ;; enough; a server that will not answer promptly is simply skipped.
-        (multiple-value-bind (h) (sb-ext:with-timeout 45
-                                   (cl-nostr.blossom:blossom-upload srv bytes kp :content-type "text/html"))
-          (setf hash h) (format t "~&[blossom] ~a -> ~a~%" srv (subseq h 0 16)))
-      ;; SERIOUS-CONDITION, not ERROR: SB-EXT:TIMEOUT is not an ERROR subtype, so an (ERROR (e))
-      ;; clause lets it straight through and the whole publish dies after the good uploads.
-      (serious-condition (e) (format t "~&[blossom] ~a SKIPPED: ~a~%" srv (type-of e)))))
-  (unless hash (format t "~&NO BLOSSOM ACCEPTED~%") (sb-ext:exit :code 1))
-  (let ((pool (cl-nostr.pool:make-pool (append *relays* *lookup*))))
-    ;; make-pool connects asynchronously: publishing immediately drops the event on relays whose
-    ;; socket is not up yet, and pool-publish reports nothing, so the script still prints [done].
-    ;; Wait for the sockets, and log each relay's OK so a silent loss is visible.
-    (sleep 3)
-    (cl-nostr.pool:pool-publish pool
-      (cl-nostr.nsite:nsite-manifest kp (list (cons (format nil "/~a.html" *version*) hash)
-                                              (cons "/index.html" hash) (cons "/" hash))
-                                     :servers *blossom* :title "glass over WebRTC")
-      :on-ok (lambda (relay ok msg)
-               (format t "~&[manifest] ~a accepted=~a ~a~%"
-                       (cl-nostr.relay:relay-url relay) ok (or msg ""))))
-    (cl-nostr.pool:pool-publish pool
-      (cl-nostr.event:build-event kp 10002 "" :tags (mapcar (lambda (r) (list "r" r)) *relays*)))
-    (cl-nostr.pool:pool-publish pool
-      (cl-nostr.event:build-event kp 10063 "" :tags (mapcar (lambda (s) (list "server" s)) *blossom*)))
-    (sleep 4)
-    (format t "~&[done] site hash ~a~%[done] versioned path: /~a.html~%" hash *version*)
+  (multiple-value-bind (npub report)
+      (cl-nostr.nsite:nsite-publish
+       ;; publish to the lookup relays too, but advertise only the read relays in kind 10002
+       (append *relays* *lookup*) *blossom* kp
+       (list (cons (format nil "/~a.html" *version*) bytes)
+             (cons "/index.html" bytes)
+             (cons "/" bytes))
+       :relays *relays* :title "glass over WebRTC" :content-type "text/html"
+       ;; ONE upload per DISTINCT blob (all three paths are the same bytes), to every server at
+       ;; once, EACH INDIVIDUALLY BOUNDED.  One of these servers reliably hangs rather than
+       ;; refusing, and an unbounded upload once sat on a single POST for twenty minutes — the
+       ;; blob went live and nothing ever pointed at it.  One success is enough.
+       :on-upload
+       (lambda (up)
+         (if (cl-nostr.blossom:upload-ok-p up)
+             (format t "~&[blossom] ~a -> ~a~%" (cl-nostr.blossom:upload-server up)
+                     (%short (cl-nostr.blossom:upload-hash up)))
+             (format t "~&[blossom] ~a SKIPPED: ~a~%" (cl-nostr.blossom:upload-server up)
+                     (cl-nostr.blossom:upload-error up))))
+       ;; NSITE-PUBLISH waits for each relay's OK rather than publishing and hoping: a websocket
+       ;; swallows a send on a dead socket without a word, so the reply is the only evidence the
+       ;; event landed.  Two publishes were lost before that was true — see DEPLOY.md.  A relay
+       ;; that blocks by policy is fine; ZERO accepted=T lines means nothing was published.
+       :on-publish
+       (lambda (pub)
+         (when (= (cl-nostr.nsite:publication-kind pub) cl-nostr.nsite:+kind-nsite-root+)
+           (dolist (ack (cl-nostr.nsite:publication-acks pub))
+             (format t "~&[manifest] ~a accepted=~a ~a~%"
+                     (cl-nostr.pool:ack-url ack)
+                     (if (cl-nostr.pool:ack-accepted-p ack) "T" "NIL")
+                     (or (cl-nostr.pool:ack-message ack) ""))))))
+    ;; No server took the blob: NSITE-PUBLISH has already declined to move the manifest, because a
+    ;; manifest naming a blob nobody holds is how a live site goes dark.
+    (unless (cl-nostr.nsite:report-stored-p report)
+      (format t "~&NO BLOSSOM ACCEPTED~%")
+      (sb-ext:exit :code 1))
+    (let ((hash (cdr (first (cl-nostr.nsite:report-paths report)))))
+      (format t "~&[done] site hash ~a~%[done] versioned path: /~a.html~%" hash *version*)
+      (dolist (problem (cl-nostr.nsite:report-problems report))
+        (format t "[done] WARNING: ~a~%" problem)))
     ;; Hand the freshly published path to the gateway, rather than expecting someone to remember.
     ;; Publishing REPLACES the manifest, so the previous /<tag>.html stops resolving the moment this
     ;; one lands — a login link minted against it 404s, which is indistinguishable from the box being
@@ -96,8 +114,7 @@
                                              (or *load-truename* *default-pathname-defaults*)))))
       (with-open-file (o envf :direction :output :if-exists :supersede :if-does-not-exist :create)
         (format o "# written by publish.lisp — the path published most recently.  Do not hand-edit.~%")
-        (format o "export LOGIN_URL_BASE='https://~a.nsite.lol/~a.html'~%"
-                (cl-nostr.bech32:npub-encode (cl-nostr.keys:public-key-of-secret *site*))
-                *version*))
+        (format o "export LOGIN_URL_BASE='~a'~%"
+                (cl-nostr.nsite:nsite-gateway-url npub (format nil "/~a.html" *version*))))
       (format t "[done] wrote ~a~%" envf))))
 (sb-ext:exit)
