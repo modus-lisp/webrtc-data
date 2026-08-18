@@ -192,19 +192,43 @@
 (ok "…and it can only ADD: TOKEN is replaced only when a string came back, so a refusal or an
         unreachable desktop leaves the answer exactly as it is today"
     (and (search "(when (stringp minted)" *gateway*)
-         (search "(values via (and (stringp token) token))" *gateway*)))
+         (search "(values via (and (stringp token) token)" *gateway*)))
 
 ;; The other half of "minimal": nothing downstream of it moved.  The envelope is built from the
 ;; same variable, in the same place, under the same condition it always was.
-(dolist (kept '("(multiple-value-bind (via renewal) (ask-admission phone-pub code)"
+(dolist (kept '("(multiple-value-bind (via renewal expires) (ask-admission phone-pub code)"
                 "(when renewal (setf (gethash \"code\" ht) renewal))"
                 "(gethash \"ufrag\" ht)"))
   (ok (format nil "the answer envelope is untouched: ~a" kept) (search kept *gateway*)))
 (ok "and the comment beside it no longer says the opposite of what the code does"
     (null (search "An allowlisted owner is handed" *gateway*)))
 
+;;; ---- and the ONE field it grew: when this enrolment runs out ------------------
+;;; A denial is answered with silence by design, so a browser holding a lapsed device key has no
+;;; channel on which to learn that except this one.  The desktop decides the expiry; this process
+;;; copies it into the envelope beside the renewal code and computes nothing.
+
+(banner "the answer envelope carries the enrolment's expiry")
+(ok "ASK-ADMISSION returns it as a third value, read from the desktop's own reply"
+    (and (search "(and plist (ignore-errors (parse-integer (getf plist :expires))))" *gateway*)
+         (search "(values VIA TOKEN EXPIRES)" *gateway*)))
+(ok "…and the envelope carries it, only when the desktop said one"
+    (search "(when expires (setf (gethash \"expires\" ht) expires))" *gateway*))
+(ok "…which means an OLDER desktop, which sends none, produces the envelope it always did"
+    ;; the field is added under a WHEN, exactly as the renewal code is: no key, no entry, no change
+    (let ((at (search "(when expires (setf (gethash \"expires\" ht)" *gateway*)))
+      (and at (< (search "(when renewal (setf (gethash \"code\" ht) renewal))" *gateway*) at))))
+(ok "…and this process does not COMPUTE an expiry of its own — it has no store and no TTL, and a
+        second opinion about when somebody's enrolment ends is the drift this whole move ended"
+    (null (search "(+ (%unix-now)" *gateway*)))
+
 (banner "warp's device panel followed the store")
-(ok "its QUERY asks the desktop" (search "(glass:admission-devices" *warp*))
+(ok "its QUERY asks the desktop" (search "(glass:admission-records" *warp*))
+(ok "…for the ACTIVE records only — the panel projects current state, not two weeks of history"
+    (null (search ":state :all" *warp*)))
+(ok "…and it enriches a row only where warp has a slot to hold it, so today's panel is unchanged"
+    (and (search "(slot-exists-p row slot)" *warp*)
+         (search ":pubkey (getf record :pubkey)" *warp*)))
 (ok "its INVOKER asks the desktop's allowlist" (search "(glass:admission-allowed-p" *warp*))
 (ok "and its REVOKE is a service call, not a file write — a panel still rewriting a local
         .glass-devices would be revoking terminals nobody enforces"

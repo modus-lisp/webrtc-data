@@ -61,6 +61,7 @@ OWNER_SEC = "33" * 32          # the npub in NOSTR_ALLOW — the signer's key
 STALE_SEC = "44" * 32          # a device key that was enrolled once and is not any more
 FRESH_SEC = "55" * 32          # a device key that is currently enrolled
 CTRL_SEC  = "66" * 32          # the negative control's, kept clear of everything above
+NOEXP_SEC = "77" * 32          # for the box that sends no expiry — the fallback control
 
 # ================================================================================================
 # the relay: store and forward, which is all a Nostr relay is to this system
@@ -191,7 +192,7 @@ with sync_playwright() as pw:
         sec)
     BOX_PUB, OWNER_PUB = pubof(BOX_SEC), pubof(OWNER_SEC)
     STALE_PUB, FRESH_PUB = pubof(STALE_SEC), pubof(FRESH_SEC)
-    CTRL_PUB = pubof(CTRL_SEC)
+    CTRL_PUB, NOEXP_PUB = pubof(CTRL_SEC), pubof(NOEXP_SEC)
     keys.close()
 
     # ---- the box, up for the whole run ---------------------------------------------------------
@@ -203,6 +204,9 @@ with sync_playwright() as pw:
 
     CODE_KEY = "glass-code:" + BOX_PUB
     DEV_KEY = "glass-device:" + BOX_PUB
+    # where the browser keeps the box's own word about when this enrolment runs out
+    ENROL_KEY = "glass-enrol:" + BOX_PUB
+    OK_KEY = "glass-lastok:" + BOX_PUB
 
     def box_log():
         return box.evaluate("window.__box.log")
@@ -215,15 +219,22 @@ with sync_playwright() as pw:
         p.goto(url)
         return p
 
-    def seeded(device=None, code=None):
-        """A fresh browser profile with exactly the credentials named, and nothing else."""
+    def seeded(device=None, code=None, enrol_exp=None, last_ok=None):
+        """A fresh browser profile with exactly the credentials named, and nothing else.
+
+        ENROL_EXP seeds what the box last said about this enrolment (unix seconds); LAST_OK seeds
+        the older heuristic's stamp (millis).  Seeding them separately is the only way to show
+        which of the two the page is actually reasoning from."""
         ctx = browser.new_context()
         ctx.add_init_script(NO_ICE)
-        seed = {"dev": DEV_KEY, "cod": CODE_KEY, "device": device, "code": code}
+        seed = {"dev": DEV_KEY, "cod": CODE_KEY, "exp": ENROL_KEY, "okk": OK_KEY,
+                "device": device, "code": code, "enrol": enrol_exp, "lastok": last_ok}
         ctx.add_init_script(
             "(s => { try {"
             "  if (s.device) localStorage.setItem(s.dev, s.device);"
             "  if (s.code) localStorage.setItem(s.cod, s.code);"
+            "  if (s.enrol) localStorage.setItem(s.exp, String(s.enrol));"
+            "  if (s.lastok) localStorage.setItem(s.okk, String(s.lastok));"
             "} catch (e) {} })(%s)" % json.dumps(seed))
         return ctx
 
@@ -237,8 +248,17 @@ with sync_playwright() as pw:
     # ============================================================================================
     ctx = seeded(device=STALE_SEC)
     p1 = phone(ctx, signer=OWNER_SEC)
+    # THE CARD COMES UP AT ONCE NOW, in its pending form: this browser has a device key and no word
+    # from the box about it, which is the guess the expiry replaced and still the fallback when
+    # there is nothing better.  What it does NOT do is conclude — so the assertions below wait for
+    # the box's silence to run out, which is a different moment and the one they are about.
+    p1.wait_for_selector("#nocred", timeout=15000)
+    ok("the ways back in are offered while the offer is still in flight, not only after it fails",
+       "Trying it anyway" in p1.evaluate("() => document.getElementById('nocred').textContent"))
     # 18s answer watchdog, then a 15s `link' request the box also refuses in silence.
-    p1.wait_for_selector("#nocred", timeout=45000)
+    p1.wait_for_function(
+        "() => /not enrolled/.test(document.querySelector('#connstatus .msg').textContent)",
+        timeout=45000)
     calls = p1.evaluate("window.__signerCalls")
     reads = p1.evaluate("window.__signerReads")
     ok("THE SIGNER WAS NEVER CALLED — no prompt, at any point, without a tap", calls == 0,
@@ -356,6 +376,70 @@ with sync_playwright() as pw:
     p5.close(); ctx.close()
 
     # ============================================================================================
+    banner("THE BOX SAYS WHEN THIS ENROLMENT RUNS OUT, and the browser keeps its word")
+    # ============================================================================================
+    # The client could not know this.  A denial is answered with SILENCE by design, so a browser
+    # holding a dead device key could only offer into the dark and conclude by timeout — and the
+    # thing it concluded from was a hardcoded 24 h guess about a TTL the box owns.  The expiry now
+    # rides the answer envelope beside the renewal code.
+    box.evaluate("(p) => window.__box.enrol(p)", FRESH_PUB)
+    before = len(box_log())
+    ctx = seeded(device=FRESH_SEC)
+    pa = phone(ctx)
+    ok("an enrolled device connects, as it always did", connected(pa))
+    said = [a for a in box_log()[before:] if a["t"] == "admitted"][-1]
+    stored_exp = pa.evaluate("(k) => localStorage.getItem(k)", ENROL_KEY)
+    ok("THE ANSWER CARRIED THE EXPIRY, and the browser stored it against THIS box",
+       stored_exp is not None and int(stored_exp) == said["expires"],
+       f"stored={stored_exp} box said={said['expires']}")
+    ok("  …and it is the box's own number, not a TTL the page computed",
+       int(stored_exp or 0) > time.time())
+    dump(pa, "a-expiry-stored")
+    pa.close(); ctx.close()
+
+    # ============================================================================================
+    banner("A LAPSED EXPIRY SHOWS THE WAY BACK IN AT ONCE — AND STILL OFFERS")
+    # ============================================================================================
+    # The two halves have to hold together.  Showing early is the point; showing early INSTEAD of
+    # trying would be a page that locks somebody out on the strength of a prediction — and the
+    # prediction can be wrong (a box restarted with a longer TTL, an owner who is on the allowlist
+    # anyway).  So: the box still honours this key, the browser thinks it does not, and both the
+    # card and the connection have to happen.
+    box.evaluate("(p) => window.__box.enrol(p)", FRESH_PUB)
+    before = len(box_log())
+    ctx = seeded(device=FRESH_SEC, enrol_exp=int(time.time()) - 600)
+    pb = phone(ctx, signer=OWNER_SEC)
+    t0 = time.time()
+    pb.wait_for_selector("#nocred", timeout=15000)
+    shown = time.time() - t0
+    ok("the ways back in are on the page in seconds, not after the 18 s answer watchdog",
+       shown < 12, f"{shown:.1f}s")
+    txt = pb.evaluate("() => document.getElementById('nocred').textContent")
+    ok("  …offering BOTH: sign in with Nostr, and DM the box for a link",
+       "Sign in with your Nostr key" in txt and "DM link to the box" in txt, txt)
+    ok("  …and a button to press", pb.locator("#signin").count() == 1)
+    ok("  …while saying it is still trying, rather than claiming a failure that has not happened",
+       "Trying it anyway" in txt)
+    ok("  …and the connect sequence's own message is NOT overwritten with a denial",
+       "not enrolled" not in
+       pb.evaluate("() => document.querySelector('#connstatus .msg').textContent"),
+       pb.evaluate("() => document.querySelector('#connstatus .msg').textContent"))
+    ok("THE OFFER WENT OUT ANYWAY — a prediction must never pre-empt a working credential",
+       connected(pb))
+    admits = [a for a in box_log()[before:] if a["t"] == "admitted"]
+    ok("  …and the box admitted it on the device key the page had written off",
+       any(a["via"] == "device" and a["peer"] == FRESH_PUB for a in admits), admits)
+    pb.wait_for_function("() => !document.getElementById('nocred')", timeout=10000)
+    ok("  …so the card goes away when the answer arrives", pb.locator("#nocred").count() == 0)
+    fixed = pb.evaluate("(k) => localStorage.getItem(k)", ENROL_KEY)
+    ok("  …and the browser's idea of the expiry is corrected by the box that just answered",
+       fixed is not None and int(fixed) > time.time(), fixed)
+    ok("the signer was still never called — the button is an offer, not a prompt",
+       pb.evaluate("window.__signerCalls") == 0)
+    dump(pb, "b-lapsed-but-live")
+    pb.close(); ctx.close()
+
+    # ============================================================================================
     banner("no credential and NO signer — the message that was already there, unchanged")
     # ============================================================================================
     ctx = browser.new_context()
@@ -435,6 +519,28 @@ with sync_playwright() as pw:
        " would be a tap on every cold load, forever", True)
     dump(p9, "9-negative-control")
     p9.close(); ctx.close()
+
+    # ============================================================================================
+    banner("THE FALLBACK: a box that sends no expiry, which is every box until it is deployed")
+    # ============================================================================================
+    # MARKADMITTED and the 24 h guess are kept for exactly this, and the one thing that must not
+    # happen is a stored expiry outliving the box that stopped sending one — a stale fact looks
+    # exactly like a fresh one, which is the only way a fact is worse than a guess.
+    with RLOCK:
+        EVENTS.clear()
+    box.goto(f"{BASE}/box.html?relay={RELAY}&sec={BOX_SEC}&secret={HMAC_SEC}"
+             f"&allow={OWNER_PUB}&expires=0")
+    box.wait_for_function("() => window.__box && window.__box.ready", timeout=15000)
+    box.evaluate("(p) => window.__box.enrol(p)", NOEXP_PUB)
+    ctx = seeded(device=NOEXP_SEC, enrol_exp=int(time.time()) + 99999)
+    pc_ = phone(ctx)
+    ok("it connects against a box that says nothing about expiry", connected(pc_))
+    ok("AND THE STALE EXPIRY IS DROPPED rather than believed for another day",
+       pc_.evaluate("(k) => localStorage.getItem(k)", ENROL_KEY) is None)
+    ok("  …leaving the old heuristic — the last-admission stamp — as the fallback it was",
+       pc_.evaluate("(k) => Number(localStorage.getItem(k)) > 0", OK_KEY))
+    dump(pc_, "c-no-expiry-fallback")
+    pc_.close(); ctx.close()
 
     boxctx.close()
     browser.close()

@@ -251,13 +251,53 @@ panel says nobody answered, which is the honest report."
 ;;; list.  What keeps that honest is that the difference is LOGGED here rather than silently
 ;;; rendered as "no terminals are enrolled" — and that a phone which cannot reach the desktop is a
 ;;; phone whose screen, audio and microphone are all coming from the same place.
+;;;
+;;; AND IT ASKS FOR THE RECORD, NOT THE PAIR.  The desktop's enrolments carry what admitted each
+;;; terminal, when, and on whose authority; ADMISSION-RECORDS is the same verb on the same socket
+;;; answering with all of it instead of the first two fields.  Two things about that are deliberate:
+;;;
+;;;   IT IS STILL CURRENT STATE.  DESIGN.md rule 4 — the stream carries state, not events — so the
+;;;   query asks for the ACTIVE records, which is exactly the result-set it asked for before.  The
+;;;   revoked and lapsed ones the desktop now keeps are a different product (`devices all', and the
+;;;   store itself); a projection that quietly grew two weeks of them would be an event log wearing
+;;;   a result-set's clothes, and every row of it would cost budget on a cellular link.
+;;;
+;;;   AND AN OLDER DESKTOP STILL ANSWERS.  A box that has not been updated sends `<pubkey>
+;;;   <expiry>' and nothing else; those parse into records whose extra fields are simply NIL.  No
+;;;   fallback path, no version check — the row got longer at the end, which is the whole reason it
+;;;   was extended that way.
 
 (defvar *warp-query-complained* nil)
+
+(defparameter *warp-enrolment-extras*
+  '((:state "STATE") (:via "VIA") (:nonce "NONCE") (:for "ISSUED") (:cause "CAUSE")
+    (:created "CREATED") (:seen "SEEN") (:since "SINCE"))
+  "Record field -> the slot warp-monitor's ENROLMENT would hold it in, IF it has one.
+
+WHERE THE PRESENTATION LIVES IS WARP, AND THIS IS THE SEAM TO IT.  The desktop decides what a
+record contains and this file carries it across the socket; how a row DRAWS is warp-monitor's
+PRESENT method, in warp's own repository, on its own release.  So the extras are set only where a
+slot exists to hold them: today the class has PUBKEY and EXPIRES and the panel is exactly what it
+was, and the day it grows VIA the provenance appears with nothing here to change.  A MAKE-INSTANCE
+with these as initargs would have been the obvious way to write it and would signal on every pass
+against today's warp — which is the definition of a broken panel.")
+
+(defun warp-enrolment-row (record)
+  "One admission RECORD (a plist) as the domain object warp-monitor's view presents."
+  (let ((row (make-instance (find-symbol "ENROLMENT" "WARP-MONITOR")
+                            :pubkey (getf record :pubkey)
+                            :expires (or (getf record :expiry) 0))))
+    (loop for (key name) in *warp-enrolment-extras*
+          for slot = (find-symbol name "WARP-MONITOR")
+          for value = (getf record key)
+          when (and slot value (slot-exists-p row slot))
+            do (setf (slot-value row slot) value))
+    row))
 
 (defun warp-enrolments ()
   "The current result-set: enrolled terminals that have not lapsed, as domain objects."
   (multiple-value-bind (rows why)
-      (glass:admission-devices :host *glass-host* :port *admission-port*)
+      (glass:admission-records :host *glass-host* :port *admission-port*)
     (cond
       ((eq why :unreachable)
        (unless *warp-query-complained*
@@ -271,10 +311,8 @@ panel says nobody answered, which is the honest report."
        (setf *warp-query-complained* nil)
        ;; a stable order, so the list does not reshuffle under a finger between passes (rule 6
        ;; depends on layouts not shifting) and so a re-sort is never mistaken for a change
-       (mapcar (lambda (r)
-                 (make-instance (find-symbol "ENROLMENT" "WARP-MONITOR")
-                                :pubkey (car r) :expires (cdr r)))
-               (sort (copy-list rows) #'string< :key #'car))))))
+       (mapcar #'warp-enrolment-row
+               (sort (copy-list rows) #'string< :key (lambda (r) (or (getf r :pubkey) ""))))))))
 
 ;;; ---- who is asking ----------------------------------------------------------------------
 

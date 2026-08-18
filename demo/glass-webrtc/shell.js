@@ -573,18 +573,39 @@ const pastTs = () => nowSec() - Math.floor(Math.random() * 172800);
 const hex = u8 => [...u8].map(b => b.toString(16).padStart(2, '0')).join('');
 const unhex = h => new Uint8Array(h.match(/../g).map(x => parseInt(x, 16)));
 const DEV_KEY = 'glass-device:' + boxArg;
-// The last time the box ADMITTED us, which is the only direct evidence an enrolment exists.
-// The client cannot ask: a denial is answered with silence by design, so the alternative is
-// offering into the dark and concluding by timeout — half a minute of nothing before the page
-// can even offer the signer.  An answer proves enrolment at that instant; enrolments last
-// DEVICE_TTL and are renewed by use, so an older stamp means almost certainly lapsed.
-// ALMOST: this only decides whether to OFFER the signer early, never whether to try.
+// ---- WHEN DOES THIS BROWSER'S ENROLMENT RUN OUT? -----------------------------------------------
+// The box now answers that, and this is where the answer is kept.  It arrives in the answer
+// envelope beside the renewal code (`expires`, a unix time, the desktop's own number from the
+// store that will be consulted next time), and it is the only channel it could arrive on: A DENIAL
+// IS ANSWERED WITH SILENCE by design, so a browser holding a dead device key cannot ask.
+//
+// WHAT THAT REPLACES is a guess: stamp the last admission, presume a hardcoded day, hope the box
+// agrees.  The guess is KEPT as the fallback for a box that does not send an expiry — an older
+// gateway, or a desktop that has not been restarted — and is nothing more than that.  Between them
+// the rule is: the box's word if we have it, the stamp otherwise, and either way THIS ONLY DECIDES
+// WHETHER TO OFFER THE WAY BACK IN EARLY.  It never decides whether to try; see the offer below.
 const OK_KEY = 'glass-lastok:' + boxArg;
-const DEVICE_TTL_MS = 24 * 3600 * 1000;   // the box's default; a hint, not a contract
+const EXP_KEY = 'glass-enrol:' + boxArg;
+const DEVICE_TTL_MS = 24 * 3600 * 1000;   // the fallback guess; a hint, not a contract
 const markAdmitted = () => { try { localStorage.setItem(OK_KEY, String(Date.now())); } catch (_) {} };
+// STORED, OR CLEARED.  An admission that carries no expiry has to DROP the one we had, or a box
+// rolled back to a build that does not send one would leave us judging today's enrolment against
+// a number from last week — the one way a fact can be worse than a guess is by going stale
+// silently while still looking like a fact.
+const noteEnrolExpiry = s => {
+  try {
+    const n = Math.floor(Number(s));
+    if (isFinite(n) && n > 0) localStorage.setItem(EXP_KEY, String(n));
+    else localStorage.removeItem(EXP_KEY);
+  } catch (_) {}
+};
+const enrolExpiry = () => { try { const n = +(localStorage.getItem(EXP_KEY) || 0);
+                                  return isFinite(n) && n > 0 ? n * 1000 : 0; } catch (_) { return 0; } };
 const staleEnrolment = () => {
   try {
     if (!hasDevice()) return false;              // nothing to be stale
+    const e = enrolExpiry();
+    if (e) return e <= Date.now();               // the box's own word about its own store
     const t = +(localStorage.getItem(OK_KEY) || 0);
     return !t || (Date.now() - t) > DEVICE_TTL_MS;
   } catch (_) { return false; }
@@ -1028,19 +1049,34 @@ async function makeIdentity() {
   // here and the screen must not claim to know which.  What it CAN do is offer the credential the
   // page has not used: a signer, if one is present, on a tap.
   let noCredEl = null, noCredBtn = null, signerLooks = 0;
-  const showNoCredential = (why) => {
-    const when = codeExp(code) ? new Date(codeExp(code)) : null;
-    setConnRaw(why || (code ? 'This link has expired' : 'This terminal is not enrolled'));
+  // PENDING is the case where the page has NOT concluded anything: the box told us, last time, when
+  // this enrolment would run out, that moment has passed, and the offer is going out anyway.  So
+  // the card shows the ways back in WITHOUT claiming failure — it does not overwrite the connect
+  // sequence's own message and does not mark the step failed, because nothing has failed yet.  The
+  // two callers want opposite things from the same card and this is the whole of the difference.
+  const clearWaysBackIn = () => {
+    if (noCredEl) { noCredEl.remove(); noCredEl = null; }
+    if (noCredBtn) { noCredBtn.remove(); noCredBtn = null; }
+  };
+  window.__clearWaysBackIn = clearWaysBackIn;
+  const showNoCredential = (why, opts) => {
+    const pending = Boolean(opts && opts.pending);
+    const when = codeExp(code) ? new Date(codeExp(code))
+                               : (enrolExpiry() ? new Date(enrolExpiry()) : null);
+    if (!pending)
+      setConnRaw(why || (code ? 'This link has expired' : 'This terminal is not enrolled'));
     // Rendered fresh each time rather than appended: the watchdog and SCHEDULERECONNECT can both
     // reach this, and a card that grew a second copy of its own advice would read as a bug.
-    if (noCredEl) noCredEl.remove();
-    if (noCredBtn) noCredBtn.remove();
+    clearWaysBackIn();
     noCredEl = document.createElement('div');
     noCredEl.id = 'nocred';
     noCredEl.style.cssText = 'max-width:22em;font-size:13px;line-height:1.5;opacity:.75;margin-top:2px';
     const signer = haveSigner();
     noCredEl.innerHTML =
-      (when ? 'It was valid until ' + when.toLocaleString() + '.<br>' : '') +
+      (pending
+        ? (when ? 'This browser’s access ran out on ' + when.toLocaleString() + '. Trying it anyway.<br>'
+                : 'This browser’s access may have run out. Trying it anyway.<br>')
+        : (when ? 'It was valid until ' + when.toLocaleString() + '.<br>' : '')) +
       (signer ? 'Sign in with your Nostr key to enrol this browser again, or DM <b>link</b> to the box for a new one.'
               : 'DM <b>link</b> to the box for a new one.');
     connMsg.insertAdjacentElement('afterend', noCredEl);
@@ -1072,26 +1108,33 @@ async function makeIdentity() {
       // the first turn of the event loop (no code, no device).  Absent-at-render is therefore not
       // absent, and the difference is a button that never appears — so look again for three
       // seconds.  This does NOT call the signer; it reads a property, which is free.
-      setTimeout(() => { if (haveSigner()) showNoCredential(why); }, 500);
+      setTimeout(() => { if (haveSigner()) showNoCredential(why, opts); }, 500);
     }
-    failConn();
-    diag('no usable credential' + (when ? ' (expired ' + when.toISOString() + ')' : '') +
+    if (!pending) failConn();
+    diag((pending ? 'enrolment expired — offering the ways back in while we try'
+                  : 'no usable credential') +
+         (when ? ' (expired ' + when.toISOString() + ')' : '') +
          (signer ? ' — offering the signer' : ' — no signer to offer'));
   };
   window.__showNoCredential = showNoCredential;
 
-  // OFFER EARLY WHEN THE ENROLMENT IS PRESUMED DEAD.  The attempt still goes out — the guess can
-  // be wrong, and a working link must never be pre-empted by a prediction — but the signer is
-  // offered beside it instead of half a minute later.  The old order made the page LOOK broken
-  // for thirty seconds before admitting it knew nothing new, and it knew this at load.
+  // SHOW THE WAYS BACK IN AT ONCE WHEN THE BOX SAID THIS ENROLMENT HAS RUN OUT.  The attempt still
+  // goes out — the expiry is a PREDICTION, the box may have been restarted with a longer TTL, an
+  // allowlisted signer may be about to admit us anyway, and a working credential must never be
+  // pre-empted by a guess about it — but the sign-in button and the DM-a-link instruction are on
+  // the page beside the spinner instead of half a minute later.  The old order made the page LOOK
+  // broken for thirty seconds before admitting it knew nothing new, and it knew this at load.
+  //
+  // NO TIMER AND NO SIGNER TEST ANY MORE, which is the whole of the change here:
+  //   * the 900 ms wait existed because the old signal was a guess about a hardcoded TTL and it
+  //     was worth letting a fast answer beat it.  The box's own expiry is not that, so waiting
+  //     buys nothing and costs the thing the delay was hiding.
+  //   * and the card is shown WITHOUT a signer present, because "DM link to the box" is the way
+  //     back in for everybody who does not have one — which is most phones.  Gating it on a signer
+  //     meant the browsers with the fewest options were told the least.  (SIGNERLOOKS still
+  //     re-renders the card if an extension shows up late; it just is not a precondition.)
   if (staleEnrolment() && !codeAlive(code)) {
-    diag('enrolment looks lapsed (no admission within DEVICE_TTL) — offering the signer now');
-    // pc.remoteDescription, not the ANSWERED flag: that is declared below this point, so reading it
-    // here works only because the timer outlives the module body.  Depending on that is how the
-    // onOpen bug happened.  The peer connection exists already and its remote description is set
-    // by exactly the event this is asking about.
-    setTimeout(() => { if (!pc.remoteDescription && haveSigner())
-                         showNoCredential('This browser may need to sign in again'); }, 900);
+    showNoCredential(null, { pending: true });
   }
 
   // ---- TAP TO OPEN, when and only when a CODE would be spent ------------------------------------
@@ -1174,6 +1217,14 @@ async function makeIdentity() {
               return;
             }
             markAdmitted();   // an answer IS the admission; nothing else proves it
+            // …and the box says how long the enrolment it just renewed is good for.  Absent from
+            // an older box's envelope, in which case this CLEARS what we held and we are back on
+            // the stamp above.
+            noteEnrolExpiry(env.expires);
+            if (env.expires) diag('enrolment good until ' + new Date(env.expires * 1000).toLocaleString());
+            // We are in.  Whatever the page predicted at load, the prediction is now answered, so
+            // the ways-back-in card goes away rather than sitting under a working desktop.
+            if (window.__clearWaysBackIn) window.__clearWaysBackIn();
             if (env.code) { storeCode(env.code); code = env.code; diag('credential renewed'); }
             answer = env.sdp;
           }

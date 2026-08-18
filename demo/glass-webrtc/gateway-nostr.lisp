@@ -201,11 +201,20 @@ including to ask it as somebody else — was a process on this machine.")
 (defvar *admission-refusals* 0 "Offers refused because the desktop could not be asked.")
 
 (defun ask-admission (pubkey code)
-  "Ask the desktop whether PUBKEY, holding CODE, may connect.  Returns (values VIA TOKEN):
+  "Ask the desktop whether PUBKEY, holding CODE, may connect.  Returns (values VIA TOKEN EXPIRES):
 
-  VIA    :code / :allowlist / :device, or NIL — and NIL is the only thing this function's caller
-         is allowed to act on, whether the desktop said no or said nothing at all.
-  TOKEN  the renewal code to put in the answer envelope, or NIL.
+  VIA      :code / :allowlist / :device, or NIL — and NIL is the only thing this function's caller
+           is allowed to act on, whether the desktop said no or said nothing at all.
+  TOKEN    the renewal code to put in the answer envelope, or NIL.
+  EXPIRES  when the desktop says this peer's ENROLMENT runs out, unix, or NIL from a desktop that
+           does not send one.  It rides the same envelope for the same reason the token does — the
+           browser has no other channel to learn it on, because a DENIAL IS ANSWERED WITH SILENCE.
+           Without it a client holding a lapsed device key can only offer into the dark and
+           conclude by timeout; with it, its next cold load shows the ways back in immediately and
+           still offers, because a prediction must never pre-empt a working credential.
+
+           COPIED, NOT COMPUTED.  This process does not know *ENROLMENT-TTL*, does not hold the
+           store, and must not guess: the desktop decides and this repeats what it said.
 
 FAILS CLOSED.  A service that cannot be reached refuses the offer and says so loudly, naming the
 port, because a silent refusal here would be diagnosed for an hour in the wrong process."
@@ -260,7 +269,11 @@ port, because a silent refusal here would be diagnosed for an hour in the wrong 
           (format t "~&@@ allowlist ~a... — minted a device credential to ride the answer~%"
                   (subseq pubkey 0 8))
           (finish-output))))
-    (values via (and (stringp token) token))))
+    ;; PARSED HERE AND NOWHERE ELSE, and NIL-safe both ways: an older desktop sends no `expires' and
+    ;; a garbled one sends something that is not a number.  Both answer NIL, the envelope leaves the
+    ;; field out, and the client falls back to the heuristic it had before this existed.
+    (values via (and (stringp token) token)
+            (and plist (ignore-errors (parse-integer (getf plist :expires)))))))
 
 (defun parse-offer (payload)
   "An offer PAYLOAD is either a {\"sdp\",\"code\"} JSON envelope or a bare SDP string.
@@ -857,7 +870,7 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                 ;; enrolment (a browser admitted earlier on a code, renewed by use and lapsing
                 ;; without it) — and all three are decided over there, in one round trip, along
                 ;; with the enrolment and the renewal token.  See ASK-ADMISSION: no answer refuses.
-                (multiple-value-bind (via renewal) (ask-admission phone-pub code)
+                (multiple-value-bind (via renewal expires) (ask-admission phone-pub code)
                   (cond
                     ((null via)
                      ;; RENEWAL carries the reason here: :absent / :bad / :expired from the desktop,
@@ -899,6 +912,15 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                                              (gethash "ufrag" ht)
                                              (ignore-errors (sdp-ice-ufrag (parse-sdp offer-sdp))))
                                        (when renewal (setf (gethash "code" ht) renewal))
+                                       ;; WHEN THIS ENROLMENT RUNS OUT, from the desktop that
+                                       ;; decided it.  The client stores it against this box and
+                                       ;; can then tell, at its next cold load and before it has
+                                       ;; spoken to anybody, whether the credential it is about to
+                                       ;; offer is one this box still honours — which a denial,
+                                       ;; being silence, can never tell it.  Absent from the
+                                       ;; envelope when the desktop did not say, and the client
+                                       ;; treats absence as "no better than the guess I had".
+                                       (when expires (setf (gethash "expires" ht) expires))
                                        (com.inuoe.jzon:stringify ht)))
                             (reply  (and (not skip)
                                          (cl-nostr.nip59:build-giftwrap kp phone-pub payload

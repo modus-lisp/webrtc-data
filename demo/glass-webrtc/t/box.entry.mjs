@@ -78,11 +78,14 @@ async function admit(pub, code) {
             : null;
   if (via) enrolled.set(pub, now() + 86400);                   // ANY admitted peer is enrolled
   let token = (via === 'code' || via === 'device') ? await mint() : null;
+  // ADMIT-PEER's fourth value: when the enrolment it just granted runs out.  The desktop's own
+  // number, from the store the NEXT offer will be measured against — not a TTL this side computed.
+  const expires = via ? enrolled.get(pub) : null;
   // ---- gateway-nostr.lisp, ASK-ADMISSION: the one line this change adds ------------------------
   // glass declines to push a bearer credential at an owner who has a signer.  True of the owner,
   // false of the browser they are sitting in front of — which holds a device key, not their npub.
   if (TOPUP && via === 'allowlist' && !token) token = await mint();   // == glass:admission-mint
-  return { via, token, status };
+  return { via, token, status, expires };
 }
 
 // ---- unwrap: the VERIFIED SEAL SIGNER is the peer, exactly as cl-nostr yields it ---------------
@@ -118,9 +121,9 @@ ws.addEventListener('message', async (m) => {
     log.push({ t: 'not-an-offer', peer: u.peer, content: String(u.content).slice(0, 40) });
     return;
   }
-  const { via, token, status } = await admit(u.peer, env.code);
+  const { via, token, status, expires } = await admit(u.peer, env.code);
   if (!via) { log.push({ t: 'denied', peer: u.peer, why: status }); return; }
-  log.push({ t: 'admitted', peer: u.peer, via, status, gaveCode: Boolean(token) });
+  log.push({ t: 'admitted', peer: u.peer, via, status, gaveCode: Boolean(token), expires });
   // A REAL answer, from a real PeerConnection, so the phone's setRemoteDescription is a real one.
   const pc = new RTCPeerConnection({ iceServers: [] });
   await pc.setRemoteDescription({ type: 'offer', sdp });
@@ -129,6 +132,9 @@ ws.addEventListener('message', async (m) => {
   const payload = { sdp: pc.localDescription.sdp,
                     ufrag: (sdp.match(/a=ice-ufrag:(\S+)/) || [])[1] };
   if (token) payload.code = token;
+  // …and the enrolment's expiry rides with it.  ?expires=0 is the box AS IT WAS, for the control
+  // that shows the client falls back to its guess rather than breaking when nothing says.
+  if (expires && q.get('expires') !== '0') payload.expires = expires;
   publish(wrapEvent({ kind: 14, content: JSON.stringify(payload), tags: [['p', u.peer]] },
                     boxSec, u.peer));
   log.push({ t: 'answered', peer: u.peer, ufrag: payload.ufrag });

@@ -64,8 +64,8 @@ by reading the gateway's own source that its command surface is gone.
 | command | effect | who |
 |---|---|---|
 | `link` | mint a token, reply with a full magic link | allowlist or enrolled device |
-| `devices` | list enrolled terminals with expiries | allowlist only |
-| `revoke <prefix\|all>` | drop an enrolment | allowlist only |
+| `devices [all]` | list enrolled terminals with expiries; `all` includes the **records** of ones that lapsed or were revoked, with the cause | allowlist only |
+| `revoke <prefix\|all>` | end an enrolment — it is **marked revoked, not deleted** | allowlist only |
 | `help` / `?` | usage | allowlist or device |
 
 `devices` and `revoke` are allowlist-only **on purpose**: a device key is a bearer credential that
@@ -90,6 +90,7 @@ Checked in this order, **by the desktop**, and the first match wins:
 3. **device** — a browser enrolled after arriving on a valid code. `DEVICE_TTL`
    (`GLASS_DEVICE_TTL`), default 24 h, **renewed on every connection**, persisted to
    `.glass-devices` — **the desktop's copy**, `GLASS_DEVICE_FILE`, default `~/.glass-devices`.
+   Each one is a **record** and not a row (§2.3).
 
 A code authorises *independently of the allowlist*, and any admitted connection enrols the caller as
 a device. One leaked link is therefore durable access until someone runs `revoke`.
@@ -113,12 +114,88 @@ One signature buys a durable terminal. (Single use is a *store* binding, not a p
 token, which is exactly what keeps this working: the code is minted for one identity and redeemed by
 another, on purpose.)
 
-### Signing in, when a terminal has lapsed
+### 2.3 An enrolment is a record, not a row
+
+`.glass-devices` was `<pubkey> <expiry>` and `revoke` deleted the line. When the `spent` alarm fires
+the questions are *how did this key get in, when, on whose authority, and was it removed or did it
+simply lapse* — and a two-field row answers none of them. Worse, revoking destroyed the evidence it
+was performed for. So an enrolment is a record with a **state**, and `revoke` **marks** it:
+
+```
+<pubkey> <expiry> <state> <created> <seen> <via|-> <nonce|-> <for|-> <since> <cause|->
+```
+
+| field | is |
+|---|---|
+| `state` | `active` / `expired` / `revoked` |
+| `created` / `seen` | first enrolled, and the last admission that renewed it |
+| `via` | `code` / `allowlist` / `device` — **how it got in**, stamped once and never overwritten by the renewals that follow (every one of those is `device`) |
+| `nonce` / `for` | for a code admission: the nonce it traded, and **who that code was minted for** — usually a different key, because a link is DM'd to a person and redeemed by a browser |
+| `since` / `cause` | when it entered this state and why: `first-admission`, `lapsed`, `revoked-by-<first-8>` |
+
+**Two compatibility properties, both deliberate.** The first two fields are what they always were, so
+`cut -d' ' -f1,2` / `awk '{print $1, $2}'` and every shell one-liner shaped like them keep working,
+and a **two-field line still loads** — that is the migration, with no conversion step and no flag
+day. And a revoked record's `expiry` is set to the instant of revocation, so a reader that knows
+nothing about states sees a past expiry and calls it lapsed. Getting *that* wrong is the one way
+keeping the line could have been worse than deleting it.
+
+**The one reader that has to change** is any that takes the *rest of the line* as the expiry rather
+than the second **word**: `parse-integer` over `1787… active 0 …` answers nothing, not `1787…`, and
+the row then reads as lapsed. `glass:admission-devices` did exactly that and was fixed in the same
+change; **warp-monitor's `read-devices` still does**, and it is a one-line fix in warp's own
+repository (it also reads `demo/glass-webrtc/.glass-devices`, which has not been the store since the
+store moved to the desktop, so nothing in the field reads it).
+
+`revoke` therefore ends the enrolment immediately (it admits nobody, and the desktop re-reads the
+file on mtime change as it always did) **and** leaves it findable: `devices all` over DM, `state=all`
+on the wire, `glass:find-enrolments` in the image.
+
+#### Retention, and a zero that means zero
+
+| | |
+|---|---|
+| **`GLASS_AUDIT_RETENTION`** (`GLASS_DEVICE_RETENTION`) | how long a record is kept after it stops being usable. Default **1209600 s — two weeks**. |
+
+A record that outlives its enrolment is a log of who connected and when: on your own box that is
+exactly what you want after an alarm, on a **shared** box it is surveillance nobody asked for. So
+zero is a real opt-out and not a small number — a settled record is dropped the instant it settles,
+and `created` / `seen` / `via` / `nonce` / `for` / `cause` are **never written at all**, so the file
+is the two-field store it was before any of this. Everything is pruned at the boundary on the next
+write.
+
+The same dial governs the login-code store, and there the point is sharper: **a spent code has two
+lifetimes.** For correctness the nonce need only be remembered until it expires — minutes — because
+the MAC refuses it from that instant with no help from any store. For forensics the *redemption* is
+worth keeping for the whole window, because "who traded that link" is asked hours later. One number
+for both gives you an unbounded store or an empty audit trail exactly for the codes that mattered.
+So a redeemed or superseded row now outlives its code by the retention window and is **not
+redeemable** while it does (`redeem-nonce` answers `:expired` from the expiry, before it consults
+anything); an *outstanding* code nobody ever tapped is still pruned at its expiry, because there is
+no redemption to record.
+
+### 2.4 Signing in, when a terminal has lapsed — and knowing before you try
 
 A denial is silent, so a browser whose enrolment expired cannot tell "refused" from "box
-unreachable" — it can only time out. When it does, the connection card says which failure it is
-(an expired link names the moment it died; an unenrolled one says so) and, **if `window.nostr`
-exists**, offers a **Sign in with Nostr** button.
+unreachable" — it can only time out. **So the box now says when the enrolment runs out.** `admit`
+answers `expires=`, the gateway copies it into the answer envelope, and the browser stores it under
+`glass-enrol:<box>`. On a later cold load with that moment past, the page shows the ways back in —
+the **Sign in with Nostr** button and the DM-a-link instruction — *immediately*, beside the spinner,
+instead of thirty seconds later.
+
+**The offer still goes out.** The expiry is a prediction (the box may have been restarted with a
+longer TTL; the caller may be on the allowlist anyway) and a working credential must never be
+pre-empted by a guess about it. So the early card says it is still trying, does not overwrite the
+connect sequence's message, does not mark the step failed, and is removed when an answer arrives.
+The terminal failure screen is unchanged and still arrives on the watchdog.
+
+A box that sends no `expires` — anything not yet deployed — falls back to the older heuristic
+(`markAdmitted`, a stamp per box, presumed lapsed after 24 h). An admission carrying no expiry
+**clears** the stored one, because a stale fact looks exactly like a fresh one and that is the only
+way a fact is worse than a guess.
+
+When the page does conclude, the connection card says which failure it is (an expired link names the
+moment it died; an unenrolled one says so) and, **if `window.nostr` exists**, offers the button.
 
 The signer is never touched without that tap. The page *reads* `window.nostr` to decide whether to
 draw the button — free, no approval sheet — and calls nothing on it until pressed. Pressing it sets
@@ -174,12 +251,16 @@ glass-admit/1 ok box=<64hex> allow=1 devices=2 ttl=86400
 
 | verb | asks | answers |
 |---|---|---|
-| `ping` | is there a desktop, and what is its posture | `box` `allow` `devices` `ttl` |
-| `admit pub= code=` | may this peer connect (decides + **redeems** + enrols + mints) | `via` `code` `token` `devices` |
+| `ping` | is there a desktop, and what is its posture | `box` `allow` `devices` `ttl` `retention` |
+| `admit pub= code=` | may this peer connect (decides + **redeems** + enrols + mints) | `via` `code` `token` **`expires`** `devices` |
 | `allowed pub=` | is this pubkey on the allowlist | `allowed=1\|0` |
-| `devices` | the enrolments (the shared warp query) | `rows=N` + `<pubkey> <expiry>` |
-| `revoke pub= arg=` | un-enrol, on `pub`'s authority — **allowlist only** | `rows=N` + revoked keys |
+| `devices [state=]` | the enrolments (the shared warp query, §2.3). `state=` is `active` (default) / `all` / `expired` / `revoked` | `rows=N` + one **record** line each |
+| `revoke pub= arg=` | end an enrolment, on `pub`'s authority — **allowlist only**, and `pub` lands in the record's cause | `rows=N` + revoked keys |
 | `mint pub= [for=] [ttl=]` | a login token, on `pub`'s authority. `for=` makes it a **link** (short TTL, supersedes that recipient's outstanding codes); no `for=` is a **top-up** (renewal TTL, supersedes nothing) | `token` `ttl` `for` `superseded` |
+
+`expires` on an `admit` is **when the enrolment it just granted runs out**, from the desktop that
+decided it. The gateway copies it into the answer envelope and the browser stores it per box — see
+§2.4, and note that this process computes no expiry of its own.
 
 `code=` / `reason=` on an `admit` is one of `absent` `bad` `expired` `superseded` `spent` `ok` — six
 distinct reasons, and the last two are the ones worth reading: `superseded` is routine (they tapped
@@ -254,9 +335,14 @@ variable. One line per code, positional, `-` for a field that does not apply:
 
 `state` is `outstanding` / `redeemed` / `superseded` — kept as distinct reasons rather than collapsed
 to a boolean, because the failure screen must eventually tell "already used" (investigate) from
-"expired" (unremarkable). Expiry is the fourth end and is not a state: an expired row is **pruned**
-at the code's own expiry, the same instant the MAC check starts refusing it, so the file stays a
-handful of lines. `GLASS_CODE_FILE` overrides the path.
+"expired" (unremarkable). Expiry is the fourth end and is not a state.
+
+**Two lifetimes, and they are not the same clock** (§2.3). A row that was *settled* — redeemed or
+superseded — is kept for `GLASS_AUDIT_RETENTION` past the code's expiry, because that row is the
+only thing that can name who traded a link; it stops being **redeemable** at the expiry itself,
+which `redeem-nonce` answers from the expiry before it looks at anything else. An *outstanding* row
+is pruned at the expiry as it always was: nothing became of it, and keeping every link ever minted
+is how a retention window turns into no bound at all. `GLASS_CODE_FILE` overrides the path.
 
 #### Two TTLs, because a link and a renewal have opposite jobs
 
@@ -290,11 +376,13 @@ redemption) but supersedes nothing. Prefer the `link` DM or `mint … for=` when
 
 ```
 offer  phone → box   {"sdp": "<full non-trickle SDP>", "code": "<token>"}
-answer box → phone   {"sdp": …, "ufrag": "<the OFFER's ice-ufrag>", "code": "<renewed token>"}
+answer box → phone   {"sdp": …, "ufrag": "<the OFFER's ice-ufrag>", "code": "<renewed token>",
+                      "expires": <unix, when this enrolment runs out>}
 ```
 
 `code` rides back on **all three** ways in now — the desktop mints it for `code` and `device`, the
-gateway tops it up for `allowlist` (§2.2).
+gateway tops it up for `allowlist` (§2.2). `expires` rides with it, and is absent from a box that
+predates it — see §2.4.
 
 Signalling is **one-shot and non-trickle**: the browser gathers fully (capped at 10 s) and publishes
 once. There is no renegotiation path anywhere in the system — which is why the microphone transceiver
@@ -492,9 +580,19 @@ tap invokes one. Same command, same authorization predicate, written once. It is
 menu (§7.2).
 
 **Where it runs.** *Inside the gateway*, but over the **desktop's** store: the query is
-`glass:admission-devices`, the invoker is `glass:admission-allowed-p`, and warp-monitor's
+`glass:admission-records`, the invoker is `glass:admission-allowed-p`, and warp-monitor's
 `revoke-in-file` is replaced at load time with `glass:admission-revoke` so the panel cannot rewrite
-a file nobody enforces. `:warp` still depends on `bordeaux-threads` and nothing else; what changed
+a file nobody enforces.
+
+**It asks for the record and projects the CURRENT STATE.** The rows carry what admitted each
+terminal and on whose authority (§2.3), and the query asks for the **active** ones — warp's
+DESIGN.md rule 4 is that the delta stream carries state, not events, so the revoked and lapsed
+records the desktop now keeps are a *different product* (`devices all`, and the file). A projection
+that quietly grew two weeks of them would be an event log wearing a result-set's clothes, and every
+row of it would cost budget on a cellular link. How a row *draws* is warp-monitor's `present`
+method, in warp's own repository: `warp-enrolment-row` fills in the extra fields **only where a slot
+exists to hold them**, so today's panel is exactly what it was and the provenance appears the day
+warp grows the slots, with nothing here to change. `:warp` still depends on `bordeaux-threads` and nothing else; what changed
 is where the rows come from.
 
 With the desktop unreachable the panel shows **no rows** (logged once, not silently rendered as
