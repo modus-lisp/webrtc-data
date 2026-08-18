@@ -1045,6 +1045,39 @@ async function makeIdentity() {
          (signer ? ' — offering the signer' : ' — no signer to offer'));
   };
   window.__showNoCredential = showNoCredential;
+
+  // ---- TAP TO OPEN, when and only when a CODE would be spent ------------------------------------
+  // A login code is one-time: redeeming it trades it for an enrolment, so a successful tap also
+  // means nobody else got there first.  That property is only worth having if the code cannot be
+  // spent WITHOUT a person -- and a link in a DM gets fetched by preview bots, some of which render
+  // the page in a headless browser.  One of those would connect, bind the code to its own throwaway
+  // key, and the human's tap would then be refused as a leak.  A false alarm that locks you out.
+  //
+  // So the gate is on REDEMPTION, not on connecting.  A returning terminal has an enrolment and
+  // spends nothing, so it opens straight away; only a load actually carrying a fresh code waits for
+  // a finger.  That also puts the connect on a user gesture, which iOS wants anyway before it will
+  // play the desktop's audio or video -- see TRYPLAY and the touchstart hook.
+  const willSpendCode = Boolean(urlCode) && codeAlive(urlCode) && !hasDevice();
+  if (willSpendCode) {
+    await new Promise(resolve => {
+      setStep(0, 'Ready when you are');
+      const wrap = document.createElement('div');
+      wrap.style.cssText = 'display:flex;flex-direction:column;gap:8px;margin-top:4px';
+      const btn = document.createElement('button');
+      btn.textContent = 'Open desktop';
+      btn.style.cssText = 'appearance:none;border:0;border-radius:10px;padding:11px 14px;' +
+        'font:600 14px/1.2 -apple-system,system-ui,sans-serif;background:#2f6f4f;color:#eaf5ee;' +
+        'touch-action:manipulation;cursor:pointer';
+      const note = document.createElement('div');
+      note.textContent = 'This link opens once. Tapping it uses it up.';
+      note.style.cssText = 'font-size:12px;color:#8a949c';
+      btn.addEventListener('click', () => { wrap.remove(); resolve(); }, { once: true });
+      wrap.append(btn, note);
+      connMsg.after(wrap);
+      diag('holding a one-time code until tapped');
+    });
+  }
+
   try { id = await makeIdentity(); }
   catch (e) {
     // A signer that was tapped and then declined lands here too, and it must land on the SAME
