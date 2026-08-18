@@ -7,7 +7,7 @@ else on this page:
 
 | | source | built by | how a change ships |
 |---|---|---|---|
-| **single page** (deployed today, k39) | `index-nostr.html` | `mkbundle.py` | edit → build → **publish under a new tag** → check-deploy → re-point `site-url.env` → restart the gateway → hand out a new URL |
+| **single page** (deployed today, k39) | `index-nostr.html` | `mkbundle.py` | edit → build → **publish under a new tag** → check-deploy → hand out a new URL |
 | **split** (built, tested, **not deployed**) | `index-shell.html` + `shell.js` + `payload.js` | `mksplit.py` | edit `payload.js` → build → `cp payload.js* ` beside the gateway → **the user reloads the same URL** |
 
 The split exists because the second row is the whole point: four publishes happened in one day
@@ -82,10 +82,16 @@ path** (`*path*` is argv, then `$NSITE_BUILD` verbatim, then `nsite-build/nsite-
 the script). So `NSITE_BUILD=/path/to/nsite-build sbcl --script publish.lisp` hands `read-bytes` a
 directory and dies. Give the file as argv — that is the only form that is right for both scripts.
 
-It uploads the HTML to the Blossom servers (one success is enough — `nostr.download` often times
-out), then publishes the nsite manifest mapping `/<tag>.html`, `/index.html` and `/` to that blob,
-plus relay (10002) and server (10063) lists. The site key is a 64-hex secret in `publish.lisp` —
-publishing rewrites the whole site's root, so treat it as a deploy, not a test.
+`publish.lisp` is a front end: it hands the request to the **running desktop** over that desktop's
+control socket, and only publishes in its own process when there is no desktop to ask (it decides by
+connecting, not by the socket file existing). Either way the work is `GLASS:PUBLISH-SITE` — upload
+the HTML to the Blossom servers (one success is enough; `nostr.download` often times out), publish
+the nsite manifest mapping `/<tag>.html`, `/index.html` and `/` to that blob, plus relay (10002) and
+server (10063) lists, and then point the box's login link at what was just published.
+
+The site key is **not** in this repo: `GLASS:SITE-SECRET` resolves it at publish time from `$SITE_SEC`
+or `~/.glass/site-key` (0600), in whichever image does the work, and refuses to publish without one.
+Publishing rewrites the whole site's root, so treat it as a deploy, not a test.
 
 **Always bump `SITE_VERSION` and hand out `/<tag>.html`.** A query string (`/?v=…`) resolves to the
 same path in the manifest, so the browser is free to serve its cached copy — that is why `?v=`
@@ -94,7 +100,7 @@ never busted anything. A new path cannot be mistaken for the previous build.
 ## Shipping a change: the whole procedure
 
 Edit, build, and publish are three separate steps, and stopping after any one of them leaves no
-visible trace — the phone just keeps loading the old page. Do all six:
+visible trace — the phone just keeps loading the old page. Do all five:
 
 ```sh
 # 1. edit the source (the ONLY file you edit)
@@ -112,43 +118,46 @@ SITE_VERSION=k30 sbcl --script publish.lisp "$NSITE_BUILD/nsite-index.html"
 # 4. verify all four hops; every line should say MATCH
 sbcl --script check-deploy.lisp "$NSITE_BUILD/nsite-index.html"
 
-# 5. publish.lisp has just OVERWRITTEN site-url.env with an nsite.LOL url.  While nsite.lol is
-#    serving a stale manifest (see "Delivering the page"), re-point that line at nsite.run —
-#    otherwise the next gateway start hands out a link that 404s.
-$EDITOR site-url.env
-
-# 6. restart the gateway.  The keepalive sources site-url.env inside its loop, so this is all
-#    it takes — but LOGIN_URL_BASE is read once at gateway start, so it does take this.
-kill <gateway-pid>          # the keepalive respawns it
-
-# 7. DM the box "link" and load the result
+# 5. DM the box "link" and load the result.  There is no step between 4 and this one any more:
+#    the desktop published it and the desktop mints the link, in one image.
 ```
 
-Steps 5 and 6 are only needed for the *login link*. A device that has connected before keeps the
-box npub in `localStorage`, so handing it the bare `https://<npub>.nsite.run/<tag>.html` (no
-`#box=…&code=…` fragment) is enough on its own — which is the way to ship a build without
-touching a running gateway.
+**There is no gateway restart in that list.** A device that has connected before keeps the box npub
+in `localStorage`, so handing it the bare `https://<npub>.nsite.run/<tag>.html` (no `#box=…&code=…`
+fragment) is enough on its own — and for the fragment, see below.
 
-### The login link must point at the path you just published
+### The login link points at the path just published, by construction
 
 Publishing **replaces** the manifest, so the previous `/<tag>.html` stops resolving the moment a new
 build lands — and a login link minted against it 404s, which from the phone is indistinguishable
-from the box being down. This has bitten twice.
+from the box being down. This bit twice through the mechanism below, and then a third time through
+the mechanism that was supposed to fix it.
 
-`publish.lisp` writes `site-url.env` beside the gateway with the path it just published, and
-`gw-keepalive.sh` sources it **inside its loop**, the same way it picks up `video-profile.env`. So a
-publish plus the next gateway restart is enough and nothing has to be remembered.
+**What it used to be, and why it broke.** `publish.lisp` wrote the new path into `site-url.env` and
+`gw-keepalive.sh` sourced that file *inside its loop*, so the gateway was always current. Then the
+`link` command moved out of the gateway and into the **desktop** — a process with no such loop,
+holding whatever `LOGIN_URL_BASE` its launcher had at exec. Nothing about the write changed and
+nothing could report that its reader had stopped reading. On 2026-08-18 the site served
+`nsite.run/k42.html` while the box handed out `nsite.lol/k27.html`: a tag from weeks earlier, on a
+gateway host stale all week, from a build predating the box-key rotation.
 
-Two ways to still get this wrong:
+**What it is now.** Publishing happens *in the desktop image*, beside the mint —
+`GLASS:PUBLISH-SITE` (glass's `:glass/site` system, `glass/src/site.lisp`) — and it sets
+`GLASS:*LOGIN-URL-BASE*` in the same call that published the manifest. `publish.lisp` is a front
+end that hands the request to the running desktop over its control socket, or publishes in-process
+if there is no desktop (it decides by *connecting*, so a socket file left behind by a `kill -9`
+reads as "no desktop"). **There is no file, no socket and no environment variable between a publish
+and the next mint**, which is why nothing above says "restart" any more.
 
-- `LOGIN_URL_BASE` is read **once, at gateway start** (`defparameter` + `getenv`), so a running
-  gateway keeps handing out the old path until it restarts.
-- Editing the `export` at the top of `gw-keepalive.sh` is **not enough on its own.** That line runs
-  once, when the keepalive loop starts; the gateway respawns *inside* that loop and inherits the
-  environment the loop already has. The symptom is a script that reads `k27` while the live process
-  serves `k25`. Restart the keepalive, not just the gateway — or let `site-url.env` do it.
+Two things still worth knowing:
 
-`@@ [keepalive] link=…` is printed on every start, so the log says which path is being handed out.
+- **The link base moves only if the manifest landed.** No relay accepted it → the old paths are
+  still what resolves → the link goes on naming what it named, and the report says
+  `link base UNCHANGED`.
+- **`~/.glass/site-url` is a memo, not a handoff.** It is written after the variable, best-effort,
+  and read once by *the same image* at its next cold start — where it deliberately **outranks**
+  `$LOGIN_URL_BASE`, because a launcher's environment is a guess made before anything was published
+  and it is the thing that was wrong.
 
 `check-deploy.lisp` (in this directory) walks build → Blossom → relays → gateway and prints what
 each hop holds, so the first mismatch names the broken hop. It is read-only and needs no secret:
@@ -178,8 +187,11 @@ nsite.lol /k33.html  -> 404      nsite.run /k33.html  -> 200, current bytes
 nsite.lol /index.html-> 200, OLD build
 ```
 
-`publish.lisp` writes the nsite.lol host into `site-url.env` regardless, so that file needs
-re-pointing after every publish until nsite.lol catches up (step 5 above).
+`publish.lisp` used to write the **nsite.lol** host into `site-url.env` on every publish — it
+inherited `CL-NOSTR.NSITE:*GATEWAY*`, whose default is `.lol` — so every deploy ended with somebody
+hand-editing that line back to `.run`, which is a step that gets skipped. The host is now a stated
+choice, `GLASS:*SITE-GATEWAY*`, and its default is **nsite.run**. A default that has to be
+corrected by hand on every deploy is not a default.
 
 The blob URL works because the published page is entirely self-contained — that is exactly what the
 build's `import-from-url 0` check guarantees — and because `#box=…&code=…` is a client-side
@@ -217,13 +229,22 @@ Nothing in this repo contains a key. Two secrets matter, and both are resolved a
 
 | secret | where it lives | used by |
 |---|---|---|
-| site key (64 hex) | `$SITE_SEC`, else `~/.glass/site-key` (mode 600) | `publish.lisp` |
+| site key (64 hex) | `$SITE_SEC`, else `~/.glass/site-key` (mode 600) | `GLASS:PUBLISH-SITE` — usually **in the desktop image** |
 | TURN user/pass, box nsec | `gw-keepalive.sh` on the box (gitignored) | the gateway |
 
-`publish.lisp` **refuses to run** if it cannot resolve the site key — it does not fall back to
-anything. That key is the site's whole identity: whoever holds it can replace every page served at
-that npub. It is deliberately single-copy; back it up somewhere you trust, because losing it means
-the npub in every link you have handed out can never be updated again.
+Publishing **refuses to run** if it cannot resolve the site key — it does not fall back to anything.
+That key is the site's whole identity: whoever holds it can replace every page served at that npub.
+It is deliberately single-copy; back it up somewhere you trust, because losing it means the npub in
+every link you have handed out can never be updated again.
+
+**The desktop image now reaches that key**, which it did not before — the key used to enter only a
+short-lived `sbcl --script` somebody ran on purpose. Two consequences worth stating: it is read
+**per publish and never cached**, so between publishes the image holds no site secret at all; and
+anything that can reach the desktop's control socket can now publish as the site. The authority did
+not move (the socket is 0600 + `SO_PEERCRED`, and a process of that uid could always have read the
+key file) — its *residence* did. This is also why publishing is its own system, `:glass/site`: the
+**gateway** loads `:glass/nostr` for the client half of admission, is internet-facing and respawns
+on crash, and must not have this code in it.
 
 ## Where the build dir is
 
@@ -291,8 +312,9 @@ under "Deploying the split" below.
 ## Why
 
 Publishing **replaces** the nsite manifest, so every client change costs a new tag, a publish, a
-check-deploy, a re-pointed `site-url.env`, a gateway restart and a user reloading at a *different*
-URL. That is a heavy price for moving a button, and it was paid four times in one day.
+check-deploy and a user reloading at a *different* URL. That is a heavy price for moving a button,
+and it was paid four times in one day. (It used to cost a re-pointed `site-url.env` and a gateway
+restart on top; publishing moved into the desktop image, so those two are gone.)
 
 But most of the client cannot possibly need to be on nsite. Split it at the only line that is
 actually forced — **can this code arrive over the connection it is used to set up?**
@@ -337,15 +359,14 @@ cp "$NSITE_BUILD"/payload.js "$NSITE_BUILD"/payload.js.gz  <beside the gateway>
 # ...and the user reloads the SAME url.
 ```
 
-**No publish, no new tag, no `site-url.env`, and no gateway restart** — the gateway re-reads the
+**No publish, no new tag, and no gateway restart** — the gateway re-reads the
 file when its mtime changes (`payload-bytes` in `payload-channel.lisp`). The phone asks for the
 payload by hash on every connection, sees a hash it does not have, and fetches it.
 
 ## Shipping a shell change
 
 Exactly the old procedure — build with `mksplit.py`, publish `nsite-shell.html` under a new tag,
-check-deploy, re-point `site-url.env`, restart the gateway. **This is what the split is for
-avoiding**, so the question to ask first is always whether the change can be made in `payload.js`
+check-deploy. **This is what the split is for avoiding**, so the question to ask first is always whether the change can be made in `payload.js`
 instead.
 
 The shell's API is **append-only**, and that is what keeps the answer to that question "yes":
@@ -364,8 +385,8 @@ only change that forces a new shell onto nsite, and it is checkable: it is a dif
 Both halves are needed; either one alone is a no-op:
 
 1. **Publish the shell.** `SITE_VERSION=<tag> sbcl --script publish.lisp "$NSITE_BUILD/nsite-shell.html"`,
-   then `check-deploy.lisp`, then re-point `site-url.env` at nsite.run, then restart the gateway so
-   `LOGIN_URL_BASE` picks up the new path. (All the usual traps on this page still apply.)
+   then `check-deploy.lisp`. The desktop publishes it and mints against it in one image, so there
+   is nothing to re-point and no gateway restart. (All the usual traps on this page still apply.)
 2. **Put the payload on the box** and set **`PAYLOAD_CHANNEL=1`** in `gw-keepalive.sh`, plus
    `PAYLOAD_FILE` if it is not `payload.js` beside the gateway. Restart the gateway.
 

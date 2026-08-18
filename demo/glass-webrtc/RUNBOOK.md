@@ -361,9 +361,10 @@ be reconstructed. `demo/turn-rig/turn-server.py` is a small RFC 5766 server usab
 
 **Sequence.**
 
-1. Desktop: `NOSTR_SEC=<box> NOSTR_ALLOW=<your npub> LOGIN_URL_BASE=<published client> cd warren && sbcl --control-stack-size 256 --dynamic-space-size 4096 --load desktop-5903.lisp` — the launcher must load `:glass/nostr` and call `(glass:start-session-nostr)`, or the box has no identity and admits nobody
+1. Desktop: `NOSTR_SEC=<box> NOSTR_ALLOW=<your npub> cd warren && sbcl --control-stack-size 256 --dynamic-space-size 4096 --load desktop-5903.lisp` — the launcher must load `:glass/nostr` and call `(glass:start-session-nostr)`, or the box has no identity and admits nobody, and should load `:glass/site` so the box publishes its own client (`LOGIN_URL_BASE` is then only a fallback for a box that has never published)
 2. Client: build and publish per `DEPLOY.md` (`mkbundle.py`, then `publish.lisp` **with the file as
-   argv**, then `check-deploy.lisp`, then re-point `site-url.env` at nsite.run)
+   argv**, then `check-deploy.lisp`) — publish.lisp hands the request to the running desktop, which
+   points its own link base at what it just published
 3. Gateway: `./gw-keepalive.sh` under nohup or tmux
 4. First login: `NOSTR_SEC=<box> sbcl --script login-link.lisp <your-npub>`, or DM the box `link`
    once allowlisted
@@ -430,8 +431,7 @@ preferred:
 * **every data channel has to exist before the offer.** Signalling is one-shot and non-trickle and
   nothing here renegotiates, so all four are created in `shell.js`. The payload may not create one.
 * **`shell.js` is on nsite.** A fifth channel is a publish under a new tag, which kills every login
-  link minted against the old one (§8.9) and needs the desktop restarted for `LOGIN_URL_BASE`
-  (§8.8). A projection id costs a file copy and a gateway restart.
+  link minted against the old one (§8.9). A projection id costs a file copy and a gateway restart.
 * and an app id is what a *third* app would want anyway; stream ids are negotiated once.
 
 So a client message may carry `a`, the app it is for, and a frame carries `a` back. **The device
@@ -557,14 +557,18 @@ dropped at the transport ends up struck through and unpickable. The untested rem
 
 **Operational**
 
-8. `LOGIN_URL_BASE` is read **once at desktop start** — it is the desktop that builds a link now, so
-   re-pointing the client at a new tag means restarting the desktop, not the gateway. Only the
-   `site-url.env` sourced *inside* the gateway's restart loop updates a running gateway.
+8. The desktop **publishes and mints in one image** (`:glass/site`, `glass/src/site.lisp`), so a
+   publish moves `GLASS:*LOGIN-URL-BASE*` in memory and the next `link` DM names the tag just
+   published — no restart of anything. This replaced a `site-url.env` handoff that went silently
+   stale the day the `link` command moved out of the gateway: the site served `k42` on nsite.run
+   while the box handed out `k27` on nsite.lol. `LOGIN_URL_BASE` survives only as the fallback for
+   a box that has never published, below the `~/.glass/site-url` memo.
 9. Publishing **replaces** the manifest, so the previous `/<tag>.html` stops resolving and every link
    minted against it 404s. Always publish under a new tag.
-10. `publish.lisp` writes an **nsite.lol** URL into `site-url.env`, but nsite.lol serves a stale
-    manifest — worse, `/index.html` returns 200 with an *older* build, which looks like success. Verify
-    on nsite.run. Zero `accepted=T` lines means nothing was published.
+10. Links name **nsite.run** (`GLASS:*SITE-GATEWAY*`). `publish.lisp` used to inherit cl-nostr's
+    `nsite.lol` default and every deploy ended with somebody hand-editing it back; nsite.lol serves a
+    stale manifest — worse, `/index.html` returns 200 with an *older* build, which looks like success.
+    Verify on nsite.run. Zero `accepted=T` lines means nothing was published.
 11. NIP-05 allowlist resolution happens once at startup and fails open-to-empty — but it is now
     re-runnable: `(glass:refresh-nostr-allow)` over the desktop's control socket, no restart.
 
