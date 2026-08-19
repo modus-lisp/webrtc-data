@@ -456,8 +456,25 @@ function onResume() {
 // control-channel ping above is the whole of the liveness check, which is enough on its own.
 let pollHook = () => {};
 
+// ---- "I am going away" ------------------------------------------------------------------------
+// The box cannot tell a phone whose screen locked from a route that broke: both are silence, and
+// both end as "peer silent 30s".  Since this client is a phone, ordinary backgrounding is by far
+// the commonest reason the box stops hearing us — so without a hint, every time the user pockets
+// their phone it would be charged as a failure of whatever ICE route happened to be selected, and
+// relay on cellular would look terrible for no reason but that people go outdoors.
+//
+// So we say so on the way out.  ONE message, best effort, never awaited and never retried: this
+// fires on the path where the browser is already suspending us, and anything that blocks here
+// costs the user a frame for the sake of a statistic.  If it does not arrive, nothing breaks —
+// the box treats a missing hint as UNEXPLAINED, never as proof the route died, because a phone
+// that genuinely lost the network cannot send this either and that is the case being counted.
+function sendAway(why) {
+  if (ctrl.readyState !== 'open') return;
+  try { ctrl.send(JSON.stringify({ away: 1, why: why })); } catch (_) {}
+}
+
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState !== 'visible') return;
+  if (document.visibilityState !== 'visible') { sendAway('hidden'); return; }
   const dead = pc.connectionState === 'failed' || pc.connectionState === 'closed' ||
                pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'closed';
   if (dead) {
@@ -473,6 +490,9 @@ document.addEventListener('visibilitychange', () => {
   }
   onResume();
 });
+// ...and the matching way out: iOS backgrounds a tab through pagehide without always firing a
+// visibilitychange first, so the hint would be missed on the platform that needs it most.
+window.addEventListener('pagehide', () => sendAway('pagehide'));
 // iOS Safari can restore a page from the back/forward cache without a visibilitychange.
 window.addEventListener('pageshow', e => {
   if (!e.persisted) return;

@@ -14,6 +14,9 @@
            #:sdp-candidates #:sdp-sctp-port #:sdp-mid
            #:sdp-media #:sdp-media-type #:sdp-media-mid #:sdp-media-codec-pt
            #:make-ice #:ice-answer #:ice-serve #:ice-start-checks #:ice-close #:ice-silent-secs
+           ;; route attribution: which pair got selected, when, and out of what
+           #:ice-route-label #:ice-selection-secs #:ice-offered-counts
+           #:ice-local-end-type #:ice-remote-end-type #:ice-agent-route-changes
            #:ice-gather-srflx #:ice-gather-relay #:ice-agent-relay-ip #:ice-agent-relay-port
            #:ice-agent-srflx-ip #:ice-agent-srflx-port #:ice-agent-turn #:ice-agent-peer
            #:ice-agent-on-media #:ice-send-to-peer            ; SRTP media demux + send (webrtc-media)

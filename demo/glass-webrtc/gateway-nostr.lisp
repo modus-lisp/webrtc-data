@@ -469,6 +469,111 @@ make."
   (let ((intro (reed:make-buffer-source (glass:audio-tone 880 0.12 :rate 8000) :frame-samples 160)))
     (lambda () (or (funcall intro) (glass:tap-next-frame tap)))))
 
+;; ---- route attribution: which route a session used, and how it ended -------------------------
+;;
+;; THE QUESTION THIS EXISTS TO ANSWER is "do some routes die more often than others", and it was
+;; unanswerable — not for want of data, but because the two halves lived apart.  The box knew the
+;; selected peer (ICE-AGENT-PEER) and it knew a session had ended ("peer silent 30s" in the log),
+;; and nothing ever wrote the two down together, so no amount of grepping could turn a pile of
+;; closes into "relay sessions last four minutes and direct ones last an hour".  One record per
+;; session with the route AND the ending in it makes that a group-by instead of an investigation.
+;;
+;; THE CONFOUNDER, stated up front because it will otherwise dominate every number here: from this
+;; end, a phone whose screen locked is INDISTINGUISHABLE from a route that broke.  Both are silence
+;; and both end as "peer silent 30s".  The client is on a phone, so ordinary backgrounding is by a
+;; wide margin the commonest cause of silence, and charging it to whatever route happened to be
+;; selected would make relay look terrible on cellular purely because people put their phones down
+;; outdoors.  So the client sends a best-effort hint before it goes quiet (see CONTROL-AWAY-P), and
+;; a close that follows one is recorded as :AWAY.
+;;
+;; ITS ABSENCE PROVES NOTHING, and the naming is deliberate about that.  A phone that is genuinely
+;; cut off — the exact case we are trying to count — cannot send the hint either.  So the two
+;; outcomes are :AWAY (voluntary, excludable) and :SILENT (UNEXPLAINED), never "voluntary" versus
+;; "route died".  Any analysis that reads :SILENT as "the route broke" has reintroduced the bug
+;; this comment exists to prevent; :SILENT is the CANDIDATE POOL for route failure, not evidence.
+(defvar *last-video-stats* nil
+  "The most recent video stats, kept so the stats file can be rewritten at session close — when the
+video sender has already stopped and will never call ON-STATS again.  Without this the one write
+that matters most, the one carrying the finished session's record, would carry no video at all.")
+(defparameter *session-log-max* 24)
+(defvar *session-log* '() "Most recent session records, newest first.")
+(defvar *session-log-lock* (bt:make-lock "session-log"))
+
+(defun note-session (record)
+  "Add RECORD to the bounded ring of finished sessions."
+  (bt:with-lock-held (*session-log-lock*)
+    (push record *session-log*)
+    (let ((tail (nthcdr (1- *session-log-max*) *session-log*)))
+      (when tail (setf (cdr tail) nil)))))
+
+(defun session-log ()
+  (bt:with-lock-held (*session-log-lock*) (copy-list *session-log*)))
+
+(defun stats-plist ()
+  "The whole stats file as one form.  Factored out of the video ON-STATS callback because the
+session record has to be written at CLOSE, which is after the video sender that used to be the
+only caller has stopped.
+
+Note :ICE and not :PATH.  This file already has a :PATH — inside :GLASS, where it means the glass
+socket — and a second one meaning an ICE route would make the two impossible to tell apart in the
+one place they would both be read."
+  (list :video *last-video-stats*
+        :sessions-ok *sessions-ok*
+        :sessions-failed *sessions-failed*
+        :no-relay *no-relay-count*
+        :last-error *last-error*
+        :devices *devices-known*
+        :glass (list :host *glass-host* :port *glass-port* :path *glass-path*)
+        :ice (list :sessions (session-log))
+        :qi-base *video-qi* :target-kbs *video-target-kbs*))
+
+(defun control-away-p (payload)
+  "T if this control message is the client's best-effort \"I am going away\" hint.
+
+Matched as a substring rather than parsed: this runs on the receive thread for every control
+message, the hint carries no arguments, and a false positive costs one session recorded as
+voluntary — which is the SAFE direction to be wrong, because the failure mode we are protecting
+is over-counting route deaths, not under-counting them."
+  (handler-case
+      (let ((s (if (stringp payload) payload (map 'string #'code-char (as-u8vec payload)))))
+        (and (search "\"away\"" s) t))
+    (error () nil)))
+
+(defun session-record (agent &key established-at away err)
+  "One session as a plist: the route it used AND how it ended, in the same form.
+
+CAUSE is the single most important field and it is ordered most-specific-first:
+  :NEVER-SELECTED  ICE never picked a pair — an establishment failure, no route to blame.
+  :ERROR           the session threw (the string is in :ERR).
+  :AWAY            the client said it was going away: VOLUNTARY, exclude from route health.
+  :SILENT          the peer went quiet past the consent limit with NO hint.  UNEXPLAINED.
+  :CLOSED          ended without any of the above (ran its duration, or a clean teardown)."
+  (let* ((now (get-internal-real-time))
+         (quiet (ice-silent-secs agent))
+         (life (when established-at
+                 (/ (float (- now established-at)) internal-time-units-per-second)))
+         (cause (cond ((null (ice-agent-selected-at agent)) :never-selected)
+                      (err :error)
+                      (away :away)
+                      ((and quiet (>= quiet *peer-silence-limit*)) :silent)
+                      (t :closed))))
+    (list :at (get-universal-time)
+          :outcome (if established-at :ok :failed)
+          ;; the group-by key: "relay/relay", "direct/srflx", … or NIL when nothing was selected
+          :route (ice-route-label agent (ice-agent-selected-first agent))
+          ;; and where it ENDED, which differs from :ROUTE exactly when the peer re-paired
+          :route-end (ice-route-label agent)
+          :route-changes (ice-agent-route-changes agent)
+          ;; what the peer said it could be reached at — the other half of attributing a failure
+          :offered (ice-offered-counts agent)
+          :select-s (let ((s (ice-selection-secs agent))) (when s (float s 1.0)))
+          :life-s (when life (float life 1.0))
+          :cause cause
+          ;; T only when the hint actually arrived.  NIL is NOT evidence of the opposite.
+          :hinted (and away t)
+          :silent-s (when quiet (float quiet 1.0))
+          :err err)))
+
 (defun run-session (conn agent &key pub)
   "Drive DTLS, run the data channel, and bridge it to glass once the channel opens.
 Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
@@ -477,7 +582,13 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
         ;; stream 102, which it only does if somebody opens the panel.
         (warp nil)
         ;; ...and its payload transfer, which is NIL until the phone's shell says hello on 104.
-        (payload-ch nil))
+        (payload-ch nil)
+        ;; ---- what the session record is built from, all three session-local on purpose: a
+        ;; global would attribute one phone's ending to another phone's route the moment two
+        ;; terminals overlap, which is the exact class of mistake this whole record exists to fix.
+        (established-at nil)                    ; when the data channel opened, or NIL if it never did
+        (away nil)                              ; the client's "going away" hint, if it arrived
+        (err nil))                              ; the error that ended the session, as a short string
     (unwind-protect
          (handler-case
              (progn
@@ -547,16 +658,8 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                                       (lambda ()
                                         (capture-take cap :scale (webrtc-media:video-scale))))
                             :on-stats (lambda (v)
-                                        (write-stats
-                                         (list :video v
-                                               :sessions-ok *sessions-ok*
-                                               :sessions-failed *sessions-failed*
-                                               :no-relay *no-relay-count*
-                                               :last-error *last-error*
-                                               :devices *devices-known*
-                                               :glass (list :host *glass-host* :port *glass-port*
-                                                            :path *glass-path*)
-                                               :qi-base *video-qi* :target-kbs *video-target-kbs*)))
+                                        (setf *last-video-stats* v)
+                                        (write-stats (stats-plist)))
                             :log (lambda (m)
                                    (let ((cs (and cap (capture-stats cap))))
                                      (format *error-output* "~&[video] ~a~@[ | glass wait ~,0fms conv ~,0fms upd ~a px ~a copies ~a rc ~a scale 1/~a (~a downscales)~]~%"
@@ -573,6 +676,10 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                 (lambda (assoc sid)
                   (setf glass (glass-connect) *last-assoc* assoc)
                   (incf *sessions-ok*)
+                  ;; The session is ESTABLISHED here, and this is the clock the survival number is
+                  ;; measured from: not the offer (which includes however long ICE spent choosing)
+                  ;; but the moment the link actually started working.
+                  (setf established-at (get-internal-real-time))
                   (format *error-output* "~&[gw-nostr] channel open -> glass ~a~%"
                           (glass:endpoint-string :host *glass-host* :port *glass-port*))
                   ;; glass -> browser: one message per read (SCTP fragments it)
@@ -610,7 +717,13 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
                   ;; Keeping it off the RFB stream is the point — that one is a byte protocol with
                   ;; its own framing, and nothing here has to know how to tell the two apart.
                   (cond
-                    ((control-sid-p sid) (handle-control-message assoc sid payload))
+                    ((control-sid-p sid)
+                     ;; Read the going-away hint off the control stream before handing the message
+                     ;; on, so the hint costs one substring search and needs no change to the
+                     ;; control protocol's own handler.  Recorded as a TIME, not a flag, so a
+                     ;; later "it came back" could be told apart from "it never did".
+                     (when (control-away-p payload) (setf away (get-internal-real-time)))
+                     (handle-control-message assoc sid payload))
                     ;; The phone's THIRD channel (stream 102) is warp: the enrolled-terminal list
                     ;; as a delta stream, and the commands on it.  A negotiated channel has no
                     ;; handshake, so the first message IS the open.
@@ -659,10 +772,34 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
              (incf *sessions-failed*)
              (setf *last-error* (let ((s (princ-to-string e)))
                                   (subseq s 0 (min 72 (length s)))))
+             (setf err *last-error*)
              (format *error-output* "~&[gw-nostr] session error: ~a~%" e)))
       (let ((quiet (ice-silent-secs agent)))
         (when (and quiet (>= quiet *peer-silence-limit*))
           (format *error-output* "~&[gw-nostr] peer silent ~,0fs — closing session~%" quiet)))
+      ;; THE ROUTE AND THE ENDING, WRITTEN DOWN TOGETHER.  Everything above this line has already
+      ;; been logged separately at one time or another; what was missing was one record carrying
+      ;; both, which is what makes "which routes die frequently" a group-by.  Written to the log
+      ;; AND to the stats file, and unconditionally: a session that failed to establish is the
+      ;; one whose record is most worth having, and it is exactly the one an "on success" hook
+      ;; would drop.  Best-effort throughout — instrumentation may not be what ends a session.
+      (ignore-errors
+       (let ((rec (session-record agent :established-at established-at :away away :err err)))
+         (note-session rec)
+         (format *error-output*
+                 "~&[route] ~a ~a — ~a | offered h~a/s~a/r~a | select ~a | life ~a~@[ | changes ~a~]~@[ | silent ~ds~]~%"
+                 (or (getf rec :route) "none")
+                 (getf rec :outcome) (getf rec :cause)
+                 (getf (getf rec :offered) :host) (getf (getf rec :offered) :srflx)
+                 (getf (getf rec :offered) :relay)
+                 (let ((s (getf rec :select-s))) (if s (format nil "~,1fs" s) "never"))
+                 (let ((s (getf rec :life-s))) (if s (format nil "~,0fs" s) "-"))
+                 (let ((n (getf rec :route-changes))) (when (and n (plusp n)) n))
+                 (let ((s (getf rec :silent-s))) (when s (round s))))
+         (finish-output *error-output*)
+         ;; and into the stats file, which the video callback can no longer do: its sender is
+         ;; stopped by the time this runs.
+         (write-stats (stats-plist))))
       (when pub (forget-session pub agent))
       ;; This peer's warp consumer dies with the session, deliberately: its STREAM is its memory of
       ;; what the far end holds, and a phone that comes back is a phone holding nothing.  Keeping it

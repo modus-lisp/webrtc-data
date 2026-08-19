@@ -24,13 +24,133 @@
   ;; duration holding a TURN allocation, an RFB connection and an encoder aimed at nobody.  Stamped
   ;; on every inbound datagram — media, DTLS, and the peer's own STUN consent checks alike, which is
   ;; why it lives at the socket rather than in any one consumer.
-  (last-rx nil))
+  (last-rx nil)
+  ;; ---- route attribution -------------------------------------------------------------------
+  ;; Which route this session actually used, so a session that dies can be charged to a ROUTE
+  ;; rather than to nothing.  Before this, the box knew the selected peer form (PEER, above) but
+  ;; never when it was selected or what it was selected from, so "relay sessions die more often
+  ;; than direct ones" was not a question the box could answer about its own history.
+  ;;
+  ;; CREATED-AT is stamped by MAKE-ICE, which is one form before the answer goes out, so
+  ;; SELECTED-AT minus CREATED-AT is time-to-selection: the number that says whether a failure is
+  ;; "no path exists" or "a viable path was still being found when the DTLS wait gave up".
+  ;;
+  ;; SELECTED-FIRST is kept beside PEER rather than instead of it because they diverge and the
+  ;; divergence is a finding: PEER is the CURRENT route and moves if the peer re-pairs mid-session,
+  ;; so a session that starts direct and ends relayed has already told us a direct path broke.
+  (created-at (get-internal-real-time))
+  (selected-at nil)                            ; when a peer was FIRST selected, or NIL if never
+  (selected-first nil)                         ; the peer form at that first selection
+  (route-changes 0))                           ; times the route TYPE changed after that
 
 (defun ice-silent-secs (agent)
   "Seconds since anything arrived from the peer, or NIL if nothing ever has."
   (let ((tt (ice-agent-last-rx agent)))
     (when tt (/ (float (- (get-internal-real-time) tt))
                 internal-time-units-per-second))))
+
+;;; ---- route attribution: what was offered, what got selected, and when ------------------------
+;;;
+;;; All of this is read once per session (at close, or when the stats file is written), never per
+;;; packet.  The one thing that IS on the packet path is ICE-NOTE-PEER, which is why it does a
+;;; comparison and not a consing bookkeeping step: ICE-RELAYED-INNER calls it for every relayed
+;;; datagram, so anything expensive here would be paid per packet on the slowest route we have.
+
+(defun ice-note-peer (agent peer-form)
+  "Select PEER-FORM as the route to the peer, recording WHEN the first selection happened.
+
+Replaces a bare (SETF ICE-AGENT-PEER): the assignment is the same, but the first one is stamped,
+and a later one that changes the route TYPE is counted.  Returns PEER-FORM."
+  (let ((cur (ice-agent-peer agent)))
+    (cond ((null cur)
+           (setf (ice-agent-selected-at agent) (get-internal-real-time)
+                 (ice-agent-selected-first agent) peer-form))
+          ;; FIRST is the route tag (:RELAY / :RELAY-SEND / a host), so comparing it is comparing
+          ;; route type.  EQUAL and not EQUALP: the direct form holds a host as a string or a
+          ;; 4-octet vector, and we only want the cheap test — a missed count is a missed count,
+          ;; a per-packet deep compare is a cost on every relayed frame.
+          ((not (equal (first cur) (first peer-form)))
+           (incf (ice-agent-route-changes agent))))
+    (setf (ice-agent-peer agent) peer-form)))
+
+(defun ice-selection-secs (agent)
+  "Seconds from agent creation to the first selected peer, or NIL if none was ever selected."
+  (let ((sel (ice-agent-selected-at agent)))
+    (when sel (/ (float (- sel (ice-agent-created-at agent)))
+                 internal-time-units-per-second))))
+
+(defun ice-offered-counts (agent)
+  "The peer's offered candidates tallied by type: a plist (:HOST n :SRFLX n :RELAY n :OTHER n).
+
+This is what the far end said it could be reached at, which is the other half of attributing a
+failure: 'never selected' means something very different when the peer offered a relay candidate
+than when it offered forty srflx candidates and nothing else."
+  (let ((host 0) (srflx 0) (relay 0) (other 0))
+    (dolist (c (ice-agent-remote-candidates agent))
+      (let ((ty (ice-candidate-type c)))
+        (cond ((equal ty "host") (incf host))
+              ((equal ty "srflx") (incf srflx))
+              ((equal ty "relay") (incf relay))
+              (t (incf other)))))
+    (list :host host :srflx srflx :relay relay :other other)))
+
+(defun %host->string (h)
+  "A host as a dotted string, whether it arrived as one or as a 4-octet vector."
+  (cond ((stringp h) h)
+        ((and (vectorp h) (= 4 (length h)))
+         (format nil "~d.~d.~d.~d" (aref h 0) (aref h 1) (aref h 2) (aref h 3)))
+        (t (princ-to-string h))))
+
+(defun %peer-form-address (agent peer-form)
+  "The peer's real transport address behind PEER-FORM, as (dotted-string . port), or NIL.
+The relay forms name a TURN channel or a raw host vector rather than an address, so this is where
+the indirection is undone — the point is to compare against what the peer OFFERED."
+  (handler-case
+      (cond
+        ((null peer-form) nil)
+        ((eq (first peer-form) :relay)
+         (let ((p (and (ice-agent-turn agent)
+                       (gethash (second peer-form)
+                                (turn-alloc-chan->peer (ice-agent-turn agent))))))
+           (when p (cons (princ-to-string (car p)) (cdr p)))))
+        ((eq (first peer-form) :relay-send)
+         (let ((tgt (second peer-form)))
+           (cons (%host->string (car tgt)) (cdr tgt))))
+        (t (cons (%host->string (first peer-form)) (second peer-form))))
+    (error () nil)))
+
+(defun ice-remote-end-type (agent &optional (peer-form (ice-agent-peer agent)))
+  "Which of the peer's OFFERED candidates the selected route reaches it at:
+:HOST, :SRFLX, :RELAY, or :PRFLX when it matches none of them (a peer-reflexive address — the
+peer is reaching us from a mapping it never advertised, which is normal behind a NAT)."
+  (let ((addr (%peer-form-address agent peer-form)))
+    (when addr
+      (let ((c (find-if (lambda (c) (and (equal (ice-candidate-ip c) (car addr))
+                                         (eql (ice-candidate-port c) (cdr addr))))
+                        (ice-agent-remote-candidates agent))))
+        (if (null c)
+            :prflx
+            (let ((ty (ice-candidate-type c)))
+              (cond ((equal ty "host") :host)
+                    ((equal ty "srflx") :srflx)
+                    ((equal ty "relay") :relay)
+                    (t :other))))))))
+
+(defun ice-local-end-type (&optional peer-form)
+  "Our end of the selected pair: :RELAY when we answer through the TURN allocation, :DIRECT when
+we answer straight off our own socket.  It is deliberately not split into host-vs-srflx: the two
+are the SAME socket here, and which of the two addresses the peer used to find it is not something
+the receiving end can observe.  Claiming otherwise would be inventing a distinction."
+  (when peer-form
+    (if (member (first peer-form) '(:relay :relay-send)) :relay :direct)))
+
+(defun ice-route-label (agent &optional (peer-form (ice-agent-peer agent)))
+  "The selected pair as \"local/remote\" by type — \"relay/relay\", \"direct/srflx\", … — or NIL
+if no peer was ever selected.  This is the GROUP-BY KEY for route statistics: it is a small closed
+set of strings, so counting outcomes per route is a tally over sessions and not an investigation."
+  (let ((local (ice-local-end-type peer-form)))
+    (when local
+      (format nil "~(~a~)/~(~a~)" local (or (ice-remote-end-type agent peer-form) :unknown)))))
 
 (defparameter *stun-servers*
   (let ((env (uiop:getenv "STUN_SERVER")))     ; "host:port" — overrides for a local/test STUN
@@ -272,7 +392,7 @@ low-overhead ChannelData framing automatically.  Idempotent per peer transport a
             (rport (if reflect (cdr reflect) 0)))
         (cond
           ((eql type +binding-request+)
-           (setf (ice-agent-peer agent) peer-form)
+           (ice-note-peer agent peer-form)
            (tdbg "binding-request -> respond via ~a" peer-form)
            (ice-send agent
                      (encode-stun +binding-success+ tid
@@ -280,7 +400,7 @@ low-overhead ChannelData framing automatically.  Idempotent per peer transport a
                                   :integrity-key (ice-agent-local-pwd agent) :fingerprint t)
                      (first peer-form) (second peer-form)))
           ((eql type +binding-success+)
-           (unless (ice-agent-peer agent) (setf (ice-agent-peer agent) peer-form))))))))
+           (unless (ice-agent-peer agent) (ice-note-peer agent peer-form))))))))
 
 (defun ice-start-checks (agent &key (interval 0.2) (duration 15.0) (priority 1845494015))
   "Full-agent behaviour layered on the ICE-lite responder: periodically send STUN connectivity
@@ -386,7 +506,7 @@ is answered THROUGH the relay (and marks the peer relay-selected); anything else
         (error (e) (tdbg "handle-stun ERROR: ~a" e)))
       (progn
         ;; relayed DTLS/SCTP: make sure the DTLS send-fn returns through this channel
-        (setf (ice-agent-peer agent) (list :relay chan))
+        (ice-note-peer agent (list :relay chan))
         (%deliver-packet agent inner :relay chan))))
 
 (defun ice-relayed-inner-send (agent inner peer-host peer-port)
@@ -396,7 +516,7 @@ PEER-HOST is a 4-octet vector.  Replies ride Send indications until a channel bi
     (if (and (>= (length inner) 20) (= (rd-u32be inner 4) +stun-magic+))
         (ice-handle-stun agent inner :relay-send tgt)
         (progn
-          (setf (ice-agent-peer agent) (list :relay-send tgt))
+          (ice-note-peer agent (list :relay-send tgt))
           (%deliver-packet agent inner :relay-send tgt)))))
 
 (defun ice-serve (agent)
