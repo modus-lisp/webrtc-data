@@ -39,8 +39,9 @@ BUILD.mkdir(parents=True, exist_ok=True)
 
 ESB = shutil.which("esbuild")
 if not ESB:
-    for c in _glob.glob("/home/claude/.npm/_npx/*/node_modules/esbuild/bin/esbuild") + \
-             _glob.glob("/home/claude/.npm/_npx/*/node_modules/@esbuild/linux-x64/bin/esbuild"):
+    npx = os.path.expanduser("~/.npm/_npx")
+    for c in _glob.glob(npx + "/*/node_modules/esbuild/bin/esbuild") + \
+             _glob.glob(npx + "/*/node_modules/@esbuild/linux-x64/bin/esbuild"):
         if pathlib.Path(c).is_file():
             ESB = c
             break

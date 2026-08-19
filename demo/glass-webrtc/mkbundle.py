@@ -21,8 +21,9 @@ js = js.replace('https://esm.sh/nostr-tools@2.15.0/', 'nostr-tools/')
 import shutil, glob as _glob
 ESB = shutil.which("esbuild")
 if not ESB:
-    for c in _glob.glob("/home/claude/.npm/_npx/*/node_modules/esbuild/bin/esbuild") + \
-             _glob.glob("/home/claude/.npm/_npx/*/node_modules/@esbuild/linux-x64/bin/esbuild"):
+    npx = os.path.expanduser("~/.npm/_npx")
+    for c in _glob.glob(npx + "/*/node_modules/esbuild/bin/esbuild") + \
+             _glob.glob(npx + "/*/node_modules/@esbuild/linux-x64/bin/esbuild"):
         if pathlib.Path(c).is_file(): ESB = c; break
 r = subprocess.run([ESB, str(BUILD/"entry.mjs"),
                     "--bundle", "--format=esm", "--minify", "--platform=browser",
