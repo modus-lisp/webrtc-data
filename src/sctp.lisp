@@ -300,8 +300,9 @@ producer (e.g. the glass pump) down to what the peer can absorb."
       (sleep 0.002))))                        ; queue full: wait for a SACK to drain it
 
 (defun sctp-send-string (assoc stream-id string)
-  "Send STRING as a WebRTC string message (PPID 51) on STREAM-ID."
-  (let ((bytes (ascii string)))
+  "Send STRING as a WebRTC string message (PPID 51) on STREAM-ID.  UTF-8, not ASCII:
+PPID-51 is UTF-8 by spec, and warp frames now carry chat text (em-dashes, emoji, …)."
+  (let ((bytes (utf8 string)))
     (if (zerop (length bytes))
         (sctp-send-data assoc stream-id +ppid-string-empty+ #(0))  ; empty needs 1 byte
         (sctp-send-data assoc stream-id +ppid-string+ bytes))))
@@ -528,7 +529,9 @@ stateful (one association) so the cookie is an opaque blob the peer just echoes 
     ((= ppid +ppid-dcep+) (sctp-handle-dcep assoc stream-id user))
     ((or (= ppid +ppid-string+) (= ppid +ppid-string-empty+))
      (when (sctp-assoc-on-message assoc)
-       (funcall (sctp-assoc-on-message assoc) assoc stream-id (bytes->ascii user))))
+       ;; UTF-8, mirroring SCTP-SEND-STRING: ASCII decodes identically, so this only
+       ;; changes behaviour for a byte > 127 — e.g. an em-dash the operator typed at the chat.
+       (funcall (sctp-assoc-on-message assoc) assoc stream-id (utf8->string user))))
     ((or (= ppid +ppid-binary+) (= ppid +ppid-binary-empty+))
      (when (sctp-assoc-on-message assoc)
        (funcall (sctp-assoc-on-message assoc) assoc stream-id user)))))
