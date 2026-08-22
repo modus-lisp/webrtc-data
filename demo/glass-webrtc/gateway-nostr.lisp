@@ -854,6 +854,20 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
         (when (> (hash-table-count *seen-wraps*) 4096) (clrhash *seen-wraps*))
         (setf (gethash id *seen-wraps*) t)))))
 
+(defun %private-ip-p (ip)
+  "RFC 1918 / link-local / CGNAT — an address only reachable from the same side of
+   a NAT as whoever offered it."
+  (flet ((second-octet (start)
+           (ignore-errors (parse-integer ip :start start :end (position #\. ip :start start)))))
+    (and (stringp ip)
+         (or (eql 0 (search "10." ip))
+             (eql 0 (search "192.168." ip))
+             (eql 0 (search "169.254." ip))
+             (let ((n (and (eql 0 (search "172." ip)) (second-octet 4))))
+               (and n (<= 16 n 31)))
+             (let ((n (and (eql 0 (search "100." ip)) (second-octet 4))))
+               (and n (<= 64 n 127)))))))
+
 (defun process-offer (offer-sdp &key pub (at 0))
   "Parse an SDP OFFER, run the answerer (srflx + full-agent checks for off-LAN), spawn the
    glass-bridged session, and return the ANSWER SDP.  PUB is the offering terminal, whose previous
@@ -906,6 +920,52 @@ Closes AGENT on exit so its TURN allocation is released (not leaked for ~600s)."
             (ice-agent-srflx-ip agent) (ice-agent-srflx-port agent)
             (ice-agent-relay-ip agent) (ice-agent-relay-port agent)
             (length (ice-agent-remote-candidates agent)))
+    ;; A COUNT of peer candidates says nothing about whether any is reachable, so
+    ;; "ice failed" has no next question.  What decides it is whether the peer
+    ;; offered an address on OUR network: if it did, a host pair should work and
+    ;; the fault is local; if every candidate is public, the phone is elsewhere
+    ;; and only a relay will ever pair.  Say which.
+    (let* ((cands (ice-agent-remote-candidates agent))
+           (ips (remove-duplicates (mapcar #'ice-candidate-ip cands) :test #'equal))
+           (ours (ice-agent-local-ip agent))
+           (prefix (and (stringp ours)
+                        (let ((d (position #\. ours :from-end t)))
+                          (and d (subseq ours 0 (1+ d))))))
+           (same-net (and prefix (remove-if-not (lambda (ip) (eql 0 (search prefix ip))) ips)))
+           (mdns (remove-if-not (lambda (ip) (search ".local" ip)) ips))
+           (private (remove-if-not #'%private-ip-p ips))
+           (public (set-difference (remove-if #'%private-ip-p ips) mdns :test #'equal)))
+      (format t "@@ peer: ~d addresses — ~d private, ~d public~@[, ~d mDNS~]~
+                 ~@[; on our /24: ~{~a~^ ~}~]~%"
+              (length ips) (length private) (length public)
+              (and mdns (length mdns)) same-net)
+      (unless same-net
+        (format t "@@ peer: nothing on ~a0/24 — no host pair is possible; this needs a relay~%"
+                (or prefix "our network")))
+      ;; An mDNS name is not an address: browsers replace host candidates with
+      ;; random .local hostnames for privacy, and they resolve only by multicast
+      ;; DNS on the peer's own link.  They are counted apart from "public" because
+      ;; we cannot dial one, and TURN cannot be given a permission for one: that is
+      ;; how an allocated relay still pairs with nothing.
+      (when mdns
+        (format t "@@ peer: ~d mDNS .local names — unresolvable here, and TURN cannot~%~
+                   @@ peer: hold a permission for a name, so those cannot pair~%"
+                (length mdns)))
+      (when public
+        (format t "@@ peer: routable ~{~a~^ ~}~%"
+                (subseq public 0 (min 4 (length public)))))
+      ;; The candidate TYPES are what say whether the phone gathered at all: only
+      ;; host means its own STUN/TURN never answered (or the offer was sent before
+      ;; gathering finished), and no amount of relay on our side fixes that.
+      (let ((types (make-hash-table :test 'equal)))
+        (dolist (c cands)
+          (incf (gethash (or (ice-candidate-type c) "?") types 0)))
+        (format t "@@ peer: types~{ ~a~}~%"
+                (let (acc) (maphash (lambda (k v) (push (format nil "~a=~d" k v) acc)) types) acc))
+        (unless (or (gethash "srflx" types) (gethash "relay" types))
+          (format t "@@ peer: no srflx and no relay from the phone — it gathered only host~%~
+                     @@ peer: candidates, so nothing it offered is reachable from here~%")))
+      (finish-output))
     (ice-serve agent)
     (ice-start-checks agent)                                    ; punch our NAT toward the phone
     (setf *video-pt*                                            ; VP8 pt from the offer, if it wants video
