@@ -9,8 +9,27 @@
 ;;;; hosting nsite with NSITE_NPUB, the relays with NOSTR_RELAYS.
 
 (require :asdf)
+;; WHERE QUICKLISP IS.  ~/quicklisp is one machine's answer, not the answer: in a
+;; container image it is /opt/quicklisp, system-wide, because the desktop runs as a
+;; user who does not own a home directory worth installing into.  Hardcoding the home
+;; path means this script -- the one that MINTS the credential you need to get in --
+;; is the one that cannot run on the box it mints for.  QUICKLISP_SETUP overrides;
+;; otherwise try the system location, then the user's.  Already loaded (running from a
+;; saved core) means there is nothing to do at all.
 (let ((here (or *load-pathname* *default-pathname-defaults*)))
-  (load (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))
+  (unless (find-package :quicklisp)
+    (let ((setup (find-if #'probe-file
+                          (remove nil
+                                  (list (let ((e (uiop:getenv "QUICKLISP_SETUP")))
+                                          (and e (pathname e)))
+                                        #p"/opt/quicklisp/setup.lisp"
+                                        (merge-pathnames "quicklisp/setup.lisp"
+                                                         (user-homedir-pathname)))))))
+      (unless setup
+        (format *error-output* "~&login-link: no Quicklisp (tried QUICKLISP_SETUP, ~
+                                /opt/quicklisp, ~~/quicklisp).~%")
+        (sb-ext:exit :code 1))
+      (load setup)))
   (handler-bind ((warning #'muffle-warning))
     (let ((*standard-output* (make-broadcast-stream)))
       (funcall (read-from-string "ql:quickload") '(:cl-nostr :ironclad))))
