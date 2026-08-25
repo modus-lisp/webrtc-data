@@ -334,6 +334,15 @@ export async function init(api) {
     // payload does is hand it to noVNC, which rides an RTCDataChannel as its transport directly.
 
     const rfb = new RFB(document.getElementById('screen'), ch, {});
+    // ASK THE DESKTOP TO BE THIS SIZE, rather than only scaling a picture of one.  noVNC
+    // sends SetDesktopSize when the container resizes, glass turns that into a resize of
+    // THIS SEAT's screen, and the desktop becomes the shape of the window looking at it —
+    // which on a phone is the difference between a letterboxed 1280x800 and a desktop.
+    //
+    // scaleViewport stays on with it: the server may refuse, or take a moment, and until
+    // it answers the picture still has to fit.  They are not alternatives — one asks, the
+    // other copes.
+    rfb.resizeSession = true;
     rfb.scaleViewport = true;
     rfb.focusOnClick = true;
     rfb.showDotCursor = true;      // desktop: draw a dot when the remote cursor is empty, so a
