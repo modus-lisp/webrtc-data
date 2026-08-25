@@ -1421,6 +1421,21 @@ if (typeof window !== "undefined") window.makeWarpClient = makeWarpClient;
     const vv = window.visualViewport;
     if (vv) {
       const screenEl = document.getElementById('screen');
+      // The controls are position:fixed over the BOTTOM of #screen.  That was invisible while
+      // the desktop was letterboxed — the strip sat on empty black — and became a problem the
+      // moment the desktop started taking the shape of #screen: the bottom of the actual
+      // desktop went under the buttons, taking the session's name in the corner with it.
+      //
+      // Measured, not assumed: the buttons move when the keyboard opens, and a constant here
+      // would be wrong in exactly the state somebody is looking at it.
+      const chromeTop = () => {
+        let t = window.innerHeight;
+        document.querySelectorAll('.gbtn, #mods').forEach(el => {
+          const r = el.getBoundingClientRect();
+          if (r.height > 0 && r.top > 0) t = Math.min(t, r.top);
+        });
+        return t;
+      };
       const fitViewport = () => {
         const lift = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
         const up = lift > 120;                                   // keyboard (not just a rotation)
@@ -1429,6 +1444,13 @@ if (typeof window !== "undefined") window.makeWarpClient = makeWarpClient;
         // the keyboard exactly when it is wanted.  Lift it to sit ON TOP of the keyboard instead,
         // where an accessory row belongs; at rest it drops back above the button row.
         document.documentElement.style.setProperty('--mods-bottom', (up ? lift + 10 : 78) + 'px');
+        // ...then measure, because the line above is what moved them.  Two frames: the style
+        // has to land before getBoundingClientRect means anything.
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          const avail = up ? vv.height : window.innerHeight;
+          const h = Math.max(200, Math.min(avail, chromeTop()) - 2);
+          screenEl.style.height = h + 'px';
+        }));
       };
       vv.addEventListener('resize', fitViewport);
       vv.addEventListener('scroll', fitViewport);

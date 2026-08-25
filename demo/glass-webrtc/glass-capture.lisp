@@ -32,6 +32,9 @@
 (defun %be32 (b i) (let ((v 0)) (dotimes (k 4 v) (setf v (logior (ash v 8) (aref b (+ i k)))))))
 (defun %s32 (v) (if (>= v #x80000000) (- v #x100000000) v))   ; encodings are SIGNED
 (defconstant +rfb-last-rect+ -224)                            ; "no more rects in this update"
+(defconstant +rfb-desktop-size+ -223
+  "DesktopSize pseudo-encoding: the rect header carries the new framebuffer size and no
+   pixels.  Asked for since seats became resizable — see the SetEncodings note below.")
 
 (defun capture-connect (host port)
   "RFB handshake with glass; returns a CAPTURE with allocated planes (native 32bpp, Raw).
@@ -60,10 +63,18 @@ stops being reachable over a port: the capture feeds the only picture the viewer
         ;; native 32bpp BGRX, Raw only
         (write-sequence (concatenate '(vector (unsigned-byte 8))
                                      (vector 0 0 0 0 32 24 0 1 0 255 0 255 0 255 16 8 0 0 0 0)) s)
-        ;; SetEncodings: CopyRect (1) then Raw (0).  glass emits CopyRect when a window MOVES,
+        ;; SetEncodings: CopyRect (1), Raw (0), DesktopSize (-223).  glass emits CopyRect when a window MOVES,
         ;; which costs 4 bytes on the wire instead of repainting the region.
+        ;;
+        ;; DESKTOP-SIZE IS NOT OPTIONAL NOW THAT SEATS RESIZE.  A client that has not
+        ;; asked for it cannot be TOLD the framebuffer changed shape — there is no
+        ;; message for that — so it goes on decoding with the old geometry and walks
+        ;; off the end of the stream.  Not theoretical: it surfaced as "unknown server
+        ;; message 101", which is misread pixel data being taken for a message type.
+        ;; Asking for it turns a desync into an announcement.
         (write-sequence (concatenate '(vector (unsigned-byte 8))
-                                     (vector 2 0 0 2  0 0 0 1  0 0 0 0)) s)
+                                     (vector 2 0 0 3  0 0 0 1  0 0 0 0
+                                             #xFF #xFF #xFF #x21)) s)
         (finish-output s)
         (let* ((cw (ceiling w 2)) (ch (ceiling h 2))
                (mc (ceiling w 16)) (mr (ceiling h 16))
@@ -185,6 +196,13 @@ active desktop), and on generic arithmetic it was costing ~14% of wall-clock."
                        ((= e 1) (let ((cp (%rd s 4)))
                                   (push (list :copy rx ry rw rh (%be16 cp 0) (%be16 cp 2)) rects)))
                        ((= e +rfb-last-rect+) (return))       ; carries no data; update ends here
+                       ;; DesktopSize: the rect header IS the new size and carries no pixels.
+                       ;; Reconnecting is how this capture adopts a geometry (%CAPTURE-RECONNECT
+                       ;; re-handshakes and re-plans the planes), so say so and let the supervisor
+                       ;; do it — deliberately, rather than discovering it by decoding rubbish a
+                       ;; moment later.
+                       ((= e +rfb-desktop-size+)
+                        (error "capture: desktop resized to ~dx~d — reconnecting" rw rh))
                        ;; An encoding we did not ask for means we can no longer know how many
                        ;; bytes it occupies, so the stream is unparseable from here.  Signal, and
                        ;; let the supervisor reconnect — one strange rect must not end the video.
