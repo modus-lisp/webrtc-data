@@ -174,9 +174,14 @@ is a convention that drifts."
 ;; already crashloops rather than serve as nobody, and it is visible in one line at startup.
 
 (defparameter *admission-port* (or (ignore-errors (parse-integer (uiop:getenv "GLASS_ADMISSION_PORT")))
-                                   5915)
+                                   (+ *glass-port* 12))
   "Where the desktop answers admission questions.  Beside the screen by the same convention the
-audio ports follow: 5903 -> 5913 mix out, 5914 microphone in, 5915 who may open any of it.")
+audio ports follow: 5903 -> 5913 mix out, 5914 microphone in, 5915 who may open any of it.
+
+DERIVED, because the convention is arithmetic and a constant is only the convention's answer for
+one display.  It read 5915 — right for display 3, and off by two for the display 1 that everything
+actually runs on, so on a PORT-mounted screen this asked the wrong door and admission looked
+unreachable.  The socket path never had the bug: SOCKET-SIBLING derives from the screen's name.")
 (defparameter *admission-host* (glass-endpoint "GLASS_ADMISSION_HOST" "admit" *admission-port*)
   "...and on which host, or in which socket file.  A socket file is worth most HERE: this is the
 question `may this person open the desktop', and on a loopback port the qualification to ask it —
@@ -436,12 +441,14 @@ ALIVE-P sees the agent stopped and unwinds, which is what releases the TURN allo
 ;; not running audio costs a quiet stream and nothing else.
 
 (defparameter *audio-port*
-  (or (ignore-errors (parse-integer (uiop:getenv "GLASS_AUDIO_PORT"))) 5913)
-  "Where the glass desktop serves its mix.  Beside the VNC port by convention (5903 -> 5913).")
+  (or (ignore-errors (parse-integer (uiop:getenv "GLASS_AUDIO_PORT"))) (+ *glass-port* 10))
+  "Where the glass desktop serves its mix.  Beside the VNC port by convention (5903 -> 5913) —
+computed from the screen's port rather than written down, since a written-down convention is the
+one display it was written for.  5913 was display 3's answer, and the desktop is on display 1.")
 (defparameter *audio-host* (glass-endpoint "GLASS_AUDIO_HOST" "audio" *audio-port*)
   "...and on which host, or in which socket file — see GLASS-ENDPOINT.")
 (defparameter *mic-port*
-  (or (ignore-errors (parse-integer (uiop:getenv "GLASS_MIC_PORT"))) 5914)
+  (or (ignore-errors (parse-integer (uiop:getenv "GLASS_MIC_PORT"))) (+ *glass-port* 11))
   "Where the glass desktop takes a peer's MICROPHONE — the other direction, one port past the mix.
 
 The phone's audio has been decoded on the receive path since webrtc-media grew :ON-RX-PCM, and

@@ -59,6 +59,17 @@ export async function init(api) {
   const vidEl    = api.video.el;
   const videoPrimary = api.video.primary;
   const syncVideo = api.video.sync;
+  // THE PICTURE CAN CHANGE SHAPE WITHOUT THE WINDOW MOVING.  A VP8 stream changes
+  // resolution mid-flight now, because the desktop resizes itself to the window looking
+  // at it, and the browser reports that by firing `resize` ON THE VIDEO ELEMENT.  The
+  // shell's geometry only listened to the WINDOW, so it went on letterboxing a 393x563
+  // desktop as though it were still 1280x800 — full width and a third of the height.
+  //
+  // Also here, and not only in the shell, because of where each one lives: the shell is
+  // baked into the published nsite page, the payload is served by the box.  A fix in the
+  // shell alone needs a republish before anybody sees it.
+  vidEl.addEventListener('resize', syncVideo);
+  vidEl.addEventListener('loadedmetadata', syncVideo);
   const tStart   = performance.now() - api.stamp();   // the SHELL's clock, so the log is one timeline
   const log      = (...a) => console.log('[glass-payload]', ...a);
 
@@ -344,6 +355,33 @@ export async function init(api) {
     // other copes.
     rfb.resizeSession = true;
     rfb.scaleViewport = true;
+
+    // ASK FOR THE DISPLAY'S PIXELS, NOT THE LAYOUT'S.  noVNC computes its resize request
+    // in CSS pixels, so on a 3x phone it asks for a 393x563 desktop and the compositor
+    // then blows it up — a desktop the size of a large phone screen, drawn soft.  What we
+    // want is the panel's real resolution: ask for CSS x DPR and let scaleViewport map it
+    // back down, which is exactly what a Retina display does with everything else.
+    //
+    // Wrapped around the REQUEST only, and restored afterwards: _screenSize also feeds
+    // noVNC's clipping and canvas fitting, and scaling those would move the picture out
+    // from under the touches.
+    //
+    // Capped, because this squares: 4x the pixels is 4x the macroblocks to encode and
+    // send, and a phone on a slow link would rather have a sharp 2x than a stalled 3x.
+    const dpr = Math.max(1, Math.min(2, Math.round(window.devicePixelRatio || 1)));
+    if (dpr > 1 && typeof rfb._requestRemoteResize === 'function'
+        && typeof rfb._screenSize === 'function') {
+      const trueSize = rfb._screenSize.bind(rfb);
+      const request  = rfb._requestRemoteResize.bind(rfb);
+      rfb._requestRemoteResize = () => {
+        rfb._screenSize = () => {
+          const s = trueSize();
+          return { w: Math.round(s.w * dpr), h: Math.round(s.h * dpr) };
+        };
+        try { request(); } finally { rfb._screenSize = trueSize; }
+      };
+      log('resize: asking for', dpr + 'x CSS pixels');
+    }
     rfb.focusOnClick = true;
     rfb.showDotCursor = true;      // desktop: draw a dot when the remote cursor is empty, so a
                                    // mouse user is never left with no pointer at all

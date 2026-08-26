@@ -289,6 +289,17 @@ const syncVideoNow = () => { syncPending = false; (geometryOwner || shellGeometr
 const syncVideo = () => { if (!syncPending) { syncPending = true; requestAnimationFrame(syncVideoNow); } };
 window.__syncVideo = syncVideo;
 window.addEventListener('resize', syncVideo);
+// AND WHEN THE PICTURE CHANGES SHAPE, which is not the same event.  A VP8 stream can
+// change resolution mid-flight — it does now, because the desktop resizes itself to the
+// window looking at it — and the browser reports that by firing `resize` ON THE VIDEO
+// ELEMENT, updating videoWidth/videoHeight.  The window has not moved, so the listener
+// above never runs, and the geometry stays computed for the old intrinsic size: a
+// 393x563 desktop letterboxed as though it were still 1280x800, which is full width and
+// a third of the height.
+vidEl.addEventListener('resize', syncVideo);
+// loadedmetadata for the same reason at the other end: the first frame of a stream whose
+// size we have never seen.
+vidEl.addEventListener('loadedmetadata', syncVideo);
 window.addEventListener('orientationchange', syncVideo);
 // iOS Safari will occasionally keep a video layer whose box was set imperatively out of the next
 // composite; a property change on the element forces it back in.  Opacity is the one to poke
