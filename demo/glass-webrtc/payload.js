@@ -1483,14 +1483,20 @@ if (typeof window !== "undefined") window.makeWarpClient = makeWarpClient;
       //
       // Measured, not assumed: the buttons move when the keyboard opens, and a constant here
       // would be wrong in exactly the state somebody is looking at it.
-      const chromeTop = () => {
-        let t = window.innerHeight;
-        document.querySelectorAll('.gbtn, #mods').forEach(el => {
-          const r = el.getBoundingClientRect();
-          if (r.height > 0 && r.top > 0) t = Math.min(t, r.top);
-        });
-        return t;
-      };
+      // THE DESKTOP'S SIZE MUST NOT DEPEND ON WHERE OUR OWN BUTTONS ARE.  This used to
+      // measure the topmost control and stop the desktop above it, which is what made
+      // resizing wonky in every direction at once: the modifier row moves when the
+      // keyboard opens, so the desktop resized to follow furniture; the measurement
+      // happened two frames later, so an old one could land after a new one and leave the
+      // desktop the size of the space above a keyboard that was gone; and the desktop was
+      // permanently ~120px shorter than the screen to reserve room for buttons that are
+      // fixed, translucent and drawn OVER it anyway.
+      //
+      // 100svh is the small viewport — the height with the browser's bars SHOWN.  It is
+      // the largest height that is always fully visible, and unlike 100vh/dvh it does not
+      // change when those bars collapse on scroll, so the desktop holds still.  No
+      // measuring pass, nothing to race, and the controls float on top where they were
+      // always going to be.
       const fitViewport = () => {
         const lift = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
         const up = lift > 120;                                   // keyboard (not just a rotation)
@@ -1511,11 +1517,11 @@ if (typeof window !== "undefined") window.makeWarpClient = makeWarpClient;
         document.documentElement.style.setProperty('--mods-bottom', (up ? lift + 10 : 78) + 'px');
         // ...then measure, because the line above is what moved them.  Two frames: the style
         // has to land before getBoundingClientRect means anything.
-        requestAnimationFrame(() => requestAnimationFrame(() => {
-          const avail = up ? vv.height : window.innerHeight;
-          const h = Math.max(200, Math.min(avail, chromeTop()) - 2);
-          screenEl.style.height = h + 'px';
-        }));
+        // Keyboard up: sit in the space above it, and (see above) DON'T ask the desktop to
+        // become that shape — the picture just scales into what is left.  Keyboard down:
+        // the whole visible viewport, which is also the size the desktop already is, so
+        // the request that follows is a no-op rather than a rebuild.
+        screenEl.style.height = up ? vv.height + 'px' : '100svh';
       };
       vv.addEventListener('resize', fitViewport);
       vv.addEventListener('scroll', fitViewport);
