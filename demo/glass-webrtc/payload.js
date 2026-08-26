@@ -70,6 +70,23 @@ export async function init(api) {
   // shell alone needs a republish before anybody sees it.
   vidEl.addEventListener('resize', syncVideo);
   vidEl.addEventListener('loadedmetadata', syncVideo);
+  // ...AND WATCH THE DIMENSIONS DIRECTLY, because that event is not dependable.  A VP8
+  // stream changing resolution mid-flight is supposed to fire `resize` on the element;
+  // Safari does not do it reliably, which showed up as a desktop that only took its new
+  // shape after a page reload — a reload builds the element afresh, so it never had to
+  // notice a change.
+  //
+  // Half a second and two integer compares.  The geometry is idempotent and rAF-coalesced
+  // (syncVideo), so a spurious call costs nothing and a missed change costs the shape.
+  let lastVW = 0, lastVH = 0;
+  setInterval(() => {
+    const w = vidEl.videoWidth, h = vidEl.videoHeight;
+    if (w && h && (w !== lastVW || h !== lastVH)) {
+      lastVW = w; lastVH = h;
+      log('video is now', w + 'x' + h);
+      syncVideo();
+    }
+  }, 500);
   const tStart   = performance.now() - api.stamp();   // the SHELL's clock, so the log is one timeline
   const log      = (...a) => console.log('[glass-payload]', ...a);
 
@@ -1477,6 +1494,16 @@ if (typeof window !== "undefined") window.makeWarpClient = makeWarpClient;
       const fitViewport = () => {
         const lift = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
         const up = lift > 120;                                   // keyboard (not just a rotation)
+        // THE KEYBOARD MUST NOT RESIZE THE DESKTOP.  Shrinking #screen to sit above it is
+        // right — the picture should stay visible — but noVNC answers any container
+        // change by asking the desktop to become that size, and fb-resize CLEARS the
+        // framebuffer.  So opening the keyboard to type rebuilt the desktop underneath
+        // the typing, which is exactly when it is least welcome.
+        //
+        // The desktop's size should follow the LAYOUT viewport, which the keyboard does
+        // not move.  Suppress the request while it is up, restore on the way down, and
+        // let scaleViewport fit the unchanged desktop into the smaller space.
+        if (typeof rfb !== 'undefined' && rfb) rfb.resizeSession = !up;
         screenEl.style.height = up ? vv.height + 'px' : '100vh';
         // iOS pins position:fixed to the LAYOUT viewport, so the modifier row would slide UNDER
         // the keyboard exactly when it is wanted.  Lift it to sit ON TOP of the keyboard instead,
