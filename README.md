@@ -72,7 +72,7 @@ peer-death detection.
 
 - **Loss resilience** — with `*sctp-drop-rate*` set to 0.15 (15 % of outbound packets dropped),
   the glass desktop still renders **completely**; retransmission recovers. The prior "blast and
-  hope" version wedged to a blank screen under the same loss. `demo/glass-webrtc/netsim/`
+  hope" version wedged to a blank screen under the same loss. `netsim/` in [glass-webrtc](https://github.com/modus-lisp/glass-webrtc)
   conditions the link (netem loss/delay/reorder/rate) to reproduce this on demand.
 - **Handshake under loss** — the DTLS flight layer coalesces and backs off exponentially, so an
   *awful* link (15 % loss + reorder) that never completed a handshake before now connects.
@@ -124,13 +124,17 @@ through `cl-transport:expose`.
 (ql:quickload "webrtc-data")
 ```
 
-Run the remote-desktop demo (`demo/glass-webrtc/`):
+Run the remote desktop — now its own repository,
+[glass-webrtc](https://github.com/modus-lisp/glass-webrtc). It lived here as
+`demo/glass-webrtc/` and grew into 124 of this repo's 147 commits, which is not a demo;
+it is the way a browser reaches a glass desktop, and it is versioned on its own now.
 
 1. Start a glass RFB server on :5900 — e.g. `(glass-term:run :port 5900)`.
-2. `sbcl --load demo/glass-webrtc/gateway.lisp` (hunchentoot serves the page + one `POST /signal`;
-   noVNC is vendored under `demo/glass-webrtc/novnc/`, or point `NOVNC_DIR` at your own 1.7+ checkout).
+2. `(asdf:load-system "glass-webrtc")` then `(webrtc-data::start-gateway)` — hunchentoot
+   serves the page plus one `POST /signal`; noVNC is vendored in that repo, or point
+   `NOVNC_DIR` at your own 1.7+ checkout.
 3. Open `http://<host>:8765/` in any browser. noVNC rides the data channel directly —
-   `new RFB(el, dataChannel)`, no shim. See `demo/glass-webrtc/README.md`.
+   `new RFB(el, dataChannel)`, no shim.
 
 For traversal across NATs, set `GATHER_SRFLX=1` (and `TURN_SERVER/USER/PASS` for symmetric NAT)
 in the gateway's environment.
