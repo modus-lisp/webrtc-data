@@ -447,6 +447,20 @@ uses.  For outbound SRTP.  Returns NIL if no peer is selected yet."
   (let ((p (ice-agent-peer agent)))
     (when p (ice-send agent bytes (first p) (second p)))))
 
+(defun %note-peer-alive (agent)
+  "The peer just sent something.  Called ONLY from the branches of ICE-DISPATCH that carry peer
+traffic — never from the TURN control path.
+
+Stamping at the socket instead, which is what this did first, counts our own allocation bookkeeping
+as evidence the far end is alive: TURN Refresh goes out every few minutes and coturn answers on the
+same socket, so a phone that vanished still looked present forever.  The consent teardown could then
+never fire, and every abandoned session kept its threads.  One gateway log reached 7.7 million lines
+of stats from sessions whose peers were long gone.
+
+Relayed peer data ALSO arrives from the TURN server's address, so the source address cannot be the
+discriminator; what the datagram IS has to be."
+  (setf (ice-agent-last-rx agent) (get-internal-real-time)))
+
 (defun ice-dispatch (agent buf len host port)
   "Classify one received datagram (BUF[0:LEN] from HOST:PORT) and route it.
 
@@ -465,6 +479,7 @@ uses.  For outbound SRTP.  Returns NIL if no peer is selected yet."
       ((and alloc (%from-turn-server-p alloc host port))
        (cond
          ((turn-channeldata-p buf len)
+          (%note-peer-alive agent)                    ; relayed peer data
           (let* ((chan (logior (ash (aref buf 0) 8) (aref buf 1)))
                  (dlen (logior (ash (aref buf 2) 8) (aref buf 3)))
                  (inner (subseq buf 4 (min len (+ 4 dlen)))))
@@ -473,6 +488,7 @@ uses.  For outbound SRTP.  Returns NIL if no peer is selected yet."
           (multiple-value-bind (type tid attrs) (decode-stun (subseq buf 0 len))
             (cond
               ((eql type +turn-data-indication+)
+               (%note-peer-alive agent)               ; relayed peer data
                ;; Data indication: DATA came from a permitted peer we have no channel for yet.
                ;; Deliver it now (reply via Send indication) and start a channel bind in the
                ;; background so subsequent traffic rides ChannelData.
@@ -486,6 +502,7 @@ uses.  For outbound SRTP.  Returns NIL if no peer is selected yet."
               (type (turn-deliver-control alloc tid type attrs)))))))
       ;; --- ordinary direct datagram -----------------------------------------------------
       (t
+       (%note-peer-alive agent)                       ; direct peer traffic, or its consent check
        (let ((pkt (subseq buf 0 len)))
          (if (and (>= len 20) (= (rd-u32be pkt 4) +stun-magic+))
              (ice-handle-stun agent pkt host port)
@@ -531,7 +548,6 @@ PEER-HOST is a 4-octet vector.  Replies ride Send indications until a channel bi
                        (sb-bsd-sockets:socket-receive (ice-agent-socket agent) buf nil)
                      (declare (ignore b))
                      (when (and len (plusp len))
-                       (setf (ice-agent-last-rx agent) (get-internal-real-time))
                        (ice-dispatch agent buf len host port)))
                  (error () (unless (ice-agent-stop agent) (sleep 0.005)))))))
          :name "webrtc-data-ice"))
