@@ -20,8 +20,9 @@
   ;;
   ;; IMPORTED, not USEd: what came from where stays greppable, and a name added upstream
   ;; cannot silently shadow one of ours.  The byte helpers are still ours -- util.lisp
-  ;; defines them for dtls and sctp -- except COLON-HEX and HEXBYTES, which came back with
-  ;; ICE and would otherwise be defined twice in one image.
+  ;; defines them for dtls and sctp.  COLON-HEX and HEXBYTES went to cl-transport with ICE
+  ;; and came straight back: ICE-ANSWER was their only caller and it stayed here, so they were
+  ;; dead weight in a transport library and an import for a function nobody else wanted.
   (:import-from #:cl-transport.ice
                 #:*stun-servers* #:*turn-debug* #:+attr-channel-number+ #:+attr-data+
                 #:+attr-error-code+ #:+attr-fingerprint+ #:+attr-ice-controlled+ #:+attr-ice-controlling+
@@ -32,8 +33,8 @@
                 #:+turn-allocate+ #:+turn-allocate-error+ #:+turn-allocate-success+ #:+turn-channel-bind+
                 #:+turn-channel-bind-success+ #:+turn-channel-max+ #:+turn-channel-min+ #:+turn-create-perm+
                 #:+turn-create-perm-success+ #:+turn-data-indication+ #:+turn-refresh+ #:+turn-refresh-success+
-                #:+turn-relay-priority+ #:+turn-send-indication+ #:colon-hex #:crc32
-                #:decode-stun #:encode-stun #:hexbytes #:hmac-sha1
+                #:+turn-relay-priority+ #:+turn-send-indication+ #:crc32
+                #:decode-stun #:encode-stun #:hmac-sha1
                 #:ice-accept-remote #:ice-agent #:ice-agent-check-thread #:ice-agent-created-at
                 #:ice-agent-last-rx #:ice-agent-local-ip #:ice-agent-local-pwd #:ice-agent-local-ufrag
                 #:ice-agent-on-media #:ice-agent-on-packet #:ice-agent-p #:ice-agent-peer
