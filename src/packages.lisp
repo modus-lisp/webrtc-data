@@ -9,6 +9,36 @@
 (defpackage #:webrtc-data
   (:use #:cl)
   (:local-nicknames (#:ic #:ironclad) (#:bt #:bordeaux-threads))
+  ;; ---- STUN and TURN now live in cl-transport ------------------------------------
+  ;; They are the IETF connectivity stack and not WebRTC's: they predate it, SIP uses
+  ;; them, and this library is one CONSUMER.  ice.lisp is the only file here that ever
+  ;; named them -- measured, not assumed -- so the whole cost of the move is this list.
+  ;; IMPORTED rather than package-USEd, so what came from where stays greppable and a
+  ;; name added upstream cannot silently start shadowing one of ours.  The byte helpers
+  ;; are deliberately NOT imported: util.lisp still defines them here for dtls and sctp,
+  ;; and importing would be a name conflict rather than a saving.
+  (:import-from #:cl-transport.ice
+                #:+attr-channel-number+ #:+attr-data+ #:+attr-error-code+ #:+attr-fingerprint+
+                #:+attr-ice-controlled+ #:+attr-ice-controlling+ #:+attr-lifetime+ #:+attr-message-integrity+
+                #:+attr-nonce+ #:+attr-priority+ #:+attr-realm+ #:+attr-requested-transport+
+                #:+attr-software+ #:+attr-use-candidate+ #:+attr-username+ #:+attr-xor-mapped-address+
+                #:+attr-xor-peer-address+ #:+attr-xor-relayed-address+ #:+binding-request+ #:+binding-success+
+                #:+stun-magic+ #:+turn-allocate+ #:+turn-allocate-error+ #:+turn-allocate-success+
+                #:+turn-channel-bind+ #:+turn-channel-bind-success+ #:+turn-channel-max+ #:+turn-channel-min+
+                #:+turn-create-perm+ #:+turn-create-perm-success+ #:+turn-data-indication+ #:+turn-refresh+
+                #:+turn-refresh-success+ #:+turn-send-indication+ #:crc32 #:decode-stun
+                #:encode-stun #:hmac-sha1 #:make-turn-alloc #:parse-xor-mapped-address
+                #:stun-attr #:stun-transaction-id #:stun-username-key #:turn-alloc
+                #:turn-alloc-binding #:turn-alloc-chan->peer #:turn-alloc-key #:turn-alloc-lifetime
+                #:turn-alloc-mapped-ip #:turn-alloc-mapped-port #:turn-alloc-next-channel #:turn-alloc-nonce
+                #:turn-alloc-p #:turn-alloc-pass #:turn-alloc-peer->chan #:turn-alloc-perms
+                #:turn-alloc-realm #:turn-alloc-refresh-thread #:turn-alloc-relay-ip #:turn-alloc-relay-port
+                #:turn-alloc-resp #:turn-alloc-resp-cv #:turn-alloc-resp-lock #:turn-alloc-server-host
+                #:turn-alloc-server-port #:turn-alloc-socket #:turn-alloc-user #:turn-allocate
+                #:turn-channel-bind #:turn-channeldata-p #:turn-create-permission #:turn-deliver-control
+                #:turn-install-peer #:turn-long-term-key #:turn-refresh #:turn-refresh-via-loop
+                #:turn-start-refresh #:turn-wrap-channeldata #:turn-wrap-send-indication #:xor-mapped-address
+                #:%turn-txn-loop #:%from-turn-server-p)
   (:export #:parse-sdp #:make-answer-sdp #:sdp-session
            #:sdp-ice-ufrag #:sdp-ice-pwd #:sdp-fingerprint #:sdp-setup
            #:sdp-candidates #:sdp-sctp-port #:sdp-mid

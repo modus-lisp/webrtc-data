@@ -9,7 +9,7 @@
   :version "0.1.0"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("ironclad" "bordeaux-threads" "sb-bsd-sockets" "seal")
+  :depends-on ("cl-transport/ice" "ironclad" "bordeaux-threads" "sb-bsd-sockets" "seal")
   :serial t
   :components
   ((:module "src"
@@ -18,8 +18,6 @@
     ((:file "packages")
      (:file "util")        ; byte helpers, base64, random
      (:file "sdp")         ; offer parse + answer generation (data-channel m-line)
-     (:file "stun")        ; STUN messages: MESSAGE-INTEGRITY + FINGERPRINT (ICE checks)
-     (:file "turn")        ; TURN client (RFC 5766/8656): relay candidate + ChannelData
      (:file "ice")         ; full ICE agent: UDP socket, host/srflx/relay candidates + own checks
      (:file "dtls")        ; DTLS 1.2 client (via seal) + ECDSA P-256 cert generation
      (:file "sctp")))))    ; SCTP association + DCEP (data channels over DTLS)
