@@ -67,8 +67,9 @@
 (defun rd-u32be (v off) (logior (ash (aref v off) 24) (ash (aref v (1+ off)) 16)
                                 (ash (aref v (+ off 2)) 8) (aref v (+ off 3))))
 
-(defun hexbytes (v) (string-downcase (format nil "~{~2,'0x~}" (coerce v 'list))))
-(defun colon-hex (v) (format nil "~{~2,'0X~^:~}" (coerce v 'list)))   ; AA:BB:CC (for fingerprints)
+;;; HEXBYTES and COLON-HEX moved to cl-transport.ice with ICE, which was their only heavy
+;;; user, and are imported back in packages.lisp.  Defining them here as well would be two
+;;; definitions of one name in one image -- the shape that makes a package conflict at load.
 
 (defun random-bytes (n)
   (handler-case

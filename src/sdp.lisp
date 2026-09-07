@@ -9,7 +9,6 @@
 
 (in-package #:webrtc-data)
 
-(defstruct ice-candidate foundation component transport priority ip port type)
 
 (defstruct (sdp-media (:conc-name sdp-media-))
   type mid (pts '()) (sctp-port 5000) (direction "sendrecv") (rtpmap '()))  ; rtpmap: ((pt . "VP8") ...)
@@ -123,3 +122,32 @@ the DTLS client; LITE advertises ICE-lite.  Audio is answered as G.711 PCMU (pt 
            (format out "m=application ~d UDP/DTLS/SCTP webrtc-datachannel~%c=IN IP4 ~a~%~
                         a=mid:~a~%a=sctp-port:~d~%a=max-message-size:65536~%~a~a"
                    port ip (sdp-media-mid m) (or (sdp-media-sctp-port m) 5000) shared own)))))))
+
+;;; ---- ICE, in SDP terms -----------------------------------------------------------------
+;;; ICE ITSELF NO LONGER KNOWS WHAT SDP IS.  cl-transport/ice takes a ufrag, a password and a
+;;; candidate list (ICE-ACCEPT-REMOTE) and has no opinion about where they were read from —
+;;; which is the whole point of it not being a WebRTC library.  This is the wrapper that speaks
+;;; both, and it belongs HERE, beside the parser, because this file is the only one that ever
+;;; knew both halves.
+;;;
+;;; The name and the arguments are unchanged, deliberately: glass-webrtc calls ICE-ANSWER and
+;;; should not have to care that the agent underneath it moved to another system.
+
+(defun ice-answer (agent remote-sdp &key fingerprint (setup "active") gather-srflx gather-relay)
+  "Record the remote credentials from REMOTE-SDP and return our answer SDP.  With GATHER-SRFLX,
+first discover our server-reflexive (public) address via STUN and include it as a candidate, so a
+peer behind a different NAT can reach us.  With GATHER-RELAY, additionally Allocate a TURN relayed
+address (env TURN_SERVER/USER/PASS unless GATHER-RELAY is a plist of :server/:user/:pass) and
+advertise it as a `typ relay` candidate — this covers the symmetric-NAT case srflx can't.  Both
+must run before ICE-SERVE (they use the ICE socket)."
+  (ice-accept-remote agent
+                     :ufrag (sdp-ice-ufrag remote-sdp)
+                     :pwd (sdp-ice-pwd remote-sdp)
+                     :candidates (sdp-candidates remote-sdp)
+                     :gather-srflx gather-srflx :gather-relay gather-relay)
+  (make-answer-sdp :ice-ufrag (ice-agent-local-ufrag agent) :ice-pwd (ice-agent-local-pwd agent)
+                   :fingerprint (or fingerprint (colon-hex (u8vec 32)))   ; valid-format placeholder until DTLS
+                   :ip (ice-agent-local-ip agent) :port (ice-agent-port agent)
+                   :srflx-ip (ice-agent-srflx-ip agent) :srflx-port (ice-agent-srflx-port agent)
+                   :relay-ip (ice-agent-relay-ip agent) :relay-port (ice-agent-relay-port agent)
+                   :setup setup :media (sdp-media remote-sdp) :lite t))

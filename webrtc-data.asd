@@ -18,7 +18,6 @@
     ((:file "packages")
      (:file "util")        ; byte helpers, base64, random
      (:file "sdp")         ; offer parse + answer generation (data-channel m-line)
-     (:file "ice")         ; full ICE agent: UDP socket, host/srflx/relay candidates + own checks
      (:file "dtls")        ; DTLS 1.2 client (via seal) + ECDSA P-256 cert generation
      (:file "sctp")))))    ; SCTP association + DCEP (data channels over DTLS)
 
