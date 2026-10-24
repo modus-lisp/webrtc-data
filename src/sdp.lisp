@@ -87,6 +87,13 @@ Payload types are dynamic (96-127) and vary per browser/offer, so we must echo b
                          41885439 relay-ip relay-port (or srflx-ip ip) (or srflx-port port)) "")
     (format nil "a=end-of-candidates~%")))
 
+(defvar *answer-video* t
+  "Whether an answer ACCEPTS the offer's video (sendonly VP8) -- NIL answers it inactive.  A box
+that encodes no video must not promise it: a browser handed a sendonly video m-line fires a
+track, the client makes video its primary view, and waits for frames that never come -- the
+desktop arriving over RFB the whole time, behind the placeholder.  glass-webrtc's lean gateway
+(no media stack) sets this NIL.")
+
 (defun make-answer-sdp (&key ice-ufrag ice-pwd fingerprint ip port srflx-ip srflx-port
                              relay-ip relay-port media
                              (setup "active") (foundation "1")
@@ -114,7 +121,7 @@ the DTLS client; LITE advertises ICE-lite.  Audio is answered as G.711 PCMU (pt 
           ((string= (sdp-media-type m) "video")
            ;; VP8 only (we encode it; forcing VP8 also keeps the return direction off H.264).
            ;; sendonly: the box streams video to the browser, it sends none back.
-           (let ((pt (sdp-media-codec-pt m "VP8")))
+           (let ((pt (and *answer-video* (sdp-media-codec-pt m "VP8"))))
              (format out "m=video ~d UDP/TLS/RTP/SAVPF ~d~%c=IN IP4 ~a~%a=rtcp-mux~%a=mid:~a~%~
                           a=~:[inactive~;sendonly~]~%~@[a=rtpmap:~d VP8/90000~%~]~a~a"
                      (if pt port 0) (or pt 96) ip (sdp-media-mid m) pt pt shared own)))
