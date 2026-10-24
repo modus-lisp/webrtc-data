@@ -263,12 +263,22 @@ TSNs and the per-message sequence number stay monotonic and the fragments stay s
   "Bytes we may have outstanding right now: min(cwnd, peer-rwnd)."
   (min (sctp-assoc-cwnd assoc) (sctp-assoc-peer-rwnd assoc)))
 
+(defparameter *sctp-flush-batch* 4
+  "At most this many DATA chunks per SCTP-FLUSH.  Each one is encrypted and sent with the
+send-lock held, and the receive path needs that lock for every SACK -- so an unbounded flush of
+a full window held SACK processing off for as long as the window took to transmit: under QEMU
+(a Zero's core) ~50 s, the browser's link watchdog fired, and the session died with its
+inbound mailbox full.  What a batch leaves is sent by the next flush: the next send, the next
+SACK, or SCTP-TICK, which the driver loop runs every pass.")
+
 (defun sctp-flush (assoc)
-  "Transmit as many queued DATA chunks as the congestion/flow window allows, moving them
-to OUTSTANDING.  Caller holds the send-lock.  Always lets at least one chunk out when
-nothing is in flight (zero-window / cold-start probe) so the stream can't wedge."
+  "Transmit queued DATA chunks as the congestion/flow window allows -- at most
+*SCTP-FLUSH-BATCH* of them -- moving them to OUTSTANDING.  Caller holds the send-lock.
+Always lets at least one chunk out when nothing is in flight (zero-window / cold-start probe)
+so the stream can't wedge."
   (loop for txc = (car (sctp-assoc-send-q assoc))
-        while txc
+        for n from 0
+        while (and txc (< n *sctp-flush-batch*))
         do (let ((size (txc-size txc)))
              (unless (or (<= (+ (sctp-assoc-flight assoc) size) (sctp-window assoc))
                          (zerop (sctp-assoc-flight assoc)))
@@ -351,7 +361,10 @@ retransmit every outstanding chunk (oldest first)."
           (incf (sctp-assoc-n-rtx assoc) (length chunks))
           (dolist (txc chunks)
             (setf (txc-sent txc) (sctp-now) (txc-missing txc) 0 (txc-retx txc) t)
-            (sctp-transmit assoc (txc-bytes txc))))))))
+            (sctp-transmit assoc (txc-bytes txc)))))
+      ;; ... and the next batch of what is queued: a flush is bounded (*SCTP-FLUSH-BATCH*),
+      ;; and the driver loop's tick is what keeps a long queue moving between SACKs
+      (sctp-flush assoc))))
 
 (defun sctp-update-rtt (assoc r)
   "Feed one RTT sample R (seconds) into the SRTT/RTTVAR estimator and recompute the RTO
