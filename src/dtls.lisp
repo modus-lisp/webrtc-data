@@ -155,7 +155,7 @@ late -- can start its checks well after the box sent it (measured on a Pi Zero g
 the browser's first check ~65 s after the answer, so the old 20 s killed sessions that then
 connected).  And it runs from the OFFER, not the answer: the session starts before the answer is
 gift-wrapped, which on that board is 20+ s of it -- at 60 a phone's offer was answered, then
-dropped 33 s after the answer went out (2026-10-27), so 120.")
+dropped 33 s after the answer went out (2026-10-27), so 120."
   (let ((agent (dtls-conn-agent conn)))
     (loop with deadline = (+ (get-internal-real-time)
                              (round (* peer-wait internal-time-units-per-second)))
