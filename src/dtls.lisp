@@ -145,7 +145,7 @@ ICE-SERVE so no early DTLS records are dropped."
       (make-dtls-conn :agent agent :session session :mailbox mb
                       :cert-der der :sign-fn sign-fn :fingerprint fp))))
 
-(defun webrtc-dtls-run (conn &key (timeout 0.4) (peer-wait 60.0))
+(defun webrtc-dtls-run (conn &key (timeout 0.4) (peer-wait 120.0))
   "Wait for ICE to settle on a peer, then drive the DTLS client handshake.  TIMEOUT is the
 INITIAL handshake retransmit timer — seal backs it off exponentially, so a low value makes a
 lossy link recover fast without storming a high-RTT one.  Returns the seal DTLS-SESSION on
@@ -153,7 +153,9 @@ success (SEAL:DTLS-DONE true).  PEER-WAIT is how long the answer stays good for:
 reaches the browser over Nostr relays, and a phone on a slow link -- or a small board that answered
 late -- can start its checks well after the box sent it (measured on a Pi Zero gateway under QEMU:
 the browser's first check ~65 s after the answer, so the old 20 s killed sessions that then
-connected)."
+connected).  And it runs from the OFFER, not the answer: the session starts before the answer is
+gift-wrapped, which on that board is 20+ s of it -- at 60 a phone's offer was answered, then
+dropped 33 s after the answer went out (2026-10-27), so 120.")
   (let ((agent (dtls-conn-agent conn)))
     (loop with deadline = (+ (get-internal-real-time)
                              (round (* peer-wait internal-time-units-per-second)))
