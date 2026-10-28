@@ -60,7 +60,9 @@
                 #:turn-alloc-server-port #:turn-alloc-socket #:turn-alloc-user #:turn-allocate
                 #:turn-channel-bind #:turn-channeldata-p #:turn-create-permission #:turn-deliver-control
                 #:turn-install-peer #:turn-long-term-key #:turn-refresh #:turn-refresh-via-loop
-                #:turn-start-refresh #:turn-wrap-channeldata #:turn-wrap-send-indication #:xor-mapped-address)
+                #:turn-start-refresh #:turn-wrap-channeldata #:turn-wrap-send-indication #:xor-mapped-address
+                ;; on an event loop (cl-transport ice-loop.lisp)
+                #:ice-start-checks-on-loop #:ice-agent-loop)
   (:export #:parse-sdp #:make-answer-sdp #:sdp-session
            #:sdp-ice-ufrag #:sdp-ice-pwd #:sdp-fingerprint #:sdp-setup
            #:sdp-candidates #:sdp-sctp-port #:sdp-mid
@@ -79,7 +81,11 @@
            #:dtls-conn-session #:dtls-conn-fingerprint
            #:webrtc-serve-datachannel #:sctp-assoc #:sctp-assoc-state
            #:sctp-send-data #:sctp-send-string #:sctp-send-binary #:sctp-stats
-           #:webrtc-error))
+           #:webrtc-error
+           ;; on an event loop (loop.lisp): no threads
+           #:ice-answer-on-loop #:webrtc-start-on-loop #:webrtc-close-on-loop
+           #:rtc-link #:link-assoc #:link-phase #:link-reason #:link-open-p #:link-conn
+           #:sctp-backlogged-p #:dtls-conn-agent #:ice-start-checks-on-loop))
 
 (in-package #:webrtc-data)
 

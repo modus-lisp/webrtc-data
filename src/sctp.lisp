@@ -185,6 +185,9 @@ the given already-encoded chunks."
   on-message                                 ; (funcall on-message assoc stream-id payload)
   on-ready                                   ; (funcall on-ready assoc stream-id) at DCEP OPEN
   (send-lock (bt:make-recursive-lock))       ; serialize send-side state + DTLS record layer
+  ;; on an event loop (loop.lisp) a send must never wait: SCTP-SEND-DATA enqueues past the
+  ;; bound, and the producer asks SCTP-BACKLOGGED-P instead
+  (nonblocking nil)
   (log nil))                                 ; optional stream for debug logging
 
 (defun sctp-log (assoc fmt &rest args)
@@ -299,7 +302,8 @@ producer (e.g. the glass pump) down to what the peer can absorb."
   (loop
     (let ((room nil))
       (bt:with-recursive-lock-held ((sctp-assoc-send-lock assoc))
-        (when (< (sctp-assoc-send-q-len assoc) +sctp-send-q-max+)
+        (when (or (< (sctp-assoc-send-q-len assoc) +sctp-send-q-max+)
+                  (sctp-assoc-nonblocking assoc))
           (setf room t)
           ;; all fragments of the message are enqueued together (consecutive TSNs, no other
           ;; chunk interleaved) so the peer can reassemble them by TSN order
@@ -308,6 +312,11 @@ producer (e.g. the glass pump) down to what the peer can absorb."
           (sctp-flush assoc)))
       (when room (return))
       (sleep 0.002))))                        ; queue full: wait for a SACK to drain it
+
+(defun sctp-backlogged-p (assoc)
+  "Is the ready queue at its bound?  A producer on an event loop stops reading its source until
+this is false again, which is the backpressure SCTP-SEND-DATA's wait provides on a thread."
+  (>= (sctp-assoc-send-q-len assoc) +sctp-send-q-max+))
 
 (defun sctp-send-string (assoc stream-id string)
   "Send STRING as a WebRTC string message (PPID 51) on STREAM-ID.  UTF-8, not ASCII:
