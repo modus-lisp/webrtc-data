@@ -98,6 +98,18 @@ link; SIGN-FN produces ecdsa_secp256r1_sha256 signatures for CertificateVerify."
               (lambda (message) (ecdsa-sha256-sign d message))
               (seal:dtls-fingerprint der)))))
 
+(defvar *webrtc-identity* nil
+  "(cert-der sign-fn fingerprint), made once per process by WEBRTC-IDENTITY.")
+
+(defun webrtc-identity ()
+  "This process's DTLS identity as (values cert-der sign-fn fingerprint), generated on first
+use and reused: making one is a P-256 keygen and a signature, ~4 s on a Pi Zero under QEMU, and
+it sat between every offer and its answer.  Nothing ties the cert to a session -- each handshake
+still makes its own ECDHE key -- and a browser keeps one certificate across connections the same
+way.  Call it at startup to take the cost before the first phone is waiting."
+  (values-list (or *webrtc-identity*
+                   (setf *webrtc-identity* (multiple-value-list (generate-webrtc-cert))))))
+
 ;;; ---- datagram mailbox (ICE recv thread -> DTLS handshake thread) -----------
 
 (defstruct mailbox (lock (bt:make-lock)) (cvar (bt:make-condition-variable)) (items '()))
@@ -126,10 +138,10 @@ latency (this is the per-hop delay in the RFB round trip, so it directly affects
 (defstruct dtls-conn agent session mailbox cert-der sign-fn fingerprint)
 
 (defun webrtc-dtls-setup (agent &key remote-fingerprint)
-  "Generate a DTLS identity, install the packet pump on AGENT's ON-PACKET, and
+  "Take this process's DTLS identity (WEBRTC-IDENTITY), install the packet pump on AGENT's ON-PACKET, and
 return a DTLS-CONN.  Put its FINGERPRINT in the answer SDP.  Call before
 ICE-SERVE so no early DTLS records are dropped."
-  (multiple-value-bind (der sign-fn fp) (generate-webrtc-cert)
+  (multiple-value-bind (der sign-fn fp) (webrtc-identity)
     (let* ((mb (make-mailbox))
            (session (seal:make-dtls-session
                      :send-fn (lambda (dg)

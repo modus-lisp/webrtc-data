@@ -77,7 +77,7 @@
            #:ice-agent-local-ip #:ice-agent-port #:turn-start-refresh
            #:turn-allocate #:turn-alloc-relay-ip #:turn-alloc-relay-port #:make-turn-alloc
            #:turn-install-peer #:turn-create-permission #:turn-channel-bind #:turn-refresh
-           #:generate-webrtc-cert #:webrtc-dtls-setup #:webrtc-dtls-run
+           #:generate-webrtc-cert #:webrtc-identity #:webrtc-dtls-setup #:webrtc-dtls-run
            #:dtls-conn-session #:dtls-conn-fingerprint
            #:webrtc-serve-datachannel #:sctp-assoc #:sctp-assoc-state
            #:sctp-send-data #:sctp-send-string #:sctp-send-binary #:sctp-stats
