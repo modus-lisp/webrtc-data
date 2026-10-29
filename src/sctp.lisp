@@ -173,6 +173,7 @@ the given already-encoded chunks."
   ;; --- receive side (peer -> us) ---
   (rcv-buffer (make-hash-table))             ; tsn -> (list stream-id ppid user flags), out-of-order
   (dup-tsns nil)                             ; duplicate TSNs to report in the next SACK
+  (sack-owed 0) (sack-since nil)             ; DATA packets not yet SACKed, and since when
   ;; reassembly of an inbound fragmented message (RFC 4960 §6.9); fragments arrive as
   ;; strictly-sequential TSNs delivered in order, so one accumulator per assoc suffices
   (reasm-frags nil) (reasm-sid nil) (reasm-ppid nil)
@@ -292,7 +293,11 @@ so the stream can't wedge."
              (incf (sctp-assoc-flight assoc) size)
              (incf (sctp-assoc-n-data-out assoc))
              (incf (sctp-assoc-n-bytes-out assoc) size)
-             (sctp-transmit assoc (txc-bytes txc)))))
+             ;; an owed SACK is in order and has no gaps or dups -- 16 bytes, which a full
+             ;; DATA chunk leaves room for under +SCTP-MTU+ -- so it rides along
+             (if (plusp (sctp-assoc-sack-owed assoc))
+                 (sctp-transmit assoc (sctp-sack-chunk assoc) (txc-bytes txc))
+                 (sctp-transmit assoc (txc-bytes txc))))))
 
 (defun sctp-send-data (assoc stream-id ppid data)
   "Enqueue one unfragmented, ordered DATA chunk on STREAM-ID and try to flush.  If the
@@ -347,6 +352,9 @@ PPID-51 is UTF-8 by spec, and warp frames now carry chat text (em-dashes, emoji,
 expiry, collapse the congestion window (RFC 4960 §7.2.3), back the RTO off, and
 retransmit every outstanding chunk (oldest first)."
   (bt:with-recursive-lock-held ((sctp-assoc-send-lock assoc))
+    (let ((since (sctp-assoc-sack-since assoc)))   ; a SACK no DATA came along to carry
+      (when (and since (> (sctp-secs-since since) *sctp-sack-delay*))
+        (sctp-send-sack assoc)))
     (let ((oldest (sctp-oldest-outstanding assoc)))
       (when (and oldest (> (sctp-secs-since (txc-sent oldest)) (sctp-assoc-rto assoc)))
         (setf (sctp-assoc-ssthresh assoc)
@@ -472,9 +480,31 @@ chunk reported missing >=3 times, then flush whatever the window now allows."
       ;; 5. the window may have opened — send more.
       (sctp-flush assoc))))
 
+(defparameter *sctp-sack-delay* 0.04
+  "Seconds an in-order DATA packet may wait for its SACK (RFC 4960 6.2 allows 200 ms).  Within
+it the SACK rides in the packet of our next DATA chunk, which on a remote desktop is the answer
+to the input that arrived: one DTLS record where there were two.")
+
+(defun sctp-note-data (assoc)
+  "DATA arrived in a packet: SACK now if it is the second unacknowledged packet or anything is
+out of order or duplicated (RFC 4960 6.2), else owe one -- SCTP-FLUSH bundles it with outbound
+DATA, SCTP-TICK sends it alone once *SCTP-SACK-DELAY* has passed."
+  (bt:with-recursive-lock-held ((sctp-assoc-send-lock assoc))
+    (if (or (>= (incf (sctp-assoc-sack-owed assoc)) 2)
+            (sctp-assoc-dup-tsns assoc)
+            (plusp (hash-table-count (sctp-assoc-rcv-buffer assoc))))
+        (sctp-send-sack assoc)
+        (unless (sctp-assoc-sack-since assoc) (setf (sctp-assoc-sack-since assoc) (sctp-now))))))
+
 (defun sctp-send-sack (assoc)
-  "Send a SACK: cumulative ack, our advertised window, gap-ack blocks derived from the
-out-of-order receive buffer, and any duplicate TSNs seen since the last SACK."
+  "Send a SACK on its own (see SCTP-SACK-CHUNK)."
+  (sctp-transmit assoc (sctp-sack-chunk assoc)))
+
+(defun sctp-sack-chunk (assoc)
+  "A SACK chunk: cumulative ack, our advertised window, gap-ack blocks derived from the
+out-of-order receive buffer, and any duplicate TSNs seen since the last SACK.  It settles
+what SCTP-NOTE-DATA owed."
+  (setf (sctp-assoc-sack-owed assoc) 0 (sctp-assoc-sack-since assoc) nil)
   (let* ((cum (sctp-assoc-last-received-tsn assoc))
          ;; offsets (relative to cum) of every buffered out-of-order TSN, ascending
          (offs (sort (loop for tsn being the hash-keys of (sctp-assoc-rcv-buffer assoc)
@@ -497,9 +527,9 @@ out-of-order receive buffer, and any duplicate TSNs seen since the last SACK."
                                       collect (cat-bytes (u16be s) (u16be e)))
                                 (loop for d in dups collect (u32be d))))))
       (setf (sctp-assoc-dup-tsns assoc) nil)
-      (sctp-transmit assoc (sctp-chunk +chunk-sack+ 0 value))
       (sctp-log assoc "~&  >> SACK cum=~a gaps=~a dups=~a~%"
-                cum (length blocks) (length dups)))))
+                cum (length blocks) (length dups))
+      (sctp-chunk +chunk-sack+ 0 value))))
 
 (defun sctp-send-init-ack (assoc)
   "Respond to an INIT: advertise our tag/window/streams/TSN plus a State Cookie.  We are
@@ -649,7 +679,7 @@ handling INIT / COOKIE-ECHO / DATA / SACK / HEARTBEAT, and sends a SACK if DATA 
             (t (sctp-log assoc "~&  << unhandled chunk type ~a~%" ctype))))
         ;; advance past chunk + padding
         (incf pos (+ clen (mod (- (mod clen 4)) 4)))))
-    (when data-seen (sctp-send-sack assoc))))
+    (when data-seen (sctp-note-data assoc))))
 
 ;;; ---- performance monitoring ------------------------------------------------
 
