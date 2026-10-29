@@ -5,8 +5,20 @@
 (deftype u8 () '(unsigned-byte 8))
 (deftype u8vec () '(simple-array (unsigned-byte 8) (*)))
 (defun u8vec (n &optional (init 0)) (make-array n :element-type 'u8 :initial-element init))
-(defun as-u8vec (seq) (coerce seq 'u8vec))
-(defun cat-bytes (&rest seqs) (apply #'concatenate 'u8vec seqs))
+;; Built by hand, not COERCE / CONCATENATE to the U8VEC type: every SCTP chunk is assembled from
+;; these, and on a Pi Zero board a SACK's worth of them was most of what a phone session allocated.
+(defun as-u8vec (seq)
+  (if (typep seq '(simple-array (unsigned-byte 8) (*)))
+      seq
+      (let ((v (make-array (length seq) :element-type '(unsigned-byte 8))))
+        (replace v seq)
+        v)))
+(defun cat-bytes (&rest seqs)
+  (let ((out (make-array (loop for s in seqs sum (length s)) :element-type '(unsigned-byte 8)))
+        (i 0))
+    (dolist (s seqs out)
+      (replace out s :start1 i)
+      (incf i (length s)))))
 (defun ascii (s) (map 'u8vec #'char-code s))
 (defun bytes->ascii (v) (map 'string #'code-char v))
 
@@ -61,8 +73,15 @@
 (defun u8! (n) (logand n #xff))
 
 ;;; big-endian integer read/write
-(defun u16be (n) (as-u8vec (list (u8! (ash n -8)) (u8! n))))
-(defun u32be (n) (as-u8vec (list (u8! (ash n -24)) (u8! (ash n -16)) (u8! (ash n -8)) (u8! n))))
+(defun u16be (n)
+  (let ((v (make-array 2 :element-type '(unsigned-byte 8))))
+    (setf (aref v 0) (u8! (ash n -8)) (aref v 1) (u8! n))
+    v))
+(defun u32be (n)
+  (let ((v (make-array 4 :element-type '(unsigned-byte 8))))
+    (setf (aref v 0) (u8! (ash n -24)) (aref v 1) (u8! (ash n -16))
+          (aref v 2) (u8! (ash n -8)) (aref v 3) (u8! n))
+    v))
 (defun rd-u16be (v off) (logior (ash (aref v off) 8) (aref v (1+ off))))
 (defun rd-u32be (v off) (logior (ash (aref v off) 24) (ash (aref v (1+ off)) 16)
                                 (ash (aref v (+ off 2)) 8) (aref v (+ off 3))))
