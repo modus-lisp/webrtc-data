@@ -89,10 +89,7 @@
 (defun hexbytes (v) (string-downcase (format nil "~{~2,'0x~}" (coerce v 'list))))
 (defun colon-hex (v) (format nil "~{~2,'0X~^:~}" (coerce v 'list)))   ; AA:BB:CC (for fingerprints)
 
-(defun random-bytes (n)
-  (handler-case
-      (with-open-file (f "/dev/urandom" :element-type 'u8) (let ((b (u8vec n))) (read-sequence b f) b))
-    (error () (ic:random-data n (ic:make-prng :fortuna)))))
+(defun random-bytes (n) (natrium:random-bytes n))   ; the OS's entropy, or the board's RNG
 
 (defparameter +b64-alphabet+ "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
 (defun b64-encode (bytes)

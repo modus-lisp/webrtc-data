@@ -3,12 +3,12 @@
 ;;;; The goal: a browser (or aiortc) opens an RTCDataChannel to us with no plugins — so we
 ;;;; implement the answerer side of the stack it expects: SDP, ICE (STUN connectivity), DTLS
 ;;;; 1.2, and SCTP + DCEP.  Data channels only (no SRTP / no video codec) — the framebuffer
-;;;; and input for `glass` ride the data channel.  Crypto via ironclad + seal; UDP via
+;;;; and input for `glass` ride the data channel.  Crypto via seal and natrium; UDP via
 ;;;; sb-bsd-sockets.  Tested against aiortc (a spec-compliant peer), then a real browser.
 
 (defpackage #:webrtc-data
   (:use #:cl)
-  (:local-nicknames (#:ic #:ironclad) (#:bt #:bordeaux-threads))
+  (:local-nicknames (#:bt #:bordeaux-threads))
   ;; ---- the connectivity stack lives in cl-transport ------------------------------
   ;; STUN, TURN and ICE are the IETF stack for getting a datagram between two peers behind
   ;; NATs.  They predate WebRTC, SIP uses them, and this library is one CONSUMER -- so they

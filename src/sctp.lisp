@@ -109,12 +109,20 @@ Default 0.0 (no loss).  Set e.g. 0.15 to exercise the retransmission path.")
 
 ;;; ---- CRC32c checksum (RFC 3309) --------------------------------------------
 ;;;
-;;; ironclad's :crc32c digest returns the CRC value as 4 big-endian bytes (verified
-;;; against the standard "123456789" -> 0xE3069283 vector).  SCTP stores the checksum
-;;; in the common header *little-endian*, so the field bytes are the digest reversed.
+;;; Castagnoli, reflected #x82F63B78 ("123456789" -> #xE3069283).  SCTP stores the
+;;; checksum in the common header *little-endian*.
+
+(defvar *crc32c-table*
+  (let ((tab (make-array 256 :element-type '(unsigned-byte 32))))
+    (dotimes (n 256 tab)
+      (let ((c n))
+        (dotimes (k 8) (setf c (if (logbitp 0 c) (logxor #x82F63B78 (ash c -1)) (ash c -1))))
+        (setf (aref tab n) c)))))
 
 (defun sctp-crc32c-value (bytes)
-  (rd-u32be (ic:digest-sequence :crc32c bytes) 0))
+  (let ((c #xFFFFFFFF) (tab *crc32c-table*))
+    (loop for b across bytes do (setf c (logxor (aref tab (logand (logxor c b) #xFF)) (ash c -8))))
+    (logxor c #xFFFFFFFF)))
 
 ;;; ---- packet + chunk framing ------------------------------------------------
 
@@ -347,6 +355,11 @@ PPID-51 is UTF-8 by spec, and warp frames now carry chat text (em-dashes, emoji,
              (sctp-assoc-outstanding assoc))
     best))
 
+(defparameter *sctp-sack-delay* 0.04
+  "Seconds an in-order DATA packet may wait for its SACK (RFC 4960 6.2 allows 200 ms).  Within
+it the SACK rides in the packet of our next DATA chunk, which on a remote desktop is the answer
+to the input that arrived: one DTLS record where there were two.")
+
 (defun sctp-tick (assoc)
   "Called frequently from the driver loop: fire the retransmission timer.  On an RTO
 expiry, collapse the congestion window (RFC 4960 §7.2.3), back the RTO off, and
@@ -479,11 +492,6 @@ chunk reported missing >=3 times, then flush whatever the window now allows."
                   (max 1 (floor (* +sctp-mtu+ +sctp-mtu+) (sctp-assoc-cwnd assoc))))))
       ;; 5. the window may have opened — send more.
       (sctp-flush assoc))))
-
-(defparameter *sctp-sack-delay* 0.04
-  "Seconds an in-order DATA packet may wait for its SACK (RFC 4960 6.2 allows 200 ms).  Within
-it the SACK rides in the packet of our next DATA chunk, which on a remote desktop is the answer
-to the input that arrived: one DTLS record where there were two.")
 
 (defun sctp-note-data (assoc)
   "DATA arrived in a packet: SACK now if it is the second unacknowledged packet or anything is

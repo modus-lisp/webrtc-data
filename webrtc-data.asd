@@ -9,7 +9,7 @@
   :version "0.1.0"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("cl-transport/ice" "ironclad" "bordeaux-threads" "sb-bsd-sockets" "seal")
+  :depends-on ("cl-transport/ice" "bordeaux-threads" "sb-bsd-sockets" "seal")
   :serial t
   :components
   ((:module "src"

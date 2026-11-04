@@ -7,7 +7,7 @@
 ;;;; one thing a WebRTC peer needs that a normal TLS client does not: a
 ;;;; self-signed certificate plus a signing closure for the client
 ;;;; CertificateVerify (WebRTC does mutual auth, trust rooted in the SDP
-;;;; fingerprint).  We generate an RSA-2048 key with ironclad, hand-roll the
+;;;; fingerprint).  We generate a P-256 key with seal, hand-roll the
 ;;;; X.509 DER, and offer TLS_ECDHE_{ECDSA,RSA}_WITH_AES_128_GCM_SHA256 (aiortc
 ;;;; picks ECDSA to match its own certificate; the ECDHE runs over X25519).
 ;;;;
