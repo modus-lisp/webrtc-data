@@ -112,17 +112,9 @@ Default 0.0 (no loss).  Set e.g. 0.15 to exercise the retransmission path.")
 ;;; Castagnoli, reflected #x82F63B78 ("123456789" -> #xE3069283).  SCTP stores the
 ;;; checksum in the common header *little-endian*.
 
-(defvar *crc32c-table*
-  (let ((tab (make-array 256 :element-type '(unsigned-byte 32))))
-    (dotimes (n 256 tab)
-      (let ((c n))
-        (dotimes (k 8) (setf c (if (logbitp 0 c) (logxor #x82F63B78 (ash c -1)) (ash c -1))))
-        (setf (aref tab n) c)))))
-
 (defun sctp-crc32c-value (bytes)
-  (let ((c #xFFFFFFFF) (tab *crc32c-table*))
-    (loop for b across bytes do (setf c (logxor (aref tab (logand (logxor c b) #xFF)) (ash c -8))))
-    (logxor c #xFFFFFFFF)))
+  ;; cram's: slicing-by-8, the org's one CRC-32C
+  (cram:crc32c bytes))
 
 ;;; ---- packet + chunk framing ------------------------------------------------
 
