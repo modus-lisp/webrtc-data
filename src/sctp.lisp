@@ -171,6 +171,10 @@ the given already-encoded chunks."
   (rto +sctp-rto-init+)                      ; current retransmission timeout (s)
   (rto-strikes 0)                            ; consecutive RTO fires with no forward progress
   (srtt nil) (rttvar nil)                    ; smoothed RTT + variance (s), Jacobson/RFC 6298
+  ;; RACK-TLP (RFC 8985): loss by TIME, not by count -- see SCTP-RACK-DETECT, SCTP-MAYBE-PROBE
+  (rack-sent nil) (rack-tsn nil) (rack-rtt nil)  ; send time, TSN, RTT of the latest-SENT chunk acked
+  (progress-at 0) (tlp-sent nil)             ; when a SACK last acked something; probed since?
+  (recover-until nil)                        ; one window cut per round trip: none before this
   ;; --- receive side (peer -> us) ---
   (rcv-buffer (make-hash-table))             ; tsn -> (list stream-id ppid user flags), out-of-order
   (dup-tsns nil)                             ; duplicate TSNs to report in the next SACK
@@ -182,6 +186,7 @@ the given already-encoded chunks."
   (n-bytes-out 0) (n-bytes-in 0)             ; DATA payload bytes sent / received
   (n-data-out 0) (n-data-in 0)               ; DATA chunks sent (incl. retransmits) / received
   (n-rtx 0) (n-fast-rtx 0) (n-rto 0)         ; chunks retransmitted, fast-retransmits, RTO events
+  (n-rack 0) (n-tlp 0)                       ; chunks RACK found lost, tail-loss probes sent
   (n-sack-in 0) (n-drop 0)                   ; SACKs processed, packets dropped by *sctp-drop-rate*
   ;; --- glue ---
   on-message                                 ; (funcall on-message assoc stream-id payload)
@@ -192,10 +197,23 @@ the given already-encoded chunks."
   (nonblocking nil)
   (log nil))                                 ; optional stream for debug logging
 
+(defparameter *sctp-trace* (and (sb-ext:posix-getenv "SCTP_TRACE") t)
+  "SCTP_TRACE=1: every association logs to *ERROR-OUTPUT*, each line stamped with the wall clock --
+its loss decisions (fast, RACK, probe, RTO) and every SACK -- so they line up with a packet capture
+or a test TURN server's drop log.")
+
+(defun %wall-stamp ()
+  #+sbcl (multiple-value-bind (s us) (sb-ext:get-time-of-day) (format nil "~d.~3,'0d" s (floor us 1000)))
+  #-sbcl (format nil "~,3f" (/ (get-internal-real-time) internal-time-units-per-second)))
+
 (defun sctp-log (assoc fmt &rest args)
-  (when (sctp-assoc-log assoc)
-    (apply #'format (sctp-assoc-log assoc) fmt args)
-    (finish-output (sctp-assoc-log assoc))))
+  (let ((out (or (sctp-assoc-log assoc) (and *sctp-trace* *error-output*))))
+    (when out
+      (if *sctp-trace*      ; one line per event, stamped, and which association it is
+          (format out "~&[sctp ~a ~(~8,'0x~)] ~a~%" (%wall-stamp) (or (sctp-assoc-local-tag assoc) 0)
+                  (string-trim '(#\Newline #\Space) (apply #'format nil fmt args)))
+          (apply #'format out fmt args))
+      (finish-output out))))
 
 (defun sctp-now () (get-internal-real-time))
 (defun sctp-secs-since (t0)
@@ -386,9 +404,99 @@ retransmit every outstanding chunk (oldest first)."
             ;; ...and each may be fast-retransmitted again: this resend can be lost too
             (setf (txc-sent txc) (sctp-now) (txc-missing txc) 0 (txc-retx txc) t (txc-fast txc) nil)
             (sctp-transmit assoc (txc-bytes txc)))))
+      ;; a loss RACK could not call at the SACK (the reordering window had not passed yet), and
+      ;; a tail with nothing after it to be SACKed: both are the timer's, and both beat the RTO
+      (sctp-rack-detect assoc)
+      (sctp-maybe-probe assoc)
       ;; ... and the next batch of what is queued: a flush is bounded (*SCTP-FLUSH-BATCH*),
       ;; and the driver loop's tick is what keeps a long queue moving between SACKs
       (sctp-flush assoc))))
+
+(defun sctp-loss-backoff (assoc)
+  "A loss was detected: cut the window -- loss-tolerantly, to 3/4 of the flight (not Reno's 1/2)
+and never below the floor, since random RF loss is not congestion -- at most ONCE PER ROUND TRIP.
+One lost packet is usually several of a burst's chunks, found by several SACKs; each finding it
+again is the same congestion signal, not a new one."
+  (let ((now (sctp-now)) (until (sctp-assoc-recover-until assoc)))
+    (when (or (null until) (> now until))
+      (setf (sctp-assoc-ssthresh assoc)
+            (max (floor (* (sctp-assoc-flight assoc) 3) 4) +sctp-cwnd-floor+)
+            (sctp-assoc-cwnd assoc) (sctp-assoc-ssthresh assoc)
+            (sctp-assoc-recover-until assoc)
+            (+ now (round (* (or (sctp-assoc-srtt assoc) +sctp-rto-init+)
+                             internal-time-units-per-second)))))))
+
+(defun %rack-after-p (sent tsn assoc)
+  "Was (SENT, TSN) transmitted after the RACK chunk?  A burst goes out inside one clock tick, so
+equal send times are ordered by TSN (RFC 8985 6.2's tie-break) -- without it a chunk lost from the
+middle of a burst was never `sent before' the one delivered after it, and waited for the RTO."
+  (let ((rs (sctp-assoc-rack-sent assoc)))
+    (or (null rs) (> sent rs) (and (= sent rs) (tsn< (sctp-assoc-rack-tsn assoc) tsn)))))
+
+(defun sctp-rack-detect (assoc)
+  "RACK (RFC 8985 6.2): a chunk is LOST when one sent after it has been delivered and it has had
+that chunk's RTT plus a reordering window (SRTT/4) to arrive.  Resend it now.  Caller holds the lock.
+
+COUNTING MISSING REPORTS IS NOT ENOUGH FOR A DESKTOP.  Fast retransmit wants three SACKs that each
+ack something newer than the hole; an update is a short burst, so a chunk lost near its end has
+three newer chunks behind it rarely, and waited for the RTO -- at least 0.4 s, on top of the round
+trip -- while the ordered channel held the whole frame behind it.  Measured over t/linkcond's lossy
+links that was most of the 500-870 ms drag steps.  Time needs no followers: one delivered chunk
+sent later is evidence enough.
+
+A resend gets a new send time, so it is only judged lost again once something sent AFTER it is
+delivered -- which is how a lost retransmission is found without waiting for the RTO either."
+  (let ((rs (sctp-assoc-rack-sent assoc)) (srtt (sctp-assoc-srtt assoc)))
+    (when (and rs srtt)
+      (let ((now (sctp-now))
+            (wait (round (* (+ (sctp-assoc-rack-rtt assoc) (/ srtt 4)) internal-time-units-per-second)))
+            (lost '()))
+        (maphash (lambda (tsn txc)
+                   (declare (ignore tsn))
+                   (when (and (not (%rack-after-p (txc-sent txc) (txc-tsn txc) assoc))
+                              (not (eql (txc-tsn txc) (sctp-assoc-rack-tsn assoc)))
+                              (> (- now (txc-sent txc)) wait))
+                     (push txc lost)))
+                 (sctp-assoc-outstanding assoc))
+        (when lost
+          (sctp-loss-backoff assoc)
+          (sctp-log assoc "~&  !! RACK: ~a chunk(s) lost~{ ~a~}~%" (length lost) (mapcar #'txc-tsn lost))
+          (incf (sctp-assoc-n-rack assoc) (length lost))
+          (incf (sctp-assoc-n-rtx assoc) (length lost))
+          (dolist (txc (sort lost (lambda (a b) (tsn< (txc-tsn a) (txc-tsn b)))))
+            (setf (txc-sent txc) now (txc-missing txc) 0 (txc-retx txc) t (txc-fast txc) t)
+            (sctp-transmit assoc (txc-bytes txc))))))))
+
+(defparameter *sctp-peer-ack-delay* 0.2d0
+  "How long the peer may hold the SACK for a lone DATA packet (RFC 4960 6.2's ceiling, and what a
+browser's SCTP uses).  A tail-loss probe for one chunk has to wait past it, or it fires at a SACK
+that is merely late.")
+
+(defun sctp-maybe-probe (assoc)
+  "Tail-loss probe (RFC 8985 7): data is outstanding, nothing has been SACKed or sent for two round
+trips, and nothing after it will draw a SACK -- the case RACK cannot see, because nothing later was
+delivered.  Resend the OLDEST outstanding chunk, once until the next progress: if it was the lost
+one that is the repair, and if it arrived the duplicate draws an immediate SACK whose gaps let RACK
+find the rest.  Only worth it when it comes before the RTO.  No window cut: a probe is not a loss."
+  (let ((srtt (sctp-assoc-srtt assoc)) (out (sctp-assoc-outstanding assoc)))
+    (when (and srtt (plusp (hash-table-count out)))
+      (let* ((newest (loop for txc being the hash-values of out maximize (txc-sent txc)))
+             (pto (+ (* 2 srtt) (if (= 1 (hash-table-count out)) *sctp-peer-ack-delay* 0))))
+        (when (and *sctp-trace*
+                   (or (sctp-assoc-tlp-sent assoc) (>= pto (sctp-assoc-rto assoc)))
+                   (> (sctp-secs-since (max newest (sctp-assoc-progress-at assoc))) pto))
+          (sctp-log assoc "  .. no probe: ~:[~;already probed ~]pto ~,2f rto ~,2f idle ~,2f"
+                    (sctp-assoc-tlp-sent assoc) pto (sctp-assoc-rto assoc)
+                    (sctp-secs-since (max newest (sctp-assoc-progress-at assoc)))))
+        (when (and (not (sctp-assoc-tlp-sent assoc)) (< pto (sctp-assoc-rto assoc))
+                   (> (sctp-secs-since (max newest (sctp-assoc-progress-at assoc))) pto))
+          (let ((txc (sctp-oldest-outstanding assoc)))
+            (sctp-log assoc "~&  !! tail-loss probe: tsn ~a~%" (txc-tsn txc))
+            (setf (sctp-assoc-tlp-sent assoc) t)
+            (incf (sctp-assoc-n-tlp assoc))
+            (incf (sctp-assoc-n-rtx assoc))
+            (setf (txc-sent txc) (sctp-now) (txc-retx txc) t)
+            (sctp-transmit assoc (txc-bytes txc))))))))
 
 (defun sctp-update-rtt (assoc r)
   "Feed one RTT sample R (seconds) into the SRTT/RTTVAR estimator and recompute the RTO
@@ -411,6 +519,9 @@ chunk reported missing >=3 times, then flush whatever the window now allows."
   (when (< (length value) 12) (return-from sctp-handle-sack))
   (bt:with-recursive-lock-held ((sctp-assoc-send-lock assoc))
     (incf (sctp-assoc-n-sack-in assoc))
+    (when *sctp-trace*
+      (sctp-log assoc " SACK cum ~a gaps ~a outstanding ~a~%" (rd-u32be value 0) (rd-u16be value 8)
+                (hash-table-count (sctp-assoc-outstanding assoc))))
     (let* ((cum      (rd-u32be value 0))
            (new-rwnd (rd-u32be value 4))
            (ngap     (rd-u16be value 8))
@@ -418,13 +529,19 @@ chunk reported missing >=3 times, then flush whatever the window now allows."
            (acked    0)
            (highest-gap nil)
            (highest-new nil))     ; the highest TSN this SACK newly acknowledged (HTNA)
-      (flet ((newly (tsn) (when (or (null highest-new) (tsn< highest-new tsn)) (setf highest-new tsn))))
+      (flet ((newly (tsn) (when (or (null highest-new) (tsn< highest-new tsn)) (setf highest-new tsn)))
+             (delivered (txc)       ; RACK: the latest-SENT chunk known delivered, and its RTT
+               (unless (txc-retx txc)                 ; a resend's ack is ambiguous (Karn)
+                 (when (%rack-after-p (txc-sent txc) (txc-tsn txc) assoc)
+                   (setf (sctp-assoc-rack-sent assoc) (txc-sent txc)
+                         (sctp-assoc-rack-tsn assoc) (txc-tsn txc)
+                         (sctp-assoc-rack-rtt assoc) (sctp-secs-since (txc-sent txc)))))))
       ;; 1. cumulative ack: drop everything at or below CUM; sample RTT off one chunk that
       ;;    was never retransmitted (Karn's algorithm) to drive the RTO estimator.
       (let ((drop '()) (rtt nil))
         (maphash (lambda (tsn txc)
                    (when (tsn<= tsn cum)
-                     (push tsn drop) (incf acked (txc-size txc))
+                     (push tsn drop) (incf acked (txc-size txc)) (delivered txc)
                      (when (and (null rtt) (not (txc-retx txc)))
                        (setf rtt (sctp-secs-since (txc-sent txc))))))
                  out)
@@ -447,7 +564,7 @@ chunk reported missing >=3 times, then flush whatever the window now allows."
                            (setf highest-gap tsn))
                          (let ((txc (gethash tsn out)))
                            (when txc
-                             (incf acked (txc-size txc))
+                             (incf acked (txc-size txc)) (delivered txc)
                              (decf (sctp-assoc-flight assoc) (txc-size txc))
                              (remhash tsn out)
                              (newly tsn))))))))
@@ -473,15 +590,15 @@ chunk reported missing >=3 times, then flush whatever the window now allows."
             (when fast
               ;; Loss-tolerant multiplicative decrease: 3/4 (not Reno's 1/2) and never below the
               ;; floor.  Random RF loss shouldn't halve a window that's nowhere near filling the pipe.
-              (setf (sctp-assoc-ssthresh assoc)
-                    (max (floor (* (sctp-assoc-flight assoc) 3) 4) +sctp-cwnd-floor+))
-              (setf (sctp-assoc-cwnd assoc) (sctp-assoc-ssthresh assoc))
-              (sctp-log assoc "~&  !! fast-retransmit ~a chunk(s)~%" (length fast))
+              (sctp-loss-backoff assoc)
+              (sctp-log assoc "~&  !! fast-retransmit ~a chunk(s)~{ ~a~}~%" (length fast) (mapcar #'txc-tsn fast))
               (incf (sctp-assoc-n-fast-rtx assoc) (length fast))
               (incf (sctp-assoc-n-rtx assoc) (length fast))
               (dolist (txc (sort fast (lambda (a b) (tsn< (txc-tsn a) (txc-tsn b)))))
                 (setf (txc-sent txc) (sctp-now) (txc-missing txc) 0 (txc-retx txc) t (txc-fast txc) t)
                 (sctp-transmit assoc (txc-bytes txc))))))))
+      ;; 3b. ...and by time: anything sent before a chunk that has since been delivered
+      (sctp-rack-detect assoc)
       ;; 4. window + congestion-control bookkeeping.
       (setf (sctp-assoc-peer-rwnd assoc) new-rwnd)
       (when (and (sctp-assoc-peer-cum-ack assoc)
@@ -489,6 +606,8 @@ chunk reported missing >=3 times, then flush whatever the window now allows."
         (setf (sctp-assoc-rto-strikes assoc) 0))   ; forward progress: clear unreachable counter
                                                     ; (RTO itself is now driven by SCTP-UPDATE-RTT)
       (setf (sctp-assoc-peer-cum-ack assoc) cum)
+      (when (plusp acked)
+        (setf (sctp-assoc-progress-at assoc) (sctp-now) (sctp-assoc-tlp-sent assoc) nil))
       (when (plusp acked)
         (if (<= (sctp-assoc-cwnd assoc) (sctp-assoc-ssthresh assoc))
             ;; slow start, Appropriate Byte Counting (RFC 3465): grow by the bytes ACKed, not
@@ -707,6 +826,7 @@ fields (:cwnd, :peer-rwnd, :flight, :outstanding, :send-q, :rto) are instantaneo
         :data-out    (sctp-assoc-n-data-out assoc)  :data-in  (sctp-assoc-n-data-in assoc)
         :rtx         (sctp-assoc-n-rtx assoc)       :fast-rtx (sctp-assoc-n-fast-rtx assoc)
         :rto-events  (sctp-assoc-n-rto assoc)       :sacks-in (sctp-assoc-n-sack-in assoc)
+        :rack        (sctp-assoc-n-rack assoc)      :tlp      (sctp-assoc-n-tlp assoc)
         :drops       (sctp-assoc-n-drop assoc)
         :cwnd        (sctp-assoc-cwnd assoc)        :peer-rwnd (sctp-assoc-peer-rwnd assoc)
         :flight      (sctp-assoc-flight assoc)      :rto      (sctp-assoc-rto assoc)
