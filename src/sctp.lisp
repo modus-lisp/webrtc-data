@@ -148,7 +148,8 @@ the given already-encoded chunks."
   size                                       ; user-data payload length (flight/window unit)
   (sent 0)                                   ; internal-real-time it was last transmitted
   (missing 0)                                ; SACK missing-indications (for fast retransmit)
-  (retx nil))                                ; ever retransmitted? (Karn: don't sample its RTT)
+  (retx nil)                                 ; ever retransmitted? (Karn: don't sample its RTT)
+  (fast nil))                                ; fast-retransmitted already: only the RTO may resend it
 
 (defstruct sctp-assoc
   session                                    ; seal DTLS session (transport)
@@ -382,7 +383,8 @@ retransmit every outstanding chunk (oldest first)."
           (incf (sctp-assoc-n-rto assoc))
           (incf (sctp-assoc-n-rtx assoc) (length chunks))
           (dolist (txc chunks)
-            (setf (txc-sent txc) (sctp-now) (txc-missing txc) 0 (txc-retx txc) t)
+            ;; ...and each may be fast-retransmitted again: this resend can be lost too
+            (setf (txc-sent txc) (sctp-now) (txc-missing txc) 0 (txc-retx txc) t (txc-fast txc) nil)
             (sctp-transmit assoc (txc-bytes txc)))))
       ;; ... and the next batch of what is queued: a flush is bounded (*SCTP-FLUSH-BATCH*),
       ;; and the driver loop's tick is what keeps a long queue moving between SACKs
@@ -414,7 +416,9 @@ chunk reported missing >=3 times, then flush whatever the window now allows."
            (ngap     (rd-u16be value 8))
            (out      (sctp-assoc-outstanding assoc))
            (acked    0)
-           (highest-gap nil))
+           (highest-gap nil)
+           (highest-new nil))     ; the highest TSN this SACK newly acknowledged (HTNA)
+      (flet ((newly (tsn) (when (or (null highest-new) (tsn< highest-new tsn)) (setf highest-new tsn))))
       ;; 1. cumulative ack: drop everything at or below CUM; sample RTT off one chunk that
       ;;    was never retransmitted (Karn's algorithm) to drive the RTO estimator.
       (let ((drop '()) (rtt nil))
@@ -426,7 +430,8 @@ chunk reported missing >=3 times, then flush whatever the window now allows."
                  out)
         (dolist (tsn drop)
           (decf (sctp-assoc-flight assoc) (txc-size (gethash tsn out)))
-          (remhash tsn out))
+          (remhash tsn out)
+          (newly tsn))
         (when rtt (sctp-update-rtt assoc rtt)))
       ;; 2. gap-ack blocks: [cum+start, cum+end] were received out of order.
       (let ((gap-acked (make-hash-table)))
@@ -444,13 +449,23 @@ chunk reported missing >=3 times, then flush whatever the window now allows."
                            (when txc
                              (incf acked (txc-size txc))
                              (decf (sctp-assoc-flight assoc) (txc-size txc))
-                             (remhash tsn out))))))))
-        ;; 3. fast retransmit: chunks below the highest gap-acked TSN that are still
-        ;;    missing get a missing-indication; after the threshold, retransmit them.
+                             (remhash tsn out)
+                             (newly tsn))))))))
+        ;; 3. fast retransmit (RFC 4960 7.2.4): a chunk still missing below the highest TSN THIS
+        ;;    SACK NEWLY ACKNOWLEDGED gets a missing-indication; at the threshold it is resent,
+        ;;    ONCE.  Both halves were missing, and together they were a storm at every start:
+        ;;    * the indication was counted against the highest gap of every SACK, new or not, so
+        ;;      a hole that was only reordering -- a few ms of relay jitter at full rate -- was
+        ;;      "missing" three SACKs later and resent (208 chunks in 2 s, no loss at all);
+        ;;    * a resend reset the count and the hole stays in every SACK until the resend has
+        ;;      had a round trip to land, so the same chunk went again every three SACKs --
+        ;;      4000-5800 resends in the first 2 s through a real TURN.
+        ;;    After its one fast retransmit a chunk is the RTO's to resend.
         (when highest-gap
           (let ((fast '()))
             (maphash (lambda (tsn txc)
-                       (when (and (tsn< tsn highest-gap) (not (gethash tsn gap-acked)))
+                       (when (and highest-new (tsn< tsn highest-new)
+                                  (not (gethash tsn gap-acked)) (not (txc-fast txc)))
                          (incf (txc-missing txc))
                          (when (= (txc-missing txc) +sctp-fast-rtx-threshold+)
                            (push txc fast))))
@@ -465,8 +480,8 @@ chunk reported missing >=3 times, then flush whatever the window now allows."
               (incf (sctp-assoc-n-fast-rtx assoc) (length fast))
               (incf (sctp-assoc-n-rtx assoc) (length fast))
               (dolist (txc (sort fast (lambda (a b) (tsn< (txc-tsn a) (txc-tsn b)))))
-                (setf (txc-sent txc) (sctp-now) (txc-missing txc) 0 (txc-retx txc) t)
-                (sctp-transmit assoc (txc-bytes txc)))))))
+                (setf (txc-sent txc) (sctp-now) (txc-missing txc) 0 (txc-retx txc) t (txc-fast txc) t)
+                (sctp-transmit assoc (txc-bytes txc))))))))
       ;; 4. window + congestion-control bookkeeping.
       (setf (sctp-assoc-peer-rwnd assoc) new-rwnd)
       (when (and (sctp-assoc-peer-cum-ack assoc)
