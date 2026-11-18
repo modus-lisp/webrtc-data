@@ -121,10 +121,15 @@ the DTLS client; LITE advertises ICE-lite.  Audio is answered as G.711 PCMU (pt 
           ((string= (sdp-media-type m) "video")
            ;; VP8 only (we encode it; forcing VP8 also keeps the return direction off H.264).
            ;; sendonly: the box streams video to the browser, it sends none back.
+           ;; rtcp-fb nack / nack pli: the browser may say which packets it lost (we resend them)
+           ;; and that it lost the picture (we send a keyframe) -- webrtc-media's rtcp.lisp.
+           ;; Unoffered, it says neither, and one lost packet froze the video until the next
+           ;; scheduled keyframe.
            (let ((pt (and *answer-video* (sdp-media-codec-pt m "VP8"))))
              (format out "m=video ~d UDP/TLS/RTP/SAVPF ~d~%c=IN IP4 ~a~%a=rtcp-mux~%a=mid:~a~%~
-                          a=~:[inactive~;sendonly~]~%~@[a=rtpmap:~d VP8/90000~%~]~a~a"
-                     (if pt port 0) (or pt 96) ip (sdp-media-mid m) pt pt shared own)))
+                          a=~:[inactive~;sendonly~]~%~@[a=rtpmap:~d VP8/90000~%~]~
+                          ~@[a=rtcp-fb:~d nack~%~]~@[a=rtcp-fb:~d nack pli~%~]~a~a"
+                     (if pt port 0) (or pt 96) ip (sdp-media-mid m) pt pt pt pt shared own)))
           (t                                                   ; application / data channel
            (format out "m=application ~d UDP/DTLS/SCTP webrtc-datachannel~%c=IN IP4 ~a~%~
                         a=mid:~a~%a=sctp-port:~d~%a=max-message-size:65536~%~a~a"
