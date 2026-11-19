@@ -161,7 +161,9 @@ the given already-encoded chunks."
 
 (defstruct sctp-assoc
   session                                    ; seal DTLS session (transport)
-  (state :closed)                            ; :closed :established :aborted
+  (state :closed)                            ; :closed :established :aborted, and initiating:
+                                             ; :cookie-wait :cookie-echoed (client.lisp)
+  cookie                                     ; the peer's State Cookie, while we echo it
   (local-tag (logior 1 (rd-u32be (random-bytes 4) 0)))   ; our initiate tag
   peer-tag                                   ; aiortc's initiate tag (verification tag we send)
   (local-tsn (rd-u32be (random-bytes 4) 0))  ; our next outbound TSN
@@ -199,6 +201,8 @@ the given already-encoded chunks."
   ;; --- glue ---
   on-message                                 ; (funcall on-message assoc stream-id payload)
   on-ready                                   ; (funcall on-ready assoc stream-id) at DCEP OPEN
+  on-ack                                     ; (funcall on-ack assoc stream-id) at DCEP ACK: a
+                                             ; channel WE opened is open (client.lisp)
   (send-lock (bt:make-recursive-lock))       ; serialize send-side state + DTLS record layer
   ;; on an event loop (loop.lisp) a send must never wait: SCTP-SEND-DATA enqueues past the
   ;; bound, and the producer asks SCTP-BACKLOGGED-P instead
@@ -693,6 +697,56 @@ stateful (one association) so the cookie is an opaque blob the peer just echoes 
     (sctp-log assoc "~&  >> INIT-ACK our-tag=~a peer-tag=~a~%"
               (sctp-assoc-local-tag assoc) (sctp-assoc-peer-tag assoc))))
 
+;;; ---- the INITIATOR's half of the handshake ----------------------------------
+;;; The side that sends INIT is the side that offered (client.lisp): it dials the box, which is
+;;; the responder above.  RFC 4960 5.1: INIT (verification tag 0) -> INIT-ACK with a State Cookie
+;;; -> COOKIE-ECHO carrying it back -> COOKIE-ACK, and the association is up.  INIT carries the
+;;; same capabilities INIT-ACK does (partial reliability), so either end may send unreliably.
+
+(defun %sctp-init-params ()
+  (cat-bytes (u16be +param-forward-tsn-supported+) (u16be 4)
+             (u16be +param-supported-extensions+) (u16be 5)
+             (vector +chunk-forward-tsn+ 0 0 0)))
+
+(defun sctp-send-init (assoc)
+  "Send (or resend) our INIT.  The packet's verification tag is 0 until the peer has given us
+one, which SCTP-TRANSMIT does by itself (PEER-TAG is NIL)."
+  (sctp-transmit assoc
+                 (sctp-chunk +chunk-init+ 0
+                             (cat-bytes (u32be (sctp-assoc-local-tag assoc))
+                                        (u32be (sctp-assoc-a-rwnd assoc))
+                                        (u16be 65535) (u16be 65535)       ; out / in streams
+                                        (u32be (sctp-assoc-local-tsn assoc))
+                                        (%sctp-init-params))))
+  (sctp-log assoc "~&  >> INIT our-tag=~a tsn=~a~%" (sctp-assoc-local-tag assoc)
+            (sctp-assoc-local-tsn assoc)))
+
+(defun sctp-handle-init-ack (assoc value)
+  "The peer answered our INIT: take its tag, window and TSN, and echo its cookie."
+  (when (and (>= (length value) 16) (member (sctp-assoc-state assoc) '(:closed :cookie-wait)))
+    (setf (sctp-assoc-peer-tag assoc)  (rd-u32be value 0)
+          (sctp-assoc-peer-rwnd assoc) (rd-u32be value 4)
+          (sctp-assoc-last-received-tsn assoc) (u32 (1- (rd-u32be value 12)))
+          (sctp-assoc-peer-cum-ack assoc) (u32 (1- (sctp-assoc-local-tsn assoc))))
+    (let ((cookie (loop with pos = 16
+                        while (<= (+ pos 4) (length value))
+                        do (let ((type (rd-u16be value pos)) (len (rd-u16be value (+ pos 2))))
+                             (when (< len 4) (return nil))
+                             (when (= type +param-state-cookie+)
+                               (return (subseq value (+ pos 4) (min (length value) (+ pos len)))))
+                             (incf pos (+ len (mod (- (mod len 4)) 4)))))))
+      (sctp-log assoc "~&  << INIT-ACK peer-tag=~a -> COOKIE-ECHO~%" (sctp-assoc-peer-tag assoc))
+      (when cookie
+        (setf (sctp-assoc-state assoc) :cookie-echoed
+              (sctp-assoc-cookie assoc) cookie)
+        (sctp-transmit assoc (sctp-chunk +chunk-cookie-echo+ 0 cookie))))))
+
+(defun sctp-resend-handshake (assoc)
+  "The initiator's handshake timer: resend INIT or COOKIE-ECHO, whichever is unanswered."
+  (case (sctp-assoc-state assoc)
+    ((:closed :cookie-wait) (setf (sctp-assoc-state assoc) :cookie-wait) (sctp-send-init assoc))
+    (:cookie-echoed (sctp-transmit assoc (sctp-chunk +chunk-cookie-echo+ 0 (sctp-assoc-cookie assoc))))))
+
 ;;; ---- inbound processing ----------------------------------------------------
 
 (defun sctp-handle-init (assoc value)
@@ -719,7 +773,9 @@ stateful (one association) so the cookie is an opaque blob the peer just echoes 
          (when (sctp-assoc-on-ready assoc)
            (funcall (sctp-assoc-on-ready assoc) assoc stream-id)))
         ((= msg-type +dcep-ack+)
-         (sctp-log assoc "~&  << DCEP ACK stream=~a~%" stream-id))))))
+         (sctp-log assoc "~&  << DCEP ACK stream=~a~%" stream-id)
+         (when (sctp-assoc-on-ack assoc)
+           (funcall (sctp-assoc-on-ack assoc) assoc stream-id)))))))
 
 (defun sctp-deliver (assoc stream-id ppid user)
   "Hand one fully-ordered message up to the application (or the DCEP handler)."
@@ -880,7 +936,11 @@ handling INIT / COOKIE-ECHO / DATA / SACK / HEARTBEAT, and sends a SACK if DATA 
             ((= ctype +chunk-heartbeat+)
              ;; echo the params back as a HEARTBEAT-ACK
              (sctp-transmit assoc (sctp-chunk +chunk-heartbeat-ack+ 0 value)))
-            ((= ctype +chunk-cookie-ack+))
+            ((= ctype +chunk-init-ack+)    (sctp-handle-init-ack assoc value))
+            ((= ctype +chunk-cookie-ack+)
+             (when (eq (sctp-assoc-state assoc) :cookie-echoed)
+               (sctp-log assoc "~&  << COOKIE-ACK (ESTABLISHED)~%")
+               (setf (sctp-assoc-state assoc) :established)))
             ((= ctype +chunk-abort+)
              (sctp-log assoc "~&  << ABORT~%") (setf (sctp-assoc-state assoc) :aborted))
             ((= ctype +chunk-shutdown+)

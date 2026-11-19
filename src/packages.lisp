@@ -85,7 +85,14 @@
            ;; on an event loop (loop.lisp): no threads
            #:ice-answer-on-loop #:webrtc-start-on-loop #:webrtc-close-on-loop
            #:rtc-link #:link-assoc #:link-phase #:link-reason #:link-open-p #:link-conn
-           #:sctp-backlogged-p #:dtls-conn-agent #:ice-start-checks-on-loop))
+           #:sctp-backlogged-p #:dtls-conn-agent #:ice-start-checks-on-loop
+           ;; the CALLING side (client.lisp): offer, dial, hold channels
+           #:connect-peer #:make-rtc-peer #:rtc-create-channel #:rtc-offer #:rtc-accept-answer
+           #:rtc-close #:rtc-open-p #:rtc-peer #:rtc-channel #:rtc-channel-stream
+           #:peer-channels #:peer-state #:peer-reason #:peer-timings #:peer-agent #:peer-assoc
+           #:peer-remote-fingerprint #:peer-offer #:peer-on-close
+           #:channel-label #:channel-id #:channel-state #:channel-send #:channel-read
+           #:channel-on-message #:channel-negotiated-p #:*consent-interval*))
 
 (in-package #:webrtc-data)
 

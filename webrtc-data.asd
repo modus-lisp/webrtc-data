@@ -20,7 +20,8 @@
      (:file "sdp")         ; offer parse + answer generation (data-channel m-line)
      (:file "dtls")        ; DTLS 1.2 client (via seal) + ECDSA P-256 cert generation
      (:file "sctp")        ; SCTP association + DCEP (data channels over DTLS)
-     (:file "loop")))))    ; the same session on an event loop: no threads
+     (:file "loop")        ; the same session on an event loop: no threads
+     (:file "client")))))  ; the CALLING side: offer, DTLS server, SCTP initiator, channels
 
 ;;; Optional integration: register :webrtc as a cl-transport INBOUND backend, so any modus-lisp
 ;;; code can accept WebRTC data-channel connections through cl-transport's uniform EXPOSE — just
