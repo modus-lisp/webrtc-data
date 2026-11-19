@@ -180,6 +180,8 @@ writes are buffered and sent as one message per FORCE-OUTPUT / FINISH-OUTPUT."))
    (state :initform :new :accessor peer-state)    ; :new :offered :connecting :open :closed
    (reason :initform nil :accessor peer-reason)                ; why it closed
    (stop :initform nil :accessor %peer-stop)
+   (closing :initform nil :accessor %peer-closing)              ; RTC-CLOSE has begun
+   (relay-only :initarg :relay-only :initform nil :reader peer-relay-only)
    (thread :initform nil :accessor %peer-thread)
    (checks :initform nil :accessor %peer-checks)
    (tiebreaker :initform (random-bytes 8) :reader %peer-tiebreaker)
@@ -207,17 +209,25 @@ writes are buffered and sent as one message per FORCE-OUTPUT / FINISH-OUTPUT."))
 (defun %mark (peer what)
   (push (cons what (%secs-since (%peer-t0 peer))) (peer-timings peer)))
 
-(defun make-rtc-peer (&key local-ip gather-srflx gather-relay log on-close)
+(defun make-rtc-peer (&key local-ip gather-srflx gather-relay log on-close relay-only)
   "Bind a UDP socket and gather candidates for a new calling session (blocking, as the phone
 gathers before it offers).  GATHER-SRFLX asks a STUN server for our public mapping
 (*STUN-SERVERS*); GATHER-RELAY allocates a TURN relay -- T for env TURN_SERVER/USER/PASS, or a
 plist (:server \"host:port\" :user :pass).  LOCAL-IP is the host candidate's address (default:
-the primary IPv4, or env ICE_LOCAL_IP).  Declare channels with RTC-CREATE-CHANNEL, then RTC-OFFER."
+the primary IPv4, or env ICE_LOCAL_IP).  RELAY-ONLY is a browser's iceTransportPolicy \"relay\":
+only the relay candidate is offered and every check (so every packet) goes through the TURN
+allocation -- what a phone on a hard NAT ends up using.  Declare channels with
+RTC-CREATE-CHANNEL, then RTC-OFFER."
   (let* ((agent (make-ice :local-ip (or local-ip (uiop:getenv "ICE_LOCAL_IP"))))
          (conn (webrtc-dtls-setup agent))
-         (peer (make-instance 'rtc-peer :agent agent :conn conn :log log :on-close on-close)))
+         (peer (make-instance 'rtc-peer :agent agent :conn conn :log log :on-close on-close
+                                        :relay-only relay-only)))
     (when gather-srflx (ice-gather-srflx agent))
-    (when gather-relay (apply #'ice-gather-relay agent (if (listp gather-relay) gather-relay '())))
+    (when (or gather-relay relay-only)
+      (apply #'ice-gather-relay agent (if (listp gather-relay) gather-relay '())))
+    (when (and relay-only (null (ice-agent-relay-ip agent)))
+      (ice-close agent)
+      (werr "relay-only, and no TURN relay could be allocated"))
     ;; Our end of DTLS is the SERVER (the answer will say a=setup:active).
     (seal:dtls-server-start (dtls-conn-session conn) :timeout 0.4)
     ;; The pump dtls.lisp installed, plus: the first datagram from the peer names the route if
@@ -225,7 +235,7 @@ the primary IPv4, or env ICE_LOCAL_IP).  Declare channels with RTC-CREATE-CHANNE
     (let ((mb (dtls-conn-mailbox conn)))
       (setf (ice-agent-on-packet agent)
             (lambda (pkt host port)
-              (unless (ice-agent-peer agent)
+              (unless (or (ice-agent-peer agent) relay-only)
                 (ignore-errors (ice-note-peer agent (list host port))))
               (mailbox-push mb pkt))))
     (%mark peer :gathered)
@@ -255,11 +265,11 @@ without it they queue for RTC-CHANNEL-STREAM / CHANNEL-READ.  Returns the RTC-CH
 
 ;;; ---- the offer ----------------------------------------------------------------------------
 
-(defun %offer-candidates (agent)
+(defun %offer-candidates (agent &optional relay-only)
   (let ((ip (ice-agent-local-ip agent)) (port (ice-agent-port agent)))
     (with-output-to-string (o)
-      (format o "a=candidate:1 1 udp 2130706431 ~a ~d typ host~%" ip port)
-      (when (ice-agent-srflx-ip agent)
+      (unless relay-only (format o "a=candidate:1 1 udp 2130706431 ~a ~d typ host~%" ip port))
+      (when (and (ice-agent-srflx-ip agent) (not relay-only))
         (format o "a=candidate:2 1 udp 1694498815 ~a ~d typ srflx raddr ~a rport ~d~%"
                 (ice-agent-srflx-ip agent) (ice-agent-srflx-port agent) ip port))
       (when (ice-agent-relay-ip agent)
@@ -282,7 +292,7 @@ opened by DCEP, the negotiated ones are agreed out of band), as in a browser's o
                            a=ice-ufrag:~a~%a=ice-pwd:~a~%a=fingerprint:sha-256 ~a~%a=setup:actpass~%~
                            a=mid:0~%a=sctp-port:5000~%a=max-message-size:262144~%"
                         sid (ice-agent-port agent) (ice-agent-local-ip agent)
-                        (%offer-candidates agent)
+                        (%offer-candidates agent (peer-relay-only peer))
                         (ice-agent-local-ufrag agent) (ice-agent-local-pwd agent)
                         (dtls-conn-fingerprint conn)))))
     ;; CRLF, as SDP is written on the wire (RFC 8866); our parser takes either.
@@ -316,10 +326,15 @@ not IPv6), highest priority first."
                        (copy-list (ice-agent-remote-candidates agent)))
         #'> :key (lambda (c) (or (ice-candidate-priority c) 0))))
 
-(defun %send-to-candidate (agent bytes c)
+(defun %send-to-candidate (agent bytes c &optional relay)
+  "BYTES to candidate C: straight from our socket, or with RELAY through our TURN allocation (a
+Send indication; the reply comes back as a Data indication and the ICE agent then answers on the
+same path, so the selected route is the relay)."
   (ignore-errors
-   (ice-send agent bytes (sb-bsd-sockets:make-inet-address (ice-candidate-ip c))
-             (ice-candidate-port c))))
+   (let ((host (sb-bsd-sockets:make-inet-address (ice-candidate-ip c))))
+     (if relay
+         (ice-send agent bytes :relay-send (cons host (ice-candidate-port c)))
+         (ice-send agent bytes host (ice-candidate-port c))))))
 
 (defun %start-checks (peer &key (interval 0.1) (duration 30.0))
   "Check every candidate pair until one answers (the ICE agent selects it on the Binding
@@ -338,7 +353,8 @@ moment so a lost USE-CANDIDATE does not matter."
                             (progn (decf extra)
                                    (ignore-errors (ice-send-to-peer agent (%check-request peer))))
                             (dolist (c (%ice-targets agent))
-                              (%send-to-candidate agent (%check-request peer) c)))
+                              (%send-to-candidate agent (%check-request peer) c
+                                                  (peer-relay-only peer))))
                         (sleep interval))))
            :name "rtc-ice-checks"))))
 
@@ -514,7 +530,11 @@ WEBRTC-ERROR on failure or after TIMEOUT seconds; PEER is then closed."
 (defun rtc-close (peer &key abort)
   "End PEER: an SCTP ABORT tells the answerer at once (rather than after its silence timeout),
 then the threads stop and the socket -- and any TURN allocation -- is released.  ABORT skips the
-goodbye (used on a failed connect)."
+goodbye (used on a failed connect).  Safe from several threads at once: the first does the
+work, the others return (a viewer's reader and its closer both hang up)."
+  (unless (bt:with-lock-held ((%peer-lock peer))
+            (unless (%peer-closing peer) (setf (%peer-closing peer) t)))
+    (return-from rtc-close peer))
   (unless (eq (peer-state peer) :closed)
     (let ((assoc (peer-assoc peer)))
       (when (and assoc (not abort) (eq (sctp-assoc-state assoc) :established))
@@ -525,7 +545,15 @@ goodbye (used on a failed connect)."
     (when (and thr (not (eq thr (bt:current-thread))))
       (ignore-errors (bt:join-thread thr))))
   (%peer-closed peer)
-  (ignore-errors (ice-close (peer-agent peer)))
+  ;; Release the TURN allocation (Refresh, lifetime 0) THROUGH the receive thread, then forget it
+  ;; so ICE-CLOSE does not do it again its own way: that reads the socket directly, racing the
+  ;; receive thread for the reply -- and a SOCKET-RECEIVE that loses the race blocks for ever (it
+  ;; hung this close about one time in six).
+  (let* ((agent (peer-agent peer)) (alloc (ice-agent-turn agent)))
+    (when alloc
+      (ignore-errors (cl-transport.ice::turn-refresh-via-loop alloc :lifetime 0 :timeout 1.0))
+      (setf (ice-agent-turn agent) nil))
+    (ignore-errors (ice-close agent)))
   peer)
 
 (defun rtc-open-p (peer) (eq (peer-state peer) :open))
@@ -533,14 +561,15 @@ goodbye (used on a failed connect)."
 ;;; ---- one call -------------------------------------------------------------------------------
 
 (defun connect-peer (signal-fn &key channels local-ip gather-srflx gather-relay (timeout 30.0)
-                                    log on-close)
+                                    log on-close relay-only)
   "Dial: gather, offer, have SIGNAL-FN deliver the offer and return the answer, connect.
 SIGNAL-FN is called with the offer SDP (a string) and returns the answer SDP, or NIL for no
 answer.  CHANNELS is a list of (LABEL &key ID NEGOTIATED ORDERED PROTOCOL ON-MESSAGE) specs,
 declared before the offer.  Returns the open RTC-PEER (its channels by RTC-CHANNEL, as streams
-by RTC-CHANNEL-STREAM); signals WEBRTC-ERROR."
+by RTC-CHANNEL-STREAM); signals WEBRTC-ERROR.  RELAY-ONLY: see MAKE-RTC-PEER."
   (let ((peer (make-rtc-peer :local-ip local-ip :gather-srflx gather-srflx
-                             :gather-relay gather-relay :log log :on-close on-close)))
+                             :gather-relay gather-relay :log log :on-close on-close
+                             :relay-only relay-only)))
     (handler-bind ((error (lambda (e) (declare (ignore e)) (rtc-close peer :abort t))))
       (dolist (spec channels) (apply #'rtc-create-channel peer spec))
       (let ((answer (funcall signal-fn (rtc-offer peer))))

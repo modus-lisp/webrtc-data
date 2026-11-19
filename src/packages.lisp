@@ -90,7 +90,7 @@
            #:connect-peer #:make-rtc-peer #:rtc-create-channel #:rtc-offer #:rtc-accept-answer
            #:rtc-close #:rtc-open-p #:rtc-peer #:rtc-channel #:rtc-channel-stream
            #:peer-channels #:peer-state #:peer-reason #:peer-timings #:peer-agent #:peer-assoc
-           #:peer-remote-fingerprint #:peer-offer #:peer-on-close
+           #:peer-remote-fingerprint #:peer-offer #:peer-on-close #:peer-relay-only
            #:channel-label #:channel-id #:channel-state #:channel-send #:channel-read
            #:channel-on-message #:channel-negotiated-p #:*consent-interval*))
 

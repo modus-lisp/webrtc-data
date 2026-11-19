@@ -153,6 +153,26 @@ in the gateway's environment.
 (sctp-stats assoc)                                   ; -> plist of counters + window health
 ```
 
+## The calling side
+
+Everything above answers.  `src/client.lisp` is the other end — the one a browser plays — so a
+Lisp program can dial a box the way a phone does:
+
+```lisp
+(webrtc-data:connect-peer
+  (lambda (offer-sdp) (signal-and-wait-for-answer offer-sdp))   ; your signalling: offer in, answer out
+  :channels '(("rfb") ("control" :id 100))                     ; declared BEFORE the offer
+  :gather-relay '(:server "turn.example:3478" :user "u" :pass "p"))
+;; => an open RTC-PEER; (rtc-channel-stream (rtc-channel peer "rfb")) is a byte stream
+```
+
+Non-trickle offer (one m=application, every candidate, `a=setup:actpass`); ICE **controlling**
+(USE-CANDIDATE, consent checks); DTLS **server** role (seal's `dtls-server.lisp` — the answerer
+picks `active`); SCTP **initiator**; DCEP OPEN on odd stream ids (RFC 8832 §6), negotiated
+channels on fixed ids; `:relay-only` for a browser's `iceTransportPolicy: "relay"`.  Threaded
+(no event-loop driver yet).  `test/client-test.lisp` runs it against this library's own answerer in
+one process.  glass-webrtc's `glass-webrtc/dial` puts the phone's Nostr signalling on top.
+
 ## Scope (honestly)
 
 Implemented: data channels over a single ordered/reliable SCTP stream, and the full ICE
