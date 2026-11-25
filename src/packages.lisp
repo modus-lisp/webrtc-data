@@ -48,7 +48,7 @@
                 #:ice-gather-srflx #:ice-handle-stun #:ice-local-end-type #:ice-note-peer
                 #:ice-offered-counts #:ice-relayed-inner #:ice-relayed-inner-send #:ice-remote-end-type
                 #:ice-route-label #:ice-selection-secs #:ice-send #:ice-send-to-peer
-                #:ice-serve #:ice-silent-secs #:ice-start-checks #:ice-string
+                #:ice-serve #:ice-poll #:ice-agent-pull #:ice-silent-secs #:ice-start-checks #:ice-string
                 #:local-ipv4 #:make-ice #:make-ice-agent #:make-ice-candidate
                 #:make-turn-alloc #:parse-xor-mapped-address #:resolve-host #:stun-attr
                 #:stun-transaction-id #:stun-username-key #:tdbg #:turn-alloc
@@ -78,7 +78,7 @@
            #:turn-allocate #:turn-alloc-relay-ip #:turn-alloc-relay-port #:make-turn-alloc
            #:turn-install-peer #:turn-create-permission #:turn-channel-bind #:turn-refresh
            #:generate-webrtc-cert #:webrtc-identity #:webrtc-dtls-setup #:webrtc-dtls-run
-           #:dtls-conn-session #:dtls-conn-fingerprint
+           #:dtls-conn-session #:dtls-conn-fingerprint #:dtls-conn-pop #:ice-poll
            #:webrtc-serve-datachannel #:sctp-assoc #:sctp-assoc-state
            #:sctp-send-data #:sctp-send-string #:sctp-send-binary #:sctp-stats
            #:webrtc-error

@@ -1,0 +1,30 @@
+;;;; test/transport-split-client.lisp — the calling half of transport-split.sh: two sessions in
+;;;; a row through the server's POST /signal (by curl), 5 bytes each way, each must come back
+;;;; reversed.  The second session reuses the first one's slot.
+(require :asdf)
+(handler-bind ((warning #'muffle-warning))
+  (let ((*standard-output* (make-broadcast-stream))) (asdf:load-system "webrtc-data")))
+(defun curl-post (port path body)
+  (let* ((out (with-output-to-string (o)
+                (with-input-from-string (in body)
+                  (sb-ext:run-program "curl" (list "-sS" "-o" "-" "-w" (format nil "~%%{http_code}")
+                                                   "--data-binary" "@-"
+                                                   (format nil "http://127.0.0.1:~d~a" port path))
+                                      :search t :input in :output o :error nil))))
+         (nl (position #\Newline out :from-end t)))
+    (values (subseq out 0 nl) (parse-integer out :start (1+ nl) :junk-allowed t))))
+(let ((port (with-open-file (i (uiop:getenv "PORT_FILE")) (parse-integer (read-line i)))) (ok 0))
+  (dotimes (k 2)
+    (handler-case
+        (let* ((peer (webrtc-data:connect-peer (lambda (o) (curl-post port "/signal" o))
+                                               :local-ip "127.0.0.1" :channels '(("bytes")) :timeout 60.0))
+               (s (webrtc-data:rtc-channel-stream (webrtc-data:rtc-channel peer "bytes")))
+               (buf (make-array 5 :element-type '(unsigned-byte 8))))
+          (write-sequence (map '(vector (unsigned-byte 8)) #'char-code "hello") s) (force-output s)
+          (read-sequence buf s)
+          (format t "~&session ~d: ~a~%" k (map 'string #'code-char buf))
+          (when (equalp (map 'string #'code-char buf) "olleh") (incf ok))
+          (webrtc-data:rtc-close peer :abort t))
+      (error (e) (format t "~&session ~d FAIL: ~a~%" k e))))
+  (format t "~&CLIENT ~d/2~%" ok))
+(sb-ext:exit :code 0 :abort t)

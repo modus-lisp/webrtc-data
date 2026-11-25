@@ -32,7 +32,8 @@
   :version "0.1.0"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("webrtc-data" "cl-transport" "cl-transport/http-server" "bordeaux-threads")
+  :depends-on ("webrtc-data" "cl-transport" "cl-transport/http-server" "cl-transport/chan"
+               "bordeaux-threads")
   :serial t
   :components
   ((:module "src"

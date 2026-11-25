@@ -13,7 +13,9 @@
 ;;;;
 ;;;; The glue turns the ICE agent into a datagram transport: non-STUN packets
 ;;;; arriving on the ICE socket are pumped into a mailbox, and seal's handshake
-;;;; reads that mailbox and writes back through ICE-SEND.
+;;;; reads that mailbox and writes back through ICE-SEND.  With the agent in PULL
+;;;; mode (ICE-SERVE :MODE :PULL) the session's own thread reads the socket
+;;;; (DTLS-CONN-POP), and no receive thread exists at all.
 
 (in-package #:webrtc-data)
 
@@ -108,7 +110,15 @@ it sat between every offer and its answer.  Nothing ties the cert to a session -
 still makes its own ECDHE key -- and a browser keeps one certificate across connections the same
 way.  Call it at startup to take the cost before the first phone is waiting."
   (values-list (or *webrtc-identity*
-                   (setf *webrtc-identity* (multiple-value-list (generate-webrtc-cert))))))
+                   (let ((id (multiple-value-list (generate-webrtc-cert))))
+                     ;; Cached only where the cache may hold it.  On modus a thread may not store
+                     ;; its own objects into a global another thread made: there a session thread
+                     ;; that finds no identity makes one for itself, every time, and the store is
+                     ;; refused.  Call WEBRTC-IDENTITY on the main thread at start-up (EXPOSE does)
+                     ;; so every session finds it made.
+                     (handler-case (setf *webrtc-identity* id)
+                       (error () nil))
+                     id))))
 
 ;;; ---- datagram mailbox (ICE recv thread -> DTLS handshake thread) -----------
 
@@ -157,6 +167,26 @@ ICE-SERVE so no early DTLS records are dropped."
       (make-dtls-conn :agent agent :session session :mailbox mb
                       :cert-der der :sign-fn sign-fn :fingerprint fp))))
 
+(defun dtls-conn-pop (conn timeout)
+  "The next non-STUN datagram for CONN, waiting up to TIMEOUT seconds; NIL on timeout.
+
+If CONN's ICE agent was started in PULL mode (ICE-SERVE :MODE :PULL), this thread reads the
+socket itself: ICE-POLL dispatches what arrives -- STUN answered there, DTLS records pushed onto
+the mailbox by ON-PACKET, on this same thread -- and the first one is returned.  Otherwise a
+receive thread fills the mailbox and this waits on it."
+  (let ((agent (dtls-conn-agent conn)) (mb (dtls-conn-mailbox conn)))
+    (if (not (ice-agent-pull agent))
+        (mailbox-pop mb timeout)
+        (let ((deadline (+ (get-internal-real-time)
+                           (round (* timeout internal-time-units-per-second)))))
+          (loop
+            (when (mailbox-items mb) (return (mailbox-pop mb 0)))
+            (let ((left (/ (float (- deadline (get-internal-real-time)) 1d0)
+                           internal-time-units-per-second)))
+              (when (or (<= left 0) (ice-agent-stop agent))
+                (return (and (mailbox-items mb) (mailbox-pop mb 0))))
+              (ice-poll agent :timeout (min left 0.05))))))))
+
 (defun webrtc-dtls-run (conn &key (timeout 0.4) (peer-wait 120.0))
   "Wait for ICE to settle on a peer, then drive the DTLS client handshake.  TIMEOUT is the
 INITIAL handshake retransmit timer — seal backs it off exponentially, so a low value makes a
@@ -174,9 +204,10 @@ dropped 33 s after the answer went out (2026-10-27), so 120."
           until (ice-agent-peer agent)
           do (when (>= (get-internal-real-time) deadline)
                (werr "DTLS: no ICE peer within ~as" peer-wait))
-             (sleep 0.05))
+             ;; PULL mode: the peer is selected by a STUN check this thread has to read.
+             (if (ice-agent-pull agent) (ice-poll agent :timeout 0.05) (sleep 0.05)))
     (seal:dtls-client-handshake
      (dtls-conn-session conn)
-     (lambda (to) (mailbox-pop (dtls-conn-mailbox conn) to))
+     (lambda (to) (dtls-conn-pop conn to))
      :timeout timeout)
     (dtls-conn-session conn)))

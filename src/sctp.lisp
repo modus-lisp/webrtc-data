@@ -971,7 +971,8 @@ fields (:cwnd, :peer-rwnd, :flight, :outstanding, :send-q, :rto) are instantaneo
 
 ;;; ---- driver: run the association over a DTLS-CONN --------------------------
 
-(defun webrtc-serve-datachannel (conn &key on-message on-ready (duration 30.0) log alive-p)
+(defun webrtc-serve-datachannel (conn &key on-message on-ready (duration 30.0) log alive-p
+                                           on-pass (tick 0.05))
   "Run the SCTP association + DCEP over the (already handshaked) DTLS-CONN for up to DURATION
 seconds (or until the peer ABORTs), pumping inbound datagrams from the mailbox.  ON-MESSAGE,
 if given, is called as (funcall on-message ASSOC STREAM-ID PAYLOAD) for each inbound message
@@ -980,10 +981,12 @@ if given, is called as (funcall on-message ASSOC STREAM-ID PAYLOAD) for each inb
 should start pushing bytes (e.g. glass, whose RFB server speaks first).  Returns the
 SCTP-ASSOC.  Higher layers push with SCTP-SEND-DATA / SCTP-SEND-STRING and pull via ON-MESSAGE.
 
-The loop wakes ~20x/s: a short mailbox timeout lets SCTP-TICK run the retransmission timer
-even when no datagrams are arriving."
+The loop wakes every TICK seconds (default 0.05, ~20x/s): a short mailbox timeout lets SCTP-TICK
+run the retransmission timer even when no datagrams are arriving.  ON-PASS, if given, is called
+as (funcall on-pass ASSOC) on every pass, on this thread: where a caller that owns nothing else
+of the association feeds it -- e.g. drains a channel of outbound messages into SCTP-SEND-DATA.
+With the ICE agent in PULL mode (ICE-SERVE :MODE :PULL) this thread also reads the socket."
   (let* ((session (dtls-conn-session conn))
-         (mb (dtls-conn-mailbox conn))
          (assoc (make-sctp-assoc :session session :on-message on-message :on-ready on-ready :log log))
          (deadline (+ (get-internal-real-time)
                       (round (* duration internal-time-units-per-second)))))
@@ -993,11 +996,12 @@ even when no datagrams are arriving."
     (loop while (and (< (get-internal-real-time) deadline)
                      (not (eq (sctp-assoc-state assoc) :aborted))
                      (or (null alive-p) (funcall alive-p)))
-          do (let ((dg (mailbox-pop mb 0.05)))
+          do (let ((dg (dtls-conn-pop conn tick)))
                (when dg
                  (dolist (sctp (seal:dtls-handle-datagram session dg))
                    (handler-case (sctp-input assoc sctp)
                      (error (e) (sctp-log assoc "~&  !! sctp-input error: ~a~%" e)))))
+               (when on-pass (funcall on-pass assoc))
                (handler-case (sctp-tick assoc)
                  (error (e) (sctp-log assoc "~&  !! sctp-tick error: ~a~%" e)))))
     assoc))

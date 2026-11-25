@@ -8,5 +8,6 @@
   (:local-nicknames (#:wd #:webrtc-data)
                     (#:ct #:cl-transport)
                     (#:http #:cl-transport.http-server)
+                    (#:chan #:cl-transport.chan)
                     (#:bt #:bordeaux-threads))
   (:export #:webrtc-channel-stream #:%webrtc-expose))

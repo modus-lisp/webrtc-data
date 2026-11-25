@@ -117,6 +117,16 @@ and its HTTP server (`cl-transport/http-server`) stay out of core webrtc-data's 
 them in, mirroring how cl-frpc provides `:frp`. Verified with an aiortc peer echoing bytes straight
 through `cl-transport:expose`.
 
+**Threads share nothing.** Each session runs on its own thread, started on a named function with
+the offer string as an argument; that thread builds the ICE agent, DTLS and SCTP and reads the UDP
+socket itself (cl-transport's ICE pull mode — no receive thread).  The handler runs on a third
+thread with a stream of its own; bytes cross between them only as copies through
+`cl-transport/chan` channels (modus channels on modus, a locked queue of copies on SBCL).  That is
+what lets the backend run on modus, where a thread may not store its objects into another
+thread's.  On modus, pass `expose` a global function or a closure made on the main thread, and
+call `expose` on the main thread.  `test/transport-split.sh` runs the server on one Lisp
+(`SERVER_CMD="modus --script"`) against the calling side on SBCL.
+
 ## Quick start
 
 ```lisp
