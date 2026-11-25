@@ -14,7 +14,7 @@
 ;;;;   1. WEBRTC-CHANNEL-STREAM — a Gray binary stream that bridges the message-oriented data
 ;;;;      channel to a byte stream: inbound SCTP messages are concatenated into a read buffer
 ;;;;      (blocking reads); outbound bytes are buffered and flushed as chunked SCTP messages.
-;;;;   2. %WEBRTC-EXPOSE — the :webrtc backend fn: a hunchentoot POST /signal endpoint that
+;;;;   2. %WEBRTC-EXPOSE — the :webrtc backend fn: an HTTP POST /signal endpoint that
 ;;;;      drives the answerer per peer and delivers each open channel to ON-CONNECTION.
 ;;;;
 ;;;; cl-transport stays OUT of core webrtc-data's deps — this is an optional integration
@@ -164,7 +164,10 @@ EOF).  Callers loop like they would on a TCP socket."
 ;;; ---------------------------------------------------------------------------
 ;;; 2. The :webrtc backend fn.
 ;;;
-;;; Signaling: a hunchentoot POST /signal (offer in, answer out), like the glass demo.  For
+;;; Signaling: a POST /signal (offer in, answer out) on cl-transport/http-server, like the glass
+;;; gateway.  The server is this EXPOSE's own, with its own routes: hunchentoot's one global
+;;; *DISPATCH-TABLE* meant a second EXPOSE (or the glass gateway) in the same image took the first
+;;; one's /signal away.  For
 ;;; each offer we run the full answerer on a background thread; when the data channel opens we
 ;;; build a WEBRTC-CHANNEL-STREAM and hand it to ON-CONNECTION (on its OWN thread, so the
 ;;; serve-datachannel loop keeps pumping inbound messages / SACKs while the handler blocks on
@@ -208,15 +211,16 @@ EOF).  Callers loop like they would on a TCP socket."
 webrtc-data answerer and deliver each open data channel to ON-CONNECTION.  Returns a zero-arg
 closer thunk (stops the acceptor + EOFs live sessions).
 
-OPTS (all optional): :signal-host \"0.0.0.0\" :signal-port 8766 :signal-path \"/signal\"
-:duration 86400.0 :local-ip <advertised host candidate> :gather-srflx :gather-relay."
+OPTS (all optional): :signal-host \"0.0.0.0\" :signal-port 8766 (0: ephemeral) :signal-path
+\"/signal\" :duration 86400.0 :local-ip <advertised host candidate> :gather-srflx :gather-relay
+:on-listening (called with the bound port once the endpoint accepts)."
   (destructuring-bind (&key (signal-host "0.0.0.0") (signal-port 8766) (signal-path "/signal")
-                            (duration 86400.0) local-ip gather-srflx gather-relay
+                            (duration 86400.0) local-ip gather-srflx gather-relay on-listening
                        &allow-other-keys)
       opts
     (let ((sessions '())
           (slock (bt:make-lock "webrtc-expose"))
-          acceptor)
+          server)
       (labels ((process-offer (offer-sdp)
                  "Offer SDP in -> answer SDP out; spawn the answerer session.  Reusable by any
                   signaling front-end, not just HTTP."
@@ -235,20 +239,17 @@ OPTS (all optional): :signal-host \"0.0.0.0\" :signal-port 8766 :signal-path \"/
                                :name "webrtc-session")))
                      (bt:with-lock-held (slock) (push thr sessions)))
                    answer))
-               (signal-handler ()
-                 (setf (hunchentoot:content-type*) "application/sdp")
-                 (process-offer (hunchentoot:raw-post-data :force-text t))))
-        (setf acceptor (make-instance 'hunchentoot:easy-acceptor
-                                      :address signal-host :port signal-port))
-        (setf hunchentoot:*dispatch-table*
-              (list (hunchentoot:create-regex-dispatcher
-                     (format nil "^~a$" signal-path) #'signal-handler)))
-        (hunchentoot:start acceptor)
+               (signal-handler (request)
+                 (setf (http:reply-content-type request) "application/sdp")
+                 (process-offer (http:request-body-string request))))
+        (setf server (http:start-server :host signal-host :port signal-port :name "webrtc-signal"
+                                        :routes (list (list "POST" signal-path #'signal-handler))))
         (format *error-output* "~&[webrtc-transport] :webrtc EXPOSE — POST http://~a:~a~a~%"
-                signal-host signal-port signal-path)
+                signal-host (http:server-port server) signal-path)
+        (when on-listening (funcall on-listening (http:server-port server)))
         ;; closer thunk
         (lambda ()
-          (ignore-errors (hunchentoot:stop acceptor))
+          (ignore-errors (http:stop-server server))
           (bt:with-lock-held (slock)
             (dolist (thr sessions) (ignore-errors (bt:destroy-thread thr)))
             (setf sessions '())))))))

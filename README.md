@@ -113,7 +113,7 @@ as `:tcp` (built in) and `:frp` (via cl-frpc) — and never branch on how the by
 `stream` is a Gray binary stream (`(unsigned-byte 8)`) over the SCTP data channel: inbound
 messages are concatenated into a blocking byte stream, outbound writes are buffered and flushed as
 chunked SCTP messages on `force-output` — read/write it exactly like a TCP socket. cl-transport
-and hunchentoot stay out of core webrtc-data's dependencies; only this integration system pulls
+and its HTTP server (`cl-transport/http-server`) stay out of core webrtc-data's dependencies; only this integration system pulls
 them in, mirroring how cl-frpc provides `:frp`. Verified with an aiortc peer echoing bytes straight
 through `cl-transport:expose`.
 
@@ -130,7 +130,7 @@ Run the remote desktop — now its own repository,
 it is the way a browser reaches a glass desktop, and it is versioned on its own now.
 
 1. Start a glass RFB server on :5900 — e.g. `(glass-term:run :port 5900)`.
-2. `(asdf:load-system "glass-webrtc")` then `(webrtc-data::start-gateway)` — hunchentoot
+2. `(asdf:load-system "glass-webrtc")` then `(webrtc-data::start-gateway)` — cl-transport/http-server
    serves the page plus one `POST /signal`; noVNC is vendored in that repo, or point
    `NOVNC_DIR` at your own 1.7+ checkout.
 3. Open `http://<host>:8765/` in any browser. noVNC rides the data channel directly —

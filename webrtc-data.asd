@@ -25,14 +25,14 @@
 
 ;;; Optional integration: register :webrtc as a cl-transport INBOUND backend, so any modus-lisp
 ;;; code can accept WebRTC data-channel connections through cl-transport's uniform EXPOSE — just
-;;; like :tcp (built in) and :frp (via cl-frpc).  cl-transport + hunchentoot stay OUT of core
+;;; like :tcp (built in) and :frp (via cl-frpc).  cl-transport + its HTTP server stay OUT of core
 ;;; webrtc-data's deps; they're only pulled in when you load this system.
 (defsystem "webrtc-data/transport"
   :description "cl-transport :webrtc inbound backend: accept WebRTC data channels via EXPOSE."
   :version "0.1.0"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("webrtc-data" "cl-transport" "hunchentoot" "bordeaux-threads")
+  :depends-on ("webrtc-data" "cl-transport" "cl-transport/http-server" "bordeaux-threads")
   :serial t
   :components
   ((:module "src"
