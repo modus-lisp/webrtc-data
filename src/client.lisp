@@ -623,9 +623,10 @@ all on this thread.  Signals WEBRTC-ERROR on failure or after TIMEOUT seconds."
       (ice-accept-remote agent :ufrag (sdp-ice-ufrag sdp) :pwd (sdp-ice-pwd sdp)
                                :candidates (sdp-candidates sdp))
       ;; Our TURN allocation (if any) must PERMIT the answerer's addresses before its checks or
-      ;; its relayed packets can reach us.  Its refresh needs no thread: in PULL mode nothing
-      ;; else reads the socket, so ICE-CLOSE's release (and a long session's refresh) can read
-      ;; the answer directly.
+      ;; its relayed packets can reach us.  Its upkeep needs no thread: in PULL mode ICE-POLL
+      ;; refreshes the allocation, these permissions and any channel binding before they lapse
+      ;; (cl-transport ice.lisp), and nothing else reads the socket, so ICE-CLOSE's release can
+      ;; read its answer directly.
       (let ((alloc (ice-agent-turn agent)))
         (when alloc
           (dolist (ip (remove-duplicates (mapcar #'ice-candidate-ip (%ice-targets agent))
