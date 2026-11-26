@@ -179,9 +179,16 @@ Lisp program can dial a box the way a phone does:
 Non-trickle offer (one m=application, every candidate, `a=setup:actpass`); ICE **controlling**
 (USE-CANDIDATE, consent checks); DTLS **server** role (seal's `dtls-server.lisp` — the answerer
 picks `active`); SCTP **initiator**; DCEP OPEN on odd stream ids (RFC 8832 §6), negotiated
-channels on fixed ids; `:relay-only` for a browser's `iceTransportPolicy: "relay"`.  Threaded
-(no event-loop driver yet).  `test/client-test.lisp` runs it against this library's own answerer in
-one process.  glass-webrtc's `glass-webrtc/dial` puts the phone's Nostr signalling on top.
+channels on fixed ids; `:relay-only` for a browser's `iceTransportPolicy: "relay"`.
+
+One session thread owns the whole session -- gathering, ICE in pull mode (it reads the socket
+itself), DTLS, SCTP, consent -- and the `rtc-peer` you get back is a handle over two
+`cl-transport/chan` channels to it: `channel-send`, `channel-read`, `rtc-channel-stream`,
+`rtc-close`, `peer-stats` (SCTP counters plus `:route`).  Events are taken on YOUR thread whenever
+you touch the peer (a read, `rtc-open-p`, `rtc-pump`), so `channel-on-message` and `:on-close` run
+there; a loop that only waits on callbacks calls `rtc-pump`.  On modus, use a peer from the thread
+that dialled.  `test/client-test.lisp` runs it against this library's own answerer (also on a
+thread of its own) in one process -- on SBCL and on modus.  glass-webrtc's `glass-webrtc/dial` puts the phone's Nostr signalling on top.
 
 ## Scope (honestly)
 

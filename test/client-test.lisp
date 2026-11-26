@@ -28,50 +28,70 @@
     (dotimes (i n v) (setf (aref v i) (mod (+ (* i seed) (ash i -8)) 256)))))
 
 ;;; ---- the answering side: the box's threaded path ------------------------------------------
+;;;
+;;; The box runs on a thread of its own, started on a NAMED function with the offer and two
+;;; channels -- as webrtc-data/transport runs one -- and owns everything it builds; it TELLS this
+;;; thread what it saw (on REPORT) rather than writing it here.  That is what modus requires (a
+;;; thread there may not store its objects into another thread's), and it costs SBCL nothing.
 
 (defvar *box-ready* '())                ; stream ids the box saw DCEP OPEN on
 (defvar *box-got* '())                  ; (sid . payload) the box received
-(defvar *box-assoc* nil)
 (defvar *box-end* nil)                  ; the association's final state, once its loop returns
-(defvar *box-lock* (sb-thread:make-mutex))
+(defvar *box-reply* (cl-transport.chan:make-chan :capacity 65536))
+(defvar *box-report* (cl-transport.chan:make-chan :capacity (* 1024 1024)))
+
+(defun box-main (offer-sdp reply report)
+  "The box's session: answer OFFER-SDP on REPLY, then serve it, saying what happened on REPORT."
+  (let ((agent nil))
+    (handler-case
+        (let* ((offer (wd:parse-sdp offer-sdp))
+               (a (setf agent (wd:make-ice :local-ip "127.0.0.1")))
+               (conn (wd:webrtc-dtls-setup a :remote-fingerprint (wd:sdp-fingerprint offer)))
+               (answer (wd:ice-answer a offer :fingerprint (wd::dtls-conn-fingerprint conn))))
+          (wd:ice-serve a :mode :pull)
+          (wd:ice-start-checks a)
+          (cl-transport.chan:chan-send reply answer)
+          (wd:webrtc-dtls-run conn :peer-wait 20.0)
+          (let ((assoc (wd:webrtc-serve-datachannel
+                        conn :duration 30.0 :tick 0.01
+                        :on-ready (lambda (assoc sid)
+                                    (cl-transport.chan:chan-send report (list :ready sid))
+                                    ;; like an RFB server: the box speaks first
+                                    (wd:sctp-send-string assoc sid "hello from the box"))
+                        :on-message (lambda (assoc sid payload)
+                                      (cl-transport.chan:chan-send report (list :got sid payload))
+                                      ;; echo: strings prefixed, bytes reversed
+                                      (if (stringp payload)
+                                          (wd:sctp-send-string assoc sid (format nil "echo:~a" payload))
+                                          (wd:sctp-send-binary assoc sid (reverse payload)))))))
+            (cl-transport.chan:chan-send report (list :end (wd:sctp-assoc-state assoc)))))
+      (error (e) (cl-transport.chan:chan-send report (list :end (format nil "error: ~a" e)) :timeout 1)))
+    (when agent (ignore-errors (wd:ice-close agent)))))
 
 (defun box-answer (offer-sdp)
-  "Answer OFFER-SDP the way the box does, run its session on a thread, return the answer."
-  (let* ((offer (wd:parse-sdp offer-sdp))
-         (agent (wd:make-ice :local-ip "127.0.0.1"))
-         (conn (wd:webrtc-dtls-setup agent :remote-fingerprint (wd:sdp-fingerprint offer)))
-         (answer (wd:ice-answer agent offer :fingerprint (wd::dtls-conn-fingerprint conn))))
-    (wd:ice-serve agent)
-    (wd:ice-start-checks agent)
-    (sb-thread:make-thread
-     (lambda ()
-       (handler-case
-           (progn
-             (wd:webrtc-dtls-run conn :peer-wait 20.0)
-             (let ((assoc (wd:webrtc-serve-datachannel
-                           conn :duration 30.0
-                           :on-ready (lambda (assoc sid)
-                                       (setf *box-assoc* assoc)
-                                       (sb-thread:with-mutex (*box-lock*) (push sid *box-ready*))
-                                       ;; like an RFB server: the box speaks first
-                                       (wd:sctp-send-string assoc sid "hello from the box"))
-                           :on-message (lambda (assoc sid payload)
-                                         (setf *box-assoc* assoc)
-                                         (sb-thread:with-mutex (*box-lock*) (push (cons sid payload) *box-got*))
-                                         ;; echo: strings prefixed, bytes reversed
-                                         (if (stringp payload)
-                                             (wd:sctp-send-string assoc sid (format nil "echo:~a" payload))
-                                             (wd:sctp-send-binary assoc sid (reverse payload)))))))
-               (setf *box-end* (wd:sctp-assoc-state assoc))))
-         (error (e) (setf *box-end* (format nil "error: ~a" e))))
-       (ignore-errors (wd:ice-close agent)))
-     :name "test-box")
-    answer))
+  "Answer OFFER-SDP the way the box does, its session on a thread, and return the answer."
+  (sb-thread:make-thread #'box-main :name "test-box" :arguments (list offer-sdp *box-reply* *box-report*))
+  (cl-transport.chan:chan-receive *box-reply* :timeout 20))
+
+(defun take-box-reports ()
+  (loop (multiple-value-bind (msg ok) (cl-transport.chan:chan-try-receive *box-report*)
+          (unless ok (return))
+          (ecase (first msg)
+            (:ready (push (second msg) *box-ready*))
+            (:got (push (cons (second msg) (third msg)) *box-got*))
+            (:end (setf *box-end* (second msg)))))))
 
 ;;; ---- the test ----------------------------------------------------------------------------
 
+(defvar *peer* nil)
+
 (defun wait-for (pred &optional (secs 10))
-  (loop repeat (* secs 100) until (funcall pred) do (sleep 0.01))
+  "Until PRED: taking the box's reports and pumping the peer (its ON-MESSAGE runs in the pump)."
+  (loop repeat (* secs 100)
+        do (take-box-reports)
+           (when *peer* (wd:rtc-pump *peer* 0))
+        until (funcall pred) do (sleep 0.01))
+  (take-box-reports)
   (funcall pred))
 
 (defun run ()
@@ -87,6 +107,7 @@
                                     :timeout 20.0)
                  (error (e) (check "connect-peer" nil (princ-to-string e)) (return-from run))))
          (ms (round (* 1000 (- (get-internal-real-time) t0)) internal-time-units-per-second)))
+    (setf *peer* peer)
     (check "the offer is a data-channel offer, actpass, with a host candidate"
            (and (search "m=application" offer) (search "a=setup:actpass" offer)
                 (search "typ host" offer) (search "a=fingerprint:sha-256 " offer)))
@@ -124,7 +145,7 @@
         (wd:channel-send ctl "{\"t\":\"ping\"}")
         (check "negotiated channel 100: a string there and back"
                (wait-for (lambda () (equal got "echo:{\"t\":\"ping\"}"))) got)))
-    (let ((st (wd:sctp-stats (wd:peer-assoc peer))))
+    (let ((st (wd:peer-stats peer)))
       (check "no retransmissions on loopback" (zerop (getf st :rtx)) st))
     (wd:rtc-close peer)
     (check "closed here" (eq (wd:peer-state peer) :closed))
