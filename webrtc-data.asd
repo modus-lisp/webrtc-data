@@ -9,7 +9,7 @@
   :version "0.1.0"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("cl-transport/ice" "cram" "bordeaux-threads" "sb-bsd-sockets" "seal" "cl-transport/chan")
+  :depends-on ("cl-transport/ice" "cram" "bordeaux-threads" "sb-bsd-sockets" "seal" "bobbin")
   :serial t
   :components
   ((:module "src"
@@ -32,7 +32,7 @@
   :version "0.1.0"
   :author "ynniv"
   :license "MIT"
-  :depends-on ("webrtc-data" "cl-transport" "cl-transport/http-server" "cl-transport/chan"
+  :depends-on ("webrtc-data" "cl-transport" "cl-transport/http-server" "bobbin"
                "bordeaux-threads")
   :serial t
   :components

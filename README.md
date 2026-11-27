@@ -121,7 +121,7 @@ through `cl-transport:expose`.
 the offer string as an argument; that thread builds the ICE agent, DTLS and SCTP and reads the UDP
 socket itself (cl-transport's ICE pull mode — no receive thread).  The handler runs on a third
 thread with a stream of its own; bytes cross between them only as copies through
-`cl-transport/chan` channels (modus channels on modus, a locked queue of copies on SBCL).  That is
+`bobbin` channels (modus channels on modus, a locked queue of copies on SBCL).  That is
 what lets the backend run on modus, where a thread may not store its objects into another
 thread's.  On modus, pass `expose` a global function or a closure made on the main thread, and
 call `expose` on the main thread.  `test/transport-split.sh` runs the server on one Lisp
@@ -183,7 +183,7 @@ channels on fixed ids; `:relay-only` for a browser's `iceTransportPolicy: "relay
 
 One session thread owns the whole session -- gathering, ICE in pull mode (it reads the socket
 itself), DTLS, SCTP, consent -- and the `rtc-peer` you get back is a handle over two
-`cl-transport/chan` channels to it: `channel-send`, `channel-read`, `rtc-channel-stream`,
+`bobbin` channels to it: `channel-send`, `channel-read`, `rtc-channel-stream`,
 `rtc-close`, `peer-stats` (SCTP counters plus `:route`).  Events are taken on YOUR thread whenever
 you touch the peer (a read, `rtc-open-p`, `rtc-pump`), so `channel-on-message` and `:on-close` run
 there; a loop that only waits on callbacks calls `rtc-pump`.  On modus, use a peer from the thread

@@ -101,7 +101,7 @@
     (loop
       (when (plusp (%chs-available s)) (return t))
       (when (or eof closed) (return nil))
-      (multiple-value-bind (msg ok) (chan:chan-receive in :timeout 1)
+      (multiple-value-bind (msg ok) (bob:channel-receive in :timeout 1)
         (when ok (%chs-take s msg))))))
 
 (defmethod sb-gray:stream-read-byte ((s webrtc-channel-stream))
@@ -113,7 +113,7 @@
 (defmethod sb-gray:stream-listen ((s webrtc-channel-stream))
   (with-slots (in eof closed) s
     (loop until (or eof closed (plusp (%chs-available s)))
-          do (multiple-value-bind (msg ok) (chan:chan-try-receive in)
+          do (multiple-value-bind (msg ok) (bob:channel-try-receive in)
                (if ok (%chs-take s msg) (return))))
     (plusp (%chs-available s))))
 
@@ -138,8 +138,8 @@ EOF).  Callers loop like they would on a TCP socket."
 (:EOF on IN), when there is nobody to drain it and the message is dropped (NIL)."
   (with-slots (out in eof) s
     (loop
-      (when (chan:chan-send out msg :timeout 1) (return t))
-      (loop (multiple-value-bind (m ok) (chan:chan-try-receive in)
+      (when (bob:channel-send out msg :timeout 1) (return t))
+      (loop (multiple-value-bind (m ok) (bob:channel-try-receive in)
               (if ok (%chs-take s m) (return))))
       (when eof (return nil)))))
 
@@ -220,13 +220,13 @@ Gives SLOT back on FREE when done."
       (labels ((to-app (msg)
                  ;; Never block the association on a slow reader: what IN will not take now
                  ;; waits here, in order, and goes on a later pass.
-                 (unless (and (null backlog) (chan:chan-send in msg :timeout 0))
+                 (unless (and (null backlog) (bob:channel-send in msg :timeout 0))
                    (setf backlog (nconc backlog (list msg)))))
                (pass (assoc)
-                 (loop while (and backlog (chan:chan-send in (first backlog) :timeout 0))
+                 (loop while (and backlog (bob:channel-send in (first backlog) :timeout 0))
                        do (pop backlog))
                  ;; everything the application has written, into SCTP
-                 (loop (multiple-value-bind (msg ok) (chan:chan-try-receive out)
+                 (loop (multiple-value-bind (msg ok) (bob:channel-try-receive out)
                          (cond ((not ok) (return))
                                ((eq msg :close) (setf app-done t) (return))
                                ((and sid (vectorp msg)) (wd:sctp-send-binary assoc sid msg)))))))
@@ -242,7 +242,7 @@ Gives SLOT back on FREE when done."
                    (wd:ice-serve a :mode :pull)
                    (when gather-srflx (wd:ice-start-checks a))
                    (setf answered t)
-                   (chan:chan-send reply answer :timeout 5)
+                   (bob:channel-send reply answer :timeout 5)
                    (wd:webrtc-dtls-run conn)
                    (let ((assoc
                            (wd:webrtc-serve-datachannel
@@ -272,20 +272,20 @@ Gives SLOT back on FREE when done."
                      (%abort-association assoc)))
                (error (e)
                  (unless answered
-                   (ignore-errors (chan:chan-send reply (list :error (princ-to-string e)) :timeout 1)))
+                   (ignore-errors (bob:channel-send reply (list :error (princ-to-string e)) :timeout 1)))
                  (format *error-output* "~&[webrtc-transport] session error: ~a~%" e)))
           (when agent (ignore-errors (wd:ice-close agent)))
           ;; The application, if it started, hears :EOF and says :CLOSE before this slot may
           ;; serve another session; give it a while, draining what it writes meanwhile.
           (when (and app (not app-done))
-            (chan:chan-drain in)
-            (chan:chan-send in :eof :timeout 1)
+            (bob:channel-drain in)
+            (bob:channel-send in :eof :timeout 1)
             (loop with deadline = (+ (get-internal-real-time) (* 10 internal-time-units-per-second))
                   until (or app-done (> (get-internal-real-time) deadline))
-                  do (multiple-value-bind (msg ok) (chan:chan-receive out :timeout 0.1)
+                  do (multiple-value-bind (msg ok) (bob:channel-receive out :timeout 0.1)
                        (when (and ok (eq msg :close)) (setf app-done t)))))
           (if (or app-done (null app))
-              (progn (chan:chan-drain in) (chan:chan-drain out) (chan:chan-send free slot :timeout 1))
+              (progn (bob:channel-drain in) (bob:channel-drain out) (bob:channel-send free slot :timeout 1))
               (format *error-output* "~&[webrtc-transport] session slot ~d not reused: its ~
                                       handler has not returned~%" slot)))))))
 
@@ -308,28 +308,28 @@ route closure made here are what every handler and session thread is handed."
       opts
     (wd:webrtc-identity)                ; made here, once, where every session can read it
     (let* ((slots (coerce (loop repeat max-sessions
-                                collect (vector (chan:make-chan :capacity 16384)
-                                                (chan:make-chan :capacity +chan-bytes+)
-                                                (chan:make-chan :capacity +chan-bytes+)))
+                                collect (vector (bob:make-channel :capacity 16384)
+                                                (bob:make-channel :capacity +chan-bytes+)
+                                                (bob:make-channel :capacity +chan-bytes+)))
                           'simple-vector))
-           (free (chan:make-chan :capacity 4096))
+           (free (bob:make-channel :capacity 4096))
            (stop (make-array 1 :element-type '(unsigned-byte 8) :initial-element 0))
            (server nil))
-      (dotimes (i max-sessions) (chan:chan-send free i))
+      (dotimes (i max-sessions) (bob:channel-send free i))
       (labels ((process-offer (offer-sdp)
                  "Offer SDP in -> answer SDP out; the session runs on a thread of its own.
                   Reusable by any signaling front-end, not just HTTP."
-                 (multiple-value-bind (slot ok) (chan:chan-try-receive free)
+                 (multiple-value-bind (slot ok) (bob:channel-try-receive free)
                    (unless ok (error "webrtc: every session slot (~d) is in use" max-sessions))
                    (let* ((chans (svref slots slot)) (reply (svref chans 0)))
-                     (chan:chan-drain reply)
+                     (bob:channel-drain reply)
                      (handler-case
                          (sb-thread:make-thread
                           #'%session-main :name "webrtc-session"
                           :arguments (list offer-sdp slot reply (svref chans 1) (svref chans 2)
                                            free stop on-connection opts))
-                       (error (e) (chan:chan-send free slot :timeout 1) (error e)))
-                     (multiple-value-bind (answer got) (chan:chan-receive reply :timeout answer-timeout)
+                       (error (e) (bob:channel-send free slot :timeout 1) (error e)))
+                     (multiple-value-bind (answer got) (bob:channel-receive reply :timeout answer-timeout)
                        (cond ((not got) (error "webrtc: no answer within ~as" answer-timeout))
                              ((stringp answer) answer)
                              (t (error "webrtc: ~a" (second answer))))))))
@@ -349,9 +349,9 @@ route closure made here are what every handler and session thread is handed."
           (let ((back '())
                 (deadline (+ (get-internal-real-time) (* 10 internal-time-units-per-second))))
             (loop while (and (< (length back) max-sessions) (< (get-internal-real-time) deadline))
-                  do (multiple-value-bind (slot ok) (chan:chan-receive free :timeout 0.1)
+                  do (multiple-value-bind (slot ok) (bob:channel-receive free :timeout 0.1)
                        (when ok (push slot back))))
-            (dolist (slot back) (chan:chan-send free slot :timeout 1))
+            (dolist (slot back) (bob:channel-send free slot :timeout 1))
             (= (length back) max-sessions)))))))
 
 ;;; Register :WEBRTC with cl-transport's inbound registry (nothing backend-specific lives in

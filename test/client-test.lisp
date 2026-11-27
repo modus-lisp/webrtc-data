@@ -37,8 +37,8 @@
 (defvar *box-ready* '())                ; stream ids the box saw DCEP OPEN on
 (defvar *box-got* '())                  ; (sid . payload) the box received
 (defvar *box-end* nil)                  ; the association's final state, once its loop returns
-(defvar *box-reply* (cl-transport.chan:make-chan :capacity 65536))
-(defvar *box-report* (cl-transport.chan:make-chan :capacity (* 1024 1024)))
+(defvar *box-reply* (bobbin:make-channel :capacity 65536))
+(defvar *box-report* (bobbin:make-channel :capacity (* 1024 1024)))
 
 (defun box-main (offer-sdp reply report)
   "The box's session: answer OFFER-SDP on REPLY, then serve it, saying what happened on REPORT."
@@ -50,31 +50,31 @@
                (answer (wd:ice-answer a offer :fingerprint (wd::dtls-conn-fingerprint conn))))
           (wd:ice-serve a :mode :pull)
           (wd:ice-start-checks a)
-          (cl-transport.chan:chan-send reply answer)
+          (bobbin:channel-send reply answer)
           (wd:webrtc-dtls-run conn :peer-wait 20.0)
           (let ((assoc (wd:webrtc-serve-datachannel
                         conn :duration 30.0 :tick 0.01
                         :on-ready (lambda (assoc sid)
-                                    (cl-transport.chan:chan-send report (list :ready sid))
+                                    (bobbin:channel-send report (list :ready sid))
                                     ;; like an RFB server: the box speaks first
                                     (wd:sctp-send-string assoc sid "hello from the box"))
                         :on-message (lambda (assoc sid payload)
-                                      (cl-transport.chan:chan-send report (list :got sid payload))
+                                      (bobbin:channel-send report (list :got sid payload))
                                       ;; echo: strings prefixed, bytes reversed
                                       (if (stringp payload)
                                           (wd:sctp-send-string assoc sid (format nil "echo:~a" payload))
                                           (wd:sctp-send-binary assoc sid (reverse payload)))))))
-            (cl-transport.chan:chan-send report (list :end (wd:sctp-assoc-state assoc)))))
-      (error (e) (cl-transport.chan:chan-send report (list :end (format nil "error: ~a" e)) :timeout 1)))
+            (bobbin:channel-send report (list :end (wd:sctp-assoc-state assoc)))))
+      (error (e) (bobbin:channel-send report (list :end (format nil "error: ~a" e)) :timeout 1)))
     (when agent (ignore-errors (wd:ice-close agent)))))
 
 (defun box-answer (offer-sdp)
   "Answer OFFER-SDP the way the box does, its session on a thread, and return the answer."
   (sb-thread:make-thread #'box-main :name "test-box" :arguments (list offer-sdp *box-reply* *box-report*))
-  (cl-transport.chan:chan-receive *box-reply* :timeout 20))
+  (bobbin:channel-receive *box-reply* :timeout 20))
 
 (defun take-box-reports ()
-  (loop (multiple-value-bind (msg ok) (cl-transport.chan:chan-try-receive *box-report*)
+  (loop (multiple-value-bind (msg ok) (bobbin:channel-try-receive *box-report*)
           (unless ok (return))
           (ecase (first msg)
             (:ready (push (second msg) *box-ready*))

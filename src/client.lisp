@@ -69,12 +69,12 @@ most 262144 bytes, a=max-message-size).")
 
 (defun %take-chan-pair ()
   (or (ignore-errors (bt:with-lock-held (*client-chan-pool-lock*) (pop *client-chan-pool*)))
-      (cons (cl-transport.chan:make-chan :capacity +client-chan-bytes+)
-            (cl-transport.chan:make-chan :capacity +client-chan-bytes+))))
+      (cons (bobbin:make-channel :capacity +client-chan-bytes+)
+            (bobbin:make-channel :capacity +client-chan-bytes+))))
 
 (defun %give-chan-pair (pair)
-  (cl-transport.chan:chan-drain (car pair))
-  (cl-transport.chan:chan-drain (cdr pair))
+  (bobbin:channel-drain (car pair))
+  (bobbin:channel-drain (cdr pair))
   (ignore-errors (bt:with-lock-held (*client-chan-pool-lock*) (push pair *client-chan-pool*))))
 
 ;;; ---- the caller's side: channel ---------------------------------------------------------------
@@ -180,7 +180,7 @@ Returns the number taken.  Call it in a loop that waits on ON-MESSAGE callbacks.
       (unless (eq (peer-state peer) :closed)
         (loop
           (multiple-value-bind (msg ok)
-              (cl-transport.chan:chan-receive (%peer-events peer) :timeout (if (zerop n) timeout 0))
+              (bobbin:channel-receive (%peer-events peer) :timeout (if (zerop n) timeout 0))
             (unless ok (return))
             (incf n)
             (when (%handle-event peer msg) (setf closed t) (return))))))
@@ -207,7 +207,7 @@ Returns the number taken.  Call it in a loop that waits on ON-MESSAGE callbacks.
       (rtc-pump peer 0.05))))
 
 (defun %command (peer msg)
-  (unless (cl-transport.chan:chan-send (%peer-commands peer) msg :timeout 10)
+  (unless (bobbin:channel-send (%peer-commands peer) msg :timeout 10)
     (werr "the session is not taking commands")))
 
 (defun channel-send (ch data)
@@ -398,7 +398,7 @@ twice: the second call returns PEER."
             (unless (%peer-closing peer) (setf (%peer-closing peer) t)))
     (return-from rtc-close peer))
   (unless (eq (peer-state peer) :closed)
-    (cl-transport.chan:chan-send (%peer-commands peer) (list :close (and abort t)) :timeout 2)
+    (bobbin:channel-send (%peer-commands peer) (list :close (and abort t)) :timeout 2)
     (let ((deadline (+ (get-internal-real-time) (* 5 internal-time-units-per-second))))
       (loop until (or (eq (peer-state peer) :closed) (> (get-internal-real-time) deadline))
             do (rtc-pump peer 0.1)))
@@ -427,7 +427,7 @@ twice: the second call returns PEER."
   "MSG to the caller, in order, never waiting: what the events channel will not take now waits
 in the session's backlog and goes on a later pass."
   (let ((ev (%s-events s)))
-    (if (and (null (%s-backlog s)) (cl-transport.chan:chan-send ev msg :timeout 0))
+    (if (and (null (%s-backlog s)) (bobbin:channel-send ev msg :timeout 0))
         t
         (let ((cell (list msg)))
           (if (%s-backlog-tail s) (setf (cdr (%s-backlog-tail s)) cell) (setf (%s-backlog s) cell))
@@ -436,7 +436,7 @@ in the session's backlog and goes on a later pass."
 
 (defun %flush-backlog (s &optional (timeout 0))
   (loop while (and (%s-backlog s)
-                   (cl-transport.chan:chan-send (%s-events s) (first (%s-backlog s)) :timeout timeout))
+                   (bobbin:channel-send (%s-events s) (first (%s-backlog s)) :timeout timeout))
         do (pop (%s-backlog s))
            (unless (%s-backlog s) (setf (%s-backlog-tail s) nil))))
 
@@ -715,7 +715,7 @@ all on this thread.  Signals WEBRTC-ERROR on failure or after TIMEOUT seconds."
 
 (defun %session-commands (s)
   "Every command the caller has sent, in order.  T if one ended the session."
-  (loop (multiple-value-bind (msg ok) (cl-transport.chan:chan-try-receive (%s-commands s))
+  (loop (multiple-value-bind (msg ok) (bobbin:channel-try-receive (%s-commands s))
           (unless ok (return nil))
           (when (%session-command s msg) (return t)))))
 
@@ -738,7 +738,7 @@ through EVENTS and COMMANDS (see the file header)."
               (loop until answer
                     do (%flush-backlog s)
                        (multiple-value-bind (msg ok)
-                           (cl-transport.chan:chan-receive commands :timeout 0.1)
+                           (bobbin:channel-receive commands :timeout 0.1)
                          (when ok
                            (case (first msg)
                              (:answer (setf answer (second msg)))
